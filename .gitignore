@@ -1,0 +1,39 @@
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*#
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Logs / temporary files
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Codex runtime state must never be committed
+.codex/
+CodexSync/
+codex-*.tar.zst
+codex-*.tar.zst.sha256
+codex-*.tar.zst.state
+
+# Local project registry, if accidentally created in the repo
+.run-codex/
+projects/
+
+# Build / package artifacts
+dist/
+build/
+target/
+node_modules/

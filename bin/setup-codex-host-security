@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+find_apparmor_parser() {
+    local parser=/usr/sbin/apparmor_parser
+
+    if [[ ! -x "$parser" ]]; then
+        echo "ERROR: Missing AppArmor policy parser." >&2
+        echo "On Ubuntu/Debian, install it with:" >&2
+        echo "  sudo apt install apparmor apparmor-utils" >&2
+        exit 1
+    fi
+
+    printf '%s\n' "$parser"
+}
+
+if (($#)); then
+    die "Usage: setup-codex-host-security"
+fi
+
+((EUID != 0)) || die "Run this command as the regular Docker user; it invokes sudo only for AppArmor installation"
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SOURCE_ROOT="$(realpath -e -- "$SCRIPT_DIR/..")"
+SOURCE_APPARMOR="$SOURCE_ROOT/security/apparmor/codex-universal"
+SOURCE_SECCOMP="$SOURCE_ROOT/security/seccomp/codex-bwrap.json"
+CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/run-codex"
+INSTALLED_SECCOMP="$CONFIG_ROOT/security/codex-bwrap.json"
+INSTALLED_APPARMOR="/etc/apparmor.d/codex-universal"
+
+[[ "$CONFIG_ROOT" == /* && "$CONFIG_ROOT" != / ]] ||
+    die "Unsafe run-codex configuration root: $CONFIG_ROOT"
+
+APPARMOR_PARSER="$(find_apparmor_parser)"
+need cmp
+need install
+need jq
+need realpath
+need sudo
+
+[[ -r "$SOURCE_APPARMOR" ]] || die "Missing AppArmor source profile: $SOURCE_APPARMOR"
+[[ -r "$SOURCE_SECCOMP" ]] || die "Missing seccomp source profile: $SOURCE_SECCOMP"
+jq -e '.defaultAction == "SCMP_ACT_ERRNO" and (.syscalls | type == "array")' \
+    "$SOURCE_SECCOMP" >/dev/null || die "Invalid seccomp source profile"
+"$APPARMOR_PARSER" -Q -T -K "$SOURCE_APPARMOR" >/dev/null
+
+[[ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true)" == Y ]] ||
+    die "AppArmor is not enabled on this host"
+
+install -d -m 0700 -- "$CONFIG_ROOT/security"
+if [[ ! -f "$INSTALLED_SECCOMP" ]] ||
+   ! cmp -s -- "$SOURCE_SECCOMP" "$INSTALLED_SECCOMP"; then
+    install -m 0600 -- "$SOURCE_SECCOMP" "$INSTALLED_SECCOMP"
+fi
+
+if ! sudo test -f "$INSTALLED_APPARMOR" ||
+   ! sudo cmp -s -- "$SOURCE_APPARMOR" "$INSTALLED_APPARMOR"; then
+    sudo install -m 0644 -- "$SOURCE_APPARMOR" "$INSTALLED_APPARMOR"
+fi
+sudo "$APPARMOR_PARSER" -r "$INSTALLED_APPARMOR"
+
+sudo grep -q '^codex-universal ' /sys/kernel/security/apparmor/profiles ||
+    die "AppArmor profile was installed but is not loaded"
+
+echo "Codex host sandbox policy is installed:"
+echo "  AppArmor: $INSTALLED_APPARMOR"
+echo "  seccomp:  $INSTALLED_SECCOMP"

@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/run-codex"
+PROJECTS_DIR="$CONFIG_ROOT/projects"
+ACP_FILE="${CODEX_IDEA_ACP_FILE:-$HOME/.jetbrains/acp.json}"
+
+usage() {
+    cat <<'USAGE'
+Usage: setup-codex-idea PROJECT
+
+Adds or updates a project-specific Dockerized Codex agent in the JetBrains
+ACP configuration. The project must already be registered with run-codex.
+
+Environment:
+  CODEX_IDEA_ACP_FILE  Override ~/.jetbrains/acp.json
+  CODEX_RUN_CODEX      Override the run-codex executable recorded in ACP
+USAGE
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+validate_project_name() {
+    local name="$1"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+        die "Invalid project name '$name'. Use letters, digits, '.', '_' or '-'."
+}
+
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
+(($# == 1)) || {
+    usage >&2
+    exit 2
+}
+
+PROJECT="$1"
+validate_project_name "$PROJECT"
+[[ -f "$PROJECTS_DIR/$PROJECT" ]] ||
+    die "Project '$PROJECT' is not registered. Run 'run-codex --init $PROJECT' first."
+
+need jq
+need realpath
+
+RUN_CODEX="${CODEX_RUN_CODEX:-}"
+if [[ -z "$RUN_CODEX" ]]; then
+    RUN_CODEX="$(command -v run-codex 2>/dev/null || true)"
+fi
+if [[ -z "$RUN_CODEX" && -x "$SCRIPT_DIR/run-codex" ]]; then
+    RUN_CODEX="$SCRIPT_DIR/run-codex"
+fi
+[[ -n "$RUN_CODEX" ]] || die "run-codex is not installed or beside this script"
+
+RUN_CODEX="$(realpath -e -- "$RUN_CODEX")" ||
+    die "Cannot resolve run-codex executable: $RUN_CODEX"
+[[ -x "$RUN_CODEX" ]] || die "run-codex is not executable: $RUN_CODEX"
+[[ "$ACP_FILE" == /* ]] || die "CODEX_IDEA_ACP_FILE must be an absolute path"
+[[ ! -L "$ACP_FILE" ]] || die "Refusing to replace symlink: $ACP_FILE"
+
+ACP_DIR="$(dirname -- "$ACP_FILE")"
+mkdir -p -- "$ACP_DIR"
+
+if [[ -e "$ACP_FILE" ]]; then
+    [[ -f "$ACP_FILE" ]] || die "ACP configuration is not a regular file: $ACP_FILE"
+    jq -e '
+        type == "object" and
+        ((.agent_servers == null) or (.agent_servers | type == "object"))
+    ' "$ACP_FILE" >/dev/null ||
+        die "ACP configuration must be a JSON object with an optional agent_servers object: $ACP_FILE"
+fi
+
+AGENT_NAME="Dockerized Codex ($PROJECT)"
+TMP_FILE="$(mktemp -- "$ACP_DIR/.acp.json.tmp.XXXXXX")"
+cleanup() {
+    rm -f -- "$TMP_FILE"
+}
+trap cleanup EXIT
+
+if [[ -f "$ACP_FILE" ]]; then
+    jq \
+        --arg name "$AGENT_NAME" \
+        --arg command "$RUN_CODEX" \
+        --arg project "$PROJECT" \
+        '.agent_servers = ((.agent_servers // {}) + {
+            ($name): {
+                "command": $command,
+                "args": ["--idea", $project],
+                "use_idea_mcp": false,
+                "use_custom_mcp": false
+            }
+        })' \
+        "$ACP_FILE" > "$TMP_FILE"
+else
+    jq -n \
+        --arg name "$AGENT_NAME" \
+        --arg command "$RUN_CODEX" \
+        --arg project "$PROJECT" \
+        '{
+            "agent_servers": {
+                ($name): {
+                    "command": $command,
+                    "args": ["--idea", $project],
+                    "use_idea_mcp": false,
+                    "use_custom_mcp": false
+                }
+            }
+        }' > "$TMP_FILE"
+fi
+
+chmod 600 "$TMP_FILE"
+mv -- "$TMP_FILE" "$ACP_FILE"
+trap - EXIT
+
+echo "Configured JetBrains ACP agent '$AGENT_NAME':"
+echo "  file:    $ACP_FILE"
+echo "  command: $RUN_CODEX --idea $PROJECT"
+echo "  MCP:     host MCP forwarding disabled"
+echo "Select '$AGENT_NAME' (not the registry-managed 'Codex') in AI Chat."
+echo "Restart the IDE only if the new custom entry does not appear."

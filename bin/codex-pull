@@ -1,0 +1,506 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+CODEX_DIR="${CODEX_DIR:-$HOME/.codex}"
+SYNC_DIR="${CODEX_SYNC_DIR:-$HOME/Seafile/CodexSync}"
+LOCK_FILE="${CODEX_LOCK_FILE:-$HOME/.cache/codex-handoff.lock}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-handoff"
+BASE_FILE="$STATE_DIR/base.state"
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  codex-pull
+  codex-pull --list
+  codex-pull --force GENERATION
+
+Commands:
+  (no arguments)       Restore the newest generation when local state has not
+                       diverged from the local baseline
+  --list               List available recovery generations
+  --force GENERATION   Preserve the current Codex directory and restore the
+                       selected generation even if local state has changed
+USAGE
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+MODE=pull
+WANTED_GEN=""
+
+case "${1:-}" in
+    '')
+        (($# == 0)) || die "Unexpected arguments"
+        ;;
+    -h|--help)
+        (($# == 1)) || die "--help takes no arguments"
+        usage
+        exit 0
+        ;;
+    --list)
+        (($# == 1)) || die "--list takes no arguments"
+        MODE=list
+        ;;
+    --force)
+        (($# == 2)) || die "Usage: codex-pull --force GENERATION"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "Generation must be a positive integer"
+        WANTED_GEN=$((10#$2))
+        ((WANTED_GEN > 0)) || die "Generation must be a positive integer"
+        MODE=force
+        ;;
+    *)
+        usage >&2
+        die "Unknown option: $1"
+        ;;
+esac
+
+for cmd in sha256sum awk sort tr basename realpath dirname; do
+    need "$cmd"
+done
+
+normalize_path() {
+    local variable="$1"
+    local value="${!variable}"
+    local normalized
+
+    [[ "$value" == /* ]] || die "$variable must be an absolute path: $value"
+    normalized="$(realpath -m -- "$value")" || die "Cannot resolve $variable: $value"
+    [[ "$normalized" != / ]] || die "$variable must not be the filesystem root"
+    printf -v "$variable" '%s' "$normalized"
+}
+
+paths_overlap() {
+    [[ "$1" == "$2" || "$1" == "$2/"* || "$2" == "$1/"* ]]
+}
+
+validate_paths() {
+    normalize_path CODEX_DIR
+    normalize_path SYNC_DIR
+    normalize_path STATE_DIR
+    normalize_path LOCK_FILE
+
+    paths_overlap "$CODEX_DIR" "$SYNC_DIR" &&
+        die "CODEX_DIR and CODEX_SYNC_DIR must not overlap"
+    paths_overlap "$CODEX_DIR" "$STATE_DIR" &&
+        die "CODEX_DIR and XDG_STATE_HOME/codex-handoff must not overlap"
+    paths_overlap "$SYNC_DIR" "$STATE_DIR" &&
+        die "CODEX_SYNC_DIR and XDG_STATE_HOME/codex-handoff must not overlap"
+
+    for directory in "$CODEX_DIR" "$SYNC_DIR" "$STATE_DIR"; do
+        paths_overlap "$LOCK_FILE" "$directory" &&
+            die "CODEX_LOCK_FILE must be separate from Codex data directories"
+    done
+
+    BASE_FILE="$STATE_DIR/base.state"
+}
+
+validate_paths
+mkdir -p "$SYNC_DIR" "$STATE_DIR" "$(dirname "$LOCK_FILE")"
+
+state_value() {
+    local file="$1"
+    local key="$2"
+
+    awk -F= -v key="$key" '
+        $1 == key {
+            sub(/^[^=]*=/, "")
+            print
+            exit
+        }
+    ' "$file"
+}
+
+valid_hash() {
+    [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+state_hash_dir() {
+    local dir="$1"
+
+    LC_ALL=C tar \
+        --sort=name \
+        --format=gnu \
+        --mtime='@0' \
+        --owner=0 \
+        --group=0 \
+        --numeric-owner \
+        -C "$dir" \
+        -cf - . |
+        sha256sum |
+        awk '{print $1}'
+}
+
+check_sqlite() {
+    local dir="$1"
+    local db result
+
+    while IFS= read -r -d '' db; do
+        echo "  checking $(basename "$db")"
+
+        result="$(sqlite3 "$db" 'PRAGMA integrity_check;')" ||
+            die "SQLite check failed: $db"
+
+        [[ "$result" == "ok" ]] ||
+            die "SQLite corruption detected in $db: $result"
+    done < <(find "$dir" -type f -name '*.sqlite' -print0)
+}
+
+BASE_GEN=""
+BASE_HASH=""
+
+read_base() {
+    [[ -f "$BASE_FILE" ]] || return 1
+
+    local generation hash
+    generation="$(state_value "$BASE_FILE" generation)"
+    hash="$(state_value "$BASE_FILE" sha256)"
+
+    [[ "$generation" =~ ^[0-9]+$ ]] ||
+        die "Invalid generation in $BASE_FILE"
+    valid_hash "$hash" || die "Invalid hash in $BASE_FILE"
+
+    BASE_GEN=$((10#$generation))
+    BASE_HASH="$hash"
+}
+
+write_base() {
+    local generation="$1"
+    local hash="$2"
+    local tmp="$BASE_FILE.tmp.$$"
+
+    {
+        echo "generation=$generation"
+        echo "sha256=$hash"
+    } > "$tmp"
+
+    mv -- "$tmp" "$BASE_FILE"
+}
+
+REMOTE_GEN=""
+REMOTE_HASH=""
+
+load_latest_metadata() {
+    local max_gen=-1
+    local max_hash=""
+    local found=false
+    local state_file generation hash
+
+    shopt -s nullglob
+    local files=("$SYNC_DIR"/codex-g*.tar.zst.state)
+
+    ((${#files[@]})) || return 1
+
+    for state_file in "${files[@]}"; do
+        generation="$(state_value "$state_file" generation)"
+        hash="$(state_value "$state_file" sha256)"
+
+        [[ "$generation" =~ ^[0-9]+$ ]] || continue
+        valid_hash "$hash" || continue
+
+        generation=$((10#$generation))
+
+        if ((generation > max_gen)); then
+            max_gen="$generation"
+            max_hash="$hash"
+            found=true
+        elif ((generation == max_gen)); then
+            [[ "$hash" == "$max_hash" ]] ||
+                die "DIVERGENCE: generation $generation has multiple different states"
+        fi
+    done
+
+    $found || return 1
+
+    REMOTE_GEN="$max_gen"
+    REMOTE_HASH="$max_hash"
+}
+
+SELECTED_ARCHIVE=""
+SELECTED_HASH=""
+
+archive_is_valid() {
+    local state_file="$1"
+    local archive format expected actual archive_path checksum_path
+
+    format="$(state_value "$state_file" format)"
+    archive="$(state_value "$state_file" archive)"
+
+    [[ "$format" == 1 ]] || return 1
+    [[ -n "$archive" && "$archive" != */* ]] || return 1
+    [[ "$(basename "$state_file")" == "$archive.state" ]] || return 1
+
+    archive_path="$SYNC_DIR/$archive"
+    checksum_path="$archive_path.sha256"
+
+    [[ -f "$archive_path" && -f "$checksum_path" ]] || return 1
+
+    expected="$(tr -d '[:space:]' < "$checksum_path")"
+    valid_hash "$expected" || return 1
+
+    actual="$(sha256sum "$archive_path" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] || return 1
+
+    SELECTED_ARCHIVE="$archive_path"
+}
+
+select_snapshot() {
+    local wanted="$1"
+    local expected_hash=""
+    local matched=false
+    local valid=false
+    local state_file generation hash
+
+    SELECTED_ARCHIVE=""
+    SELECTED_HASH=""
+
+    shopt -s nullglob
+
+    for state_file in "$SYNC_DIR"/codex-g*.tar.zst.state; do
+        generation="$(state_value "$state_file" generation)"
+        hash="$(state_value "$state_file" sha256)"
+
+        [[ "$generation" =~ ^[0-9]+$ ]] || continue
+        valid_hash "$hash" || continue
+
+        generation=$((10#$generation))
+        ((generation == wanted)) || continue
+        matched=true
+
+        if [[ -z "$expected_hash" ]]; then
+            expected_hash="$hash"
+        elif [[ "$hash" != "$expected_hash" ]]; then
+            die "DIVERGENCE: generation $wanted has multiple different states"
+        fi
+
+        if archive_is_valid "$state_file"; then
+            valid=true
+        fi
+    done
+
+    $matched || return 1
+    $valid || return 2
+
+    SELECTED_HASH="$expected_hash"
+}
+
+select_or_die() {
+    local generation="$1"
+    local result
+
+    if select_snapshot "$generation"; then
+        return 0
+    else
+        result=$?
+    fi
+
+    if ((result == 1)); then
+        die "Generation $generation does not exist"
+    fi
+
+    die "Generation $generation is incomplete or has a failed archive checksum; synchronization may still be in progress"
+}
+
+list_snapshots() {
+    local state_file generation hash created host archive status
+
+    shopt -s nullglob
+    local files=("$SYNC_DIR"/codex-g*.tar.zst.state)
+
+    if ((${#files[@]} == 0)); then
+        echo "No Codex snapshots found in $SYNC_DIR"
+        return 0
+    fi
+
+    printf '%-12s %-17s %-20s %-10s %s\n' \
+        "GENERATION" "CREATED" "HOST" "STATUS" "ARCHIVE"
+
+    while IFS= read -r state_file; do
+        generation="$(state_value "$state_file" generation)"
+        hash="$(state_value "$state_file" sha256)"
+        created="$(state_value "$state_file" created)"
+        host="$(state_value "$state_file" host)"
+        archive="$(state_value "$state_file" archive)"
+        status="INVALID"
+
+        if [[ "$generation" =~ ^[0-9]+$ ]] && valid_hash "$hash" &&
+           archive_is_valid "$state_file"; then
+            status="OK"
+        fi
+
+        printf '%-12s %-17s %-20s %-10s %s\n' \
+            "${generation:--}" "${created:--}" "${host:--}" "$status" "${archive:--}"
+    done < <(printf '%s\n' "${files[@]}" | LC_ALL=C sort)
+}
+
+if [[ "$MODE" == list ]]; then
+    list_snapshots
+    exit 0
+fi
+
+running_codex_containers() {
+    command -v docker >/dev/null 2>&1 || return 0
+    docker ps --format '{{.Names}}' 2>/dev/null |
+        grep '^codex-' || true
+}
+
+report_running_codex_containers() {
+    local running
+
+    running="$(running_codex_containers)"
+    [[ -n "$running" ]] || return 1
+
+    echo "Running Codex Docker containers:" >&2
+    while IFS= read -r container; do
+        printf '  %s\n' "$container" >&2
+    done <<< "$running"
+    return 0
+}
+
+for cmd in tar zstd find sqlite3 lsof flock hostname; do
+    need "$cmd"
+done
+
+[[ -d "$CODEX_DIR" ]] || die "$CODEX_DIR does not exist"
+
+# Exclusive against codex-push and shared locks held by run-codex.
+if report_running_codex_containers; then
+    die "Stop the listed Codex session(s) before pulling"
+fi
+
+exec 9>"$LOCK_FILE"
+if ! flock -n -x 9; then
+    report_running_codex_containers || true
+    die "Codex is running, starting, or another push/pull is active"
+fi
+
+if lsof +D "$CODEX_DIR" >/dev/null 2>&1; then
+    echo "Open files under $CODEX_DIR:" >&2
+    lsof +D "$CODEX_DIR" >&2 || true
+    die "Stop Codex first"
+fi
+
+if report_running_codex_containers; then
+    die "Stop the listed Codex session(s) before pulling"
+fi
+
+echo "Checking local SQLite databases..."
+check_sqlite "$CODEX_DIR"
+
+echo "Calculating local state..."
+LOCAL_HASH="$(state_hash_dir "$CODEX_DIR")"
+
+if read_base; then
+    HAVE_BASE=true
+else
+    HAVE_BASE=false
+fi
+
+load_latest_metadata || die "No remote Codex snapshots found in $SYNC_DIR"
+
+# Do not establish a baseline from metadata whose archive has not arrived or
+# whose checksum fails. This also makes forced recovery from an older snapshot
+# wait until the current remote generation is complete.
+select_or_die "$REMOTE_GEN"
+LATEST_ARCHIVE="$SELECTED_ARCHIVE"
+
+if [[ "$MODE" == force ]]; then
+    select_or_die "$WANTED_GEN"
+else
+    if $HAVE_BASE; then
+        ((REMOTE_GEN >= BASE_GEN)) ||
+            die "Remote generation $REMOTE_GEN is older than local baseline $BASE_GEN. Refusing."
+
+        if ((REMOTE_GEN == BASE_GEN)); then
+            [[ "$REMOTE_HASH" == "$BASE_HASH" ]] ||
+                die "DIVERGENCE: remote generation $REMOTE_GEN differs from local baseline"
+
+            if [[ "$LOCAL_HASH" == "$BASE_HASH" ]]; then
+                echo "No changes. Codex state already matches generation $REMOTE_GEN."
+                exit 0
+            fi
+
+            die "Local Codex state changed since generation $BASE_GEN. Run codex-push, or use --force only if remote state should replace it."
+        fi
+
+        [[ "$LOCAL_HASH" == "$BASE_HASH" ]] ||
+            die "DIVERGENCE: remote advanced to generation $REMOTE_GEN and local Codex also changed"
+    else
+        if [[ "$LOCAL_HASH" == "$REMOTE_HASH" ]]; then
+            write_base "$REMOTE_GEN" "$REMOTE_HASH"
+            echo "No changes. Adopted generation $REMOTE_GEN as local baseline."
+            exit 0
+        fi
+
+        die "Remote generation $REMOTE_GEN exists but this machine has no baseline. Use 'codex-pull --force $REMOTE_GEN' if remote state should replace the local directory."
+    fi
+
+    # The normal forward path always restores the newest valid snapshot.
+    SELECTED_ARCHIVE="$LATEST_ARCHIVE"
+    SELECTED_HASH="$REMOTE_HASH"
+    WANTED_GEN="$REMOTE_GEN"
+fi
+
+CODEX_PARENT="$(dirname "$CODEX_DIR")"
+CODEX_NAME="$(basename "$CODEX_DIR")"
+RESTORE_TMP="$(mktemp -d "$CODEX_PARENT/.${CODEX_NAME}.restore.XXXXXX")"
+
+cleanup() {
+    if [[ -n "${RESTORE_TMP:-}" && -d "$RESTORE_TMP" ]]; then
+        rm -rf -- "$RESTORE_TMP"
+    fi
+}
+trap cleanup EXIT
+
+echo "Extracting generation $WANTED_GEN..."
+zstd -q -d -c "$SELECTED_ARCHIVE" |
+    tar -xf - \
+        --no-same-owner \
+        --same-permissions \
+        --transform='s,^\.$,content,rSH' \
+        --transform='s,^\./,content/,rSH' \
+        -C "$RESTORE_TMP"
+
+[[ -d "$RESTORE_TMP/content" ]] ||
+    die "Generation $WANTED_GEN archive has no Codex directory"
+
+RESTORED_HASH="$(state_hash_dir "$RESTORE_TMP/content")"
+[[ "$RESTORED_HASH" == "$SELECTED_HASH" ]] ||
+    die "Restored state hash does not match generation $WANTED_GEN"
+
+echo "Checking restored SQLite databases..."
+check_sqlite "$RESTORE_TMP/content"
+
+timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+nonce="$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+BACKUP_DIR="$CODEX_PARENT/${CODEX_NAME}.backup-${timestamp}-${nonce}"
+
+mv -- "$CODEX_DIR" "$BACKUP_DIR"
+if ! mv -- "$RESTORE_TMP/content" "$CODEX_DIR"; then
+    mv -- "$BACKUP_DIR" "$CODEX_DIR" || true
+    die "Could not install restored state; attempted to restore the original directory"
+fi
+
+RESTORE_TMP=""
+
+# Baseline the newest remote generation, not necessarily the selected one.
+# After forcing an older generation this makes the next push publish the
+# recovered contents as REMOTE_GEN + 1 without moving history backwards.
+write_base "$REMOTE_GEN" "$REMOTE_HASH"
+
+echo
+echo "Restored Codex generation $WANTED_GEN."
+echo "  backup: $BACKUP_DIR"
+
+if ((WANTED_GEN < REMOTE_GEN)); then
+    echo
+    echo "The remote head remains generation $REMOTE_GEN."
+    echo "Run codex-push to publish the recovered contents as a new generation."
+fi

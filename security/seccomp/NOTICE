@@ -1,0 +1,10 @@
+codex-bwrap.json
+
+This file is derived from the Moby default seccomp profile:
+https://github.com/moby/profiles/blob/61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31/seccomp/default.json
+
+Copyright The Moby Authors.
+Copyright 2026 leafclick s. r. o. for modifications.
+
+The file and its modifications are licensed under the Apache License,
+Version 2.0. See LICENSE in this directory.

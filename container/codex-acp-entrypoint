@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# The CUDA base image uses this entrypoint to initialize its runtime before
+# starting the requested process. The generic image has no equivalent hook.
+if [[ -x /opt/nvidia/nvidia_entrypoint.sh ]]; then
+    exec /opt/nvidia/nvidia_entrypoint.sh codex-acp "$@"
+fi
+
+exec codex-acp "$@"

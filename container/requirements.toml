@@ -1,0 +1,6 @@
+# These are enforced requirements, not user defaults. They keep every Codex
+# client in this image inside the same human-reviewed security boundary even
+# when an ACP client offers less restrictive modes in its UI.
+allowed_approval_policies = ["on-request"]
+allowed_approvals_reviewers = ["user"]
+allowed_sandbox_modes = ["read-only", "workspace-write"]

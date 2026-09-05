@@ -1,0 +1,200 @@
+FROM nvidia/cuda:13.1.2-devel-ubuntu24.04
+
+ARG UNAME=codex
+ARG UID=1000
+ARG GID=1000
+ARG CODEX_VERSION=latest
+ARG CODEX_ACP_VERSION=latest
+ARG IMAGE_VERSION=dev
+ARG VCS_REF=unknown
+ARG IMAGE_SOURCE=https://github.com/leafclick/codex-universal
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL org.opencontainers.image.title="codex-universal-cuda" \
+      org.opencontainers.image.description="Non-root NVIDIA CUDA development environment for OpenAI Codex" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}"
+
+ENV LANG=C.UTF-8
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:${PATH}
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Build-time CUDA sanity check. GPU access is intentionally not required at
+# image-build time; this verifies the devel image contains the toolkit.
+RUN nvcc --version \
+    && test -f /usr/local/cuda/include/cuda.h \
+    && test -f /usr/local/cuda/include/cuda_runtime.h
+
+# Development/runtime prerequisites. Avoid exact Ubuntu package-version pins so
+# security updates to Ubuntu 24.04 do not make otherwise identical builds fail.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        aggregate \
+        binutils \
+        bubblewrap \
+        build-essential \
+        bzr \
+        ca-certificates \
+        curl \
+        default-libmysqlclient-dev \
+        dnsutils \
+        fd-find \
+        fish \
+        fzf \
+        gettext \
+        gh \
+        git \
+        git-lfs \
+        gnupg \
+        inotify-tools \
+        iputils-ping \
+        jq \
+        less \
+        libbz2-dev \
+        libc6-dev \
+        libcurl4-openssl-dev \
+        libdb-dev \
+        libedit2 \
+        libffi-dev \
+        libgcc-13-dev \
+        libgdbm-compat-dev \
+        libgdbm-dev \
+        libgdiplus \
+        libgssapi-krb5-2 \
+        liblzma-dev \
+        libncurses-dev \
+        libnss3-dev \
+        libpq-dev \
+        libpsl-dev \
+        libpython3-dev \
+        libreadline-dev \
+        libsqlite3-dev \
+        libssl-dev \
+        libstdc++-13-dev \
+        libunwind8 \
+        libuuid1 \
+        libxml2-dev \
+        libz3-dev \
+        make \
+        man-db \
+        moreutils \
+        netcat-openbsd \
+        openssh-client \
+        pkg-config \
+        procps \
+        protobuf-compiler \
+        ripgrep \
+        rsync \
+        software-properties-common \
+        sqlite3 \
+        sudo \
+        swig \
+        tk-dev \
+        tzdata \
+        universal-ctags \
+        unixodbc-dev \
+        unzip \
+        uuid-dev \
+        wget \
+        xz-utils \
+        zip \
+        zlib1g \
+        zlib1g-dev \
+        zstd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a stable in-container user name while matching the host's numeric
+# UID/GID. NVIDIA's Ubuntu base can also contain a pre-existing numeric ID.
+RUN set -eux; \
+    [ "${UID}" -gt 0 ]; \
+    [ "${GID}" -gt 0 ]; \
+    if getent group "${GID}" >/dev/null; then \
+        group_name="$(getent group "${GID}" | cut -d: -f1)"; \
+    else \
+        group_name="${UNAME}"; \
+        groupadd --gid "${GID}" "${group_name}"; \
+    fi; \
+    existing_user="$(getent passwd "${UID}" | cut -d: -f1 || true)"; \
+    if [ -n "${existing_user}" ] && [ "${existing_user}" != "${UNAME}" ]; then \
+        usermod --login "${UNAME}" "${existing_user}"; \
+        usermod --home "/home/${UNAME}" --move-home "${UNAME}"; \
+        usermod --gid "${GID}" --shell /bin/bash "${UNAME}"; \
+    elif id "${UNAME}" >/dev/null 2>&1; then \
+        usermod --uid "${UID}" --gid "${GID}" --home "/home/${UNAME}" --shell /bin/bash "${UNAME}"; \
+    else \
+        useradd --create-home --uid "${UID}" --gid "${GID}" --shell /bin/bash "${UNAME}"; \
+    fi
+
+# Node.js 24.
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Global npm directory writable by the runtime user.
+RUN mkdir -p /usr/local/share/npm-global \
+    && chown "${UID}:${GID}" /usr/local/share/npm-global \
+    && chmod 755 /usr/local/share/npm-global
+
+ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
+ENV PATH=${PATH}:/usr/local/share/npm-global/bin
+
+RUN npm install -g \
+        "@openai/codex@${CODEX_VERSION}" \
+        "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
+    && npm cache clean --force
+
+# requirements.toml is an enforced Codex policy layer. In particular, an IDE
+# cannot switch the ACP session to automatic review or full access.
+COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
+COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint
+
+# Eclipse Temurin 25 JDK.
+RUN install -d -m 0755 /etc/apt/keyrings \
+    && wget -qO- https://packages.adoptium.net/artifactory/api/gpg/key/public \
+       | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo "${VERSION_CODENAME}") main" \
+       > /etc/apt/sources.list.d/adoptium.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends temurin-25-jdk \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clojure CLI. Force IPv4 for the installer because some Docker/DNS setups
+# have unreliable IPv6 connectivity.
+RUN cd /tmp \
+    && curl -4 -fsSL -o linux-install.sh \
+       https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh \
+    && sed -i 's/curl /curl -4 /g' linux-install.sh \
+    && chmod +x linux-install.sh \
+    && ./linux-install.sh \
+    && rm -f linux-install.sh
+
+# Leiningen.
+RUN cd /tmp \
+    && wget -q https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
+    && chmod +x lein \
+    && mv lein /usr/local/bin/lein \
+    && mkdir -p /opt/clojure \
+    && ln -s /usr/local/bin/lein /opt/clojure/lein \
+    && lein upgrade
+
+# deps.clj.
+RUN cd /tmp \
+    && wget -q https://raw.githubusercontent.com/borkdude/deps.clj/master/install \
+    && bash ./install \
+    && rm -f install
+
+ENV HOME=/home/${UNAME}
+
+RUN mkdir -p /workspace "/home/${UNAME}/.codex" "/home/${UNAME}/.m2" \
+    && chown -R "${UID}:${GID}" /workspace "/home/${UNAME}"
+
+WORKDIR /workspace
+USER ${UID}:${GID}
+
+# Preserve NVIDIA's entrypoint (it runs /opt/nvidia/entrypoint.d hooks), but
+# make Codex the command it ultimately executes. Thus arguments passed after
+# the image name become Codex arguments: `IMAGE resume --last`.
+ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh", "codex"]

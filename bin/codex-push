@@ -1,0 +1,517 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+CODEX_DIR="${CODEX_DIR:-$HOME/.codex}"
+SYNC_DIR="${CODEX_SYNC_DIR:-$HOME/Seafile/CodexSync}"
+LOCK_FILE="${CODEX_LOCK_FILE:-$HOME/.cache/codex-handoff.lock}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-handoff"
+BASE_FILE="$STATE_DIR/base.state"
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+for cmd in tar zstd sha256sum sqlite3 lsof flock awk find hostname realpath dirname; do
+    command -v "$cmd" >/dev/null || die "Missing command: $cmd"
+done
+
+normalize_path() {
+    local variable="$1"
+    local value="${!variable}"
+    local normalized
+
+    [[ "$value" == /* ]] || die "$variable must be an absolute path: $value"
+    normalized="$(realpath -m -- "$value")" || die "Cannot resolve $variable: $value"
+    [[ "$normalized" != / ]] || die "$variable must not be the filesystem root"
+    printf -v "$variable" '%s' "$normalized"
+}
+
+paths_overlap() {
+    [[ "$1" == "$2" || "$1" == "$2/"* || "$2" == "$1/"* ]]
+}
+
+validate_paths() {
+    normalize_path CODEX_DIR
+    normalize_path SYNC_DIR
+    normalize_path STATE_DIR
+    normalize_path LOCK_FILE
+
+    paths_overlap "$CODEX_DIR" "$SYNC_DIR" &&
+        die "CODEX_DIR and CODEX_SYNC_DIR must not overlap"
+    paths_overlap "$CODEX_DIR" "$STATE_DIR" &&
+        die "CODEX_DIR and XDG_STATE_HOME/codex-handoff must not overlap"
+    paths_overlap "$SYNC_DIR" "$STATE_DIR" &&
+        die "CODEX_SYNC_DIR and XDG_STATE_HOME/codex-handoff must not overlap"
+
+    for directory in "$CODEX_DIR" "$SYNC_DIR" "$STATE_DIR"; do
+        paths_overlap "$LOCK_FILE" "$directory" &&
+            die "CODEX_LOCK_FILE must be separate from Codex data directories"
+    done
+
+    BASE_FILE="$STATE_DIR/base.state"
+}
+
+validate_paths
+mkdir -p "$SYNC_DIR" "$STATE_DIR" "$(dirname "$LOCK_FILE")"
+
+[[ -d "$CODEX_DIR" ]] || die "$CODEX_DIR does not exist"
+
+state_value() {
+    local file="$1"
+    local key="$2"
+
+    awk -F= -v key="$key" '
+        $1 == key {
+            sub(/^[^=]*=/, "")
+            print
+            exit
+        }
+    ' "$file"
+}
+
+valid_hash() {
+    [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+state_hash_dir() {
+    local dir="$1"
+
+    LC_ALL=C tar \
+        --sort=name \
+        --format=gnu \
+        --mtime='@0' \
+        --owner=0 \
+        --group=0 \
+        --numeric-owner \
+        -C "$dir" \
+        -cf - . |
+        sha256sum |
+        awk '{print $1}'
+}
+
+check_sqlite() {
+    local dir="$1"
+
+    while IFS= read -r -d '' db; do
+        echo "  checking $(basename "$db")"
+
+        local result
+        result="$(sqlite3 "$db" 'PRAGMA integrity_check;')" ||
+            die "SQLite check failed: $db"
+
+        [[ "$result" == "ok" ]] ||
+            die "SQLite corruption detected in $db: $result"
+
+    done < <(find "$dir" -type f -name '*.sqlite' -print0)
+}
+
+write_base() {
+    local generation="$1"
+    local hash="$2"
+    local tmp="$BASE_FILE.tmp.$$"
+
+    {
+        echo "generation=$generation"
+        echo "sha256=$hash"
+    } > "$tmp"
+
+    mv "$tmp" "$BASE_FILE"
+}
+
+BASE_GEN=""
+BASE_HASH=""
+
+read_base() {
+    [[ -f "$BASE_FILE" ]] || return 1
+
+    local generation
+    local hash
+
+    generation="$(state_value "$BASE_FILE" generation)"
+    hash="$(state_value "$BASE_FILE" sha256)"
+
+    [[ "$generation" =~ ^[0-9]+$ ]] ||
+        die "Invalid generation in $BASE_FILE"
+
+    valid_hash "$hash" ||
+        die "Invalid hash in $BASE_FILE"
+
+    BASE_GEN=$((10#$generation))
+    BASE_HASH="$hash"
+
+    return 0
+}
+
+REMOTE_GEN=""
+REMOTE_HASH=""
+REMOTE_STATE_FILE=""
+
+load_latest_remote() {
+    local best_gen=-1
+    local best_hash=""
+    local best_file=""
+    local found=false
+
+    shopt -s nullglob
+    local files=("$SYNC_DIR"/codex-g*.tar.zst.state)
+
+    for state_file in "${files[@]}"; do
+        local generation
+        local hash
+
+        generation="$(state_value "$state_file" generation)"
+        hash="$(state_value "$state_file" sha256)"
+
+        [[ "$generation" =~ ^[0-9]+$ ]] || continue
+        valid_hash "$hash" || continue
+
+        generation=$((10#$generation))
+
+        if (( generation > best_gen )); then
+            best_gen="$generation"
+            best_hash="$hash"
+            best_file="$state_file"
+            found=true
+
+        elif (( generation == best_gen )); then
+            [[ "$hash" == "$best_hash" ]] ||
+                die "DIVERGENCE: generation $generation has multiple different hashes"
+        fi
+    done
+
+    $found || return 1
+
+    REMOTE_GEN="$best_gen"
+    REMOTE_HASH="$best_hash"
+    REMOTE_STATE_FILE="$best_file"
+
+    return 0
+}
+
+verify_remote_snapshot() {
+    local state_file="$1"
+
+    local archive_name
+    local archive_path
+    local checksum_path
+    local expected
+    local actual
+
+    archive_name="$(state_value "$state_file" archive)"
+
+    [[ -n "$archive_name" ]] ||
+        die "Remote state file has no archive field: $state_file"
+
+    [[ "$archive_name" != */* ]] ||
+        die "Invalid archive name in $state_file"
+
+    archive_path="$SYNC_DIR/$archive_name"
+    checksum_path="$archive_path.sha256"
+
+    [[ -f "$archive_path" ]] ||
+        die "Remote generation is incomplete: missing $archive_name"
+
+    [[ -f "$checksum_path" ]] ||
+        die "Remote generation is incomplete: missing $archive_name.sha256"
+
+    expected="$(tr -d '[:space:]' < "$checksum_path")"
+
+    valid_hash "$expected" ||
+        die "Invalid archive checksum file: $checksum_path"
+
+    actual="$(sha256sum "$archive_path" | awk '{print $1}')"
+
+    [[ "$actual" == "$expected" ]] ||
+        die "Remote archive checksum failed: $archive_name"
+}
+
+publish_file() {
+    local source="$1"
+    local destination_name="$2"
+    local partial
+
+    partial="$SYNC_DIR/.${destination_name}.partial.$$.$RANDOM"
+
+    cp -- "$source" "$partial"
+    sync "$partial"
+    mv -- "$partial" "$SYNC_DIR/$destination_name"
+}
+
+running_codex_containers() {
+    command -v docker >/dev/null 2>&1 || return 0
+    docker ps --format '{{.Names}}' 2>/dev/null |
+        grep '^codex-' || true
+}
+
+report_running_codex_containers() {
+    local running
+
+    running="$(running_codex_containers)"
+    [[ -n "$running" ]] || return 1
+
+    echo "Running Codex Docker containers:" >&2
+    while IFS= read -r container; do
+        printf '  %s\n' "$container" >&2
+    done <<< "$running"
+    return 0
+}
+
+#
+# Lock against codex-pull and run-codex.sh.
+#
+if report_running_codex_containers; then
+    die "Stop the listed Codex session(s) before pushing"
+fi
+
+exec 9>"$LOCK_FILE"
+
+if ! flock -n -x 9; then
+    report_running_codex_containers || true
+    die "Codex is running, starting, or another push/pull is active"
+fi
+
+#
+# Extra safety checks.
+#
+if lsof +D "$CODEX_DIR" >/dev/null 2>&1; then
+    echo "Open files under $CODEX_DIR:" >&2
+    lsof +D "$CODEX_DIR" >&2 || true
+    die "Stop Codex first"
+fi
+
+if report_running_codex_containers; then
+    die "Stop the listed Codex session(s) before pushing"
+fi
+
+#
+# Validate local state.
+#
+echo "Checking SQLite databases..."
+check_sqlite "$CODEX_DIR"
+
+echo "Calculating local state..."
+LOCAL_HASH="$(state_hash_dir "$CODEX_DIR")"
+
+#
+# Read local baseline.
+#
+if read_base; then
+    HAVE_BASE=true
+else
+    HAVE_BASE=false
+fi
+
+#
+# Read Seafile state.
+#
+if load_latest_remote; then
+    HAVE_REMOTE=true
+    verify_remote_snapshot "$REMOTE_STATE_FILE"
+else
+    HAVE_REMOTE=false
+fi
+
+REBUILD_REMOTE=false
+
+#
+# Decide what should happen.
+#
+if $HAVE_BASE; then
+
+    if ! $HAVE_REMOTE; then
+
+        #
+        # Important bootstrap/recovery case:
+        #
+        # We have a valid local baseline but Seafile is empty.
+        # If the local state still matches the baseline, we can safely
+        # recreate that same generation remotely.
+        #
+        if [[ "$LOCAL_HASH" == "$BASE_HASH" ]]; then
+            echo "Remote state is empty."
+            echo "Re-publishing local baseline generation $BASE_GEN."
+
+            NEXT_GEN="$BASE_GEN"
+            REBUILD_REMOTE=true
+        else
+            die "Remote state is empty, but local Codex changed since generation $BASE_GEN. Refusing automatic recovery."
+        fi
+
+    else
+
+        if (( REMOTE_GEN < BASE_GEN )); then
+            die "Remote generation $REMOTE_GEN is older than local baseline $BASE_GEN. Refusing."
+        fi
+
+        if (( REMOTE_GEN > BASE_GEN )); then
+
+            if [[ "$LOCAL_HASH" == "$BASE_HASH" ]]; then
+                die "Remote generation $REMOTE_GEN is newer. Run codex-pull first."
+            else
+                die "DIVERGENCE: remote advanced to generation $REMOTE_GEN and local Codex also changed."
+            fi
+        fi
+
+        #
+        # Same generation on both sides.
+        #
+        [[ "$REMOTE_HASH" == "$BASE_HASH" ]] ||
+            die "DIVERGENCE: remote generation $REMOTE_GEN differs from local baseline."
+
+        if [[ "$LOCAL_HASH" == "$BASE_HASH" ]]; then
+            echo "No changes. Codex state already matches Seafile generation $REMOTE_GEN."
+            exit 0
+        fi
+
+        NEXT_GEN=$((REMOTE_GEN + 1))
+    fi
+
+else
+
+    #
+    # No local baseline.
+    #
+    if $HAVE_REMOTE; then
+
+        if [[ "$LOCAL_HASH" == "$REMOTE_HASH" ]]; then
+            write_base "$REMOTE_GEN" "$REMOTE_HASH"
+
+            echo "No changes."
+            echo "Adopted Seafile generation $REMOTE_GEN as local baseline."
+            exit 0
+        fi
+
+        die "Remote generation $REMOTE_GEN exists but this machine has no baseline. Run 'codex-pull --force $REMOTE_GEN' if the remote state should win."
+    fi
+
+    #
+    # Completely fresh synchronization setup.
+    #
+    NEXT_GEN=1
+fi
+
+#
+# Create snapshot.
+#
+timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+
+host="$(hostname -s 2>/dev/null || echo unknown)"
+host="${host//[^A-Za-z0-9_.-]/_}"
+
+generation_padded="$(printf '%08d' "$NEXT_GEN")"
+nonce="$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+
+archive_name="codex-g${generation_padded}-${timestamp}-${host}-${nonce}.tar.zst"
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+archive="$tmpdir/$archive_name"
+
+echo "Creating generation $NEXT_GEN..."
+
+tar \
+    -C "$CODEX_DIR" \
+    -cf - . |
+    zstd \
+        -T0 \
+        -10 \
+        -q \
+        -o "$archive"
+
+archive_hash="$(sha256sum "$archive" | awk '{print $1}')"
+
+printf '%s\n' "$archive_hash" \
+    > "$tmpdir/$archive_name.sha256"
+
+cat > "$tmpdir/$archive_name.state" <<EOF
+format=1
+generation=$NEXT_GEN
+sha256=$LOCAL_HASH
+created=$timestamp
+host=$host
+archive=$archive_name
+EOF
+
+#
+# Check that Seafile state did not change while we were creating
+# the snapshot.
+#
+OLD_REMOTE_GEN="${REMOTE_GEN:-}"
+OLD_REMOTE_HASH="${REMOTE_HASH:-}"
+
+REMOTE_GEN=""
+REMOTE_HASH=""
+REMOTE_STATE_FILE=""
+
+if load_latest_remote; then
+
+    verify_remote_snapshot "$REMOTE_STATE_FILE"
+
+    if ! $HAVE_REMOTE; then
+        die "Remote state appeared while creating the snapshot. Aborting."
+    fi
+
+    [[ "$REMOTE_GEN" == "$OLD_REMOTE_GEN" ]] ||
+        die "Remote generation changed while creating the snapshot. Aborting."
+
+    [[ "$REMOTE_HASH" == "$OLD_REMOTE_HASH" ]] ||
+        die "Remote state changed while creating the snapshot. Aborting."
+
+else
+
+    if $HAVE_REMOTE; then
+        die "Remote state disappeared while creating the snapshot. Aborting."
+    fi
+
+    #
+    # Empty remote is expected for:
+    #   - initial generation 1
+    #   - reconstruction of a missing remote baseline
+    #
+fi
+
+#
+# Publish:
+#
+#   1. archive
+#   2. archive checksum
+#   3. state file LAST
+#
+# The .state file is the commit marker.
+#
+publish_file \
+    "$archive" \
+    "$archive_name"
+
+publish_file \
+    "$tmpdir/$archive_name.sha256" \
+    "$archive_name.sha256"
+
+publish_file \
+    "$tmpdir/$archive_name.state" \
+    "$archive_name.state"
+
+sync \
+    "$SYNC_DIR/$archive_name" \
+    "$SYNC_DIR/$archive_name.sha256" \
+    "$SYNC_DIR/$archive_name.state"
+
+#
+# Update local baseline only after the complete snapshot has been
+# published locally into the Seafile directory.
+#
+write_base "$NEXT_GEN" "$LOCAL_HASH"
+
+echo
+if $REBUILD_REMOTE; then
+    echo "Re-published Codex generation $NEXT_GEN."
+else
+    echo "Published Codex generation $NEXT_GEN."
+fi
+
+echo "  $archive_name"
+echo
+echo "Wait for Seafile to report synchronized before switching machines."
