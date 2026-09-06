@@ -540,7 +540,7 @@ smoke_image() {
         set -Eeuo pipefail
         (( $(id -u) > 0 ))
         (( $(id -g) > 0 ))
-        command -v bubblewrap >/dev/null
+        command -v bwrap >/dev/null
         command -v codex >/dev/null
         command -v codex-acp >/dev/null
         command -v codex-acp-entrypoint >/dev/null

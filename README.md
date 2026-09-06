@@ -448,6 +448,21 @@ To run the non-synchronization checks while a Codex container remains active:
 CODEX_TEST_SKIP_SYNC=1 ./tests/host-smoke.sh
 ```
 
+To check only a locally available CUDA image, use an intentionally absent
+generic image name. This form works in Bash and Fish:
+
+```bash
+env \
+  CODEX_TEST_SKIP_SYNC=1 \
+  CODEX_TEST_GENERIC_IMAGE=local/skip-generic:not-present \
+  CODEX_TEST_CUDA_IMAGE=leafclick/codex-universal-cuda:latest \
+  ./tests/host-smoke.sh
+```
+
+This is a lightweight container/runtime check: it verifies the CUDA compiler,
+headers, and GPU visibility through `nvidia-smi`. Project-level CUDA workloads
+remain the responsibility of the project using the image.
+
 Set `CODEX_TEST_SKIP_CUDA=1` to omit the CUDA image check on a host without an
 NVIDIA runtime. Set `CODEX_TEST_SKIP_IMAGE=1` to omit all real-image checks.
 
@@ -786,10 +801,54 @@ Setup:
    auto-review, which the image policy intentionally rejects. The image also
    rejects `never` and full-access modes.
 
-7. In the new IDEA chat, ask the agent to run `pwd` and read a few lines from a
-   project file. Neither operation should request approval. Then perform the
-   [manual approval-boundary check](#manual-approval-boundary-check) if you
-   want to verify `.git` and network approval behavior through ACP as well.
+7. In the new IDEA chat, use the
+   [Codex-side MCP smoke test](#codex-side-idea-mcp-smoke-test). If the client
+   exposes MCP connection status, confirm that `idea` is connected first, but
+   treat successful tool calls as the authoritative check. Neither the test's
+   shell reads nor its IDEA calls should request approval. Perform the
+   [manual approval-boundary check](#manual-approval-boundary-check) as a
+   separate test if you also want to verify `.git` and network behavior through
+   ACP.
+
+### Codex-side IDEA MCP smoke test
+
+Paste this prompt into the **Dockerized Codex** chat. It is deliberately
+read-only and verifies both path identity and actual MCP tool use rather than
+merely checking a client status display. Start a new chat after changing the
+target project's `AGENTS.md`, because project instructions are loaded when the
+Codex session starts.
+
+```text
+Perform a read-only IntelliJ MCP smoke test. Do not modify files, use the
+network, request escalation, or invoke any write-capable tool.
+
+1. State the active repository instruction that governs semantic navigation
+   versus text search. If no such instruction was loaded, report that but
+   continue the connection test.
+2. Through the container shell, run `pwd` and `git status --short`. Record the
+   exact project path and the exact Git-status output as the baseline.
+3. For the rest of the inspection, use `mcp__idea__` tools instead of `rg`,
+   `grep`, `sed`, `find`, or `cat`:
+   - list the project root;
+   - read `AGENTS.md`, or `README.md` if `AGENTS.md` is absent;
+   - search for a filename and for text observed in that file;
+   - when the project contains a supported source file, resolve one symbol,
+     request its symbol information, and request diagnostics for its file.
+4. Pass the exact path returned by `pwd` as `projectPath` in every IDEA call.
+   Do not translate it to `/workspace/...` or follow a second-path alias.
+5. If IDEA exposes shell execution, file mutation, run-configuration,
+   debugger, database, or settings-management tools, do not invoke them;
+   report `SECURITY FAILURE` and list their names. An unsupported semantic
+   operation is not a connection failure and must not be reported as proof
+   that a symbol has no references or callers.
+6. Run `git status --short` again through the container shell and compare it
+   byte-for-byte with the baseline.
+
+Report each MCP tool called, the `projectPath` used, what it established, and
+PASS or FAIL. The test passes only if IDEA calls returned project data, every
+path exactly matched `pwd`, no unsafe IDEA capability was exposed, and Git
+status was unchanged.
+```
 
 The command preserves other agents and settings in the file, and records the
 absolute path of the installed `run-codex`. The resulting entry is equivalent

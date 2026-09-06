@@ -31,6 +31,19 @@ This repository builds non-root Docker environments for OpenAI Codex and provide
 
 - Preserve unrelated user changes and inspect both staged and unstaged diffs before editing.
 - Do not stage, commit, push, or rewrite Git history unless the user explicitly requests it.
+- Prefer available language-aware MCP tools over `rg`, `grep`, or `sed` for
+  definitions, references, symbol documentation, diagnostics, and call
+  relationships. In terminal Clojure sessions use the `clojure_lsp` tools; in
+  IntelliJ ACP sessions use the read-only `mcp__idea__` tools and pass the
+  session's exact `pwd` as `projectPath` without rewriting it to `/workspace`.
+- Use `rg` for literal text, filenames, configuration, generated identifiers,
+  or when semantic tooling is unavailable. Use `sed` only to display a known
+  file range, not as a substitute for symbol navigation. If a semantic
+  operation is unsupported, say so before falling back; do not infer that a
+  symbol has no references or callers.
+- During investigation, prefer read-only MCP operations. Use formatting,
+  rename, refactoring, or other write-capable semantic tools only when the
+  requested task authorizes working-tree changes, and inspect their diff.
 - Use Bash with `set -Eeuo pipefail`, quote path expansions, and use `--` before user-controlled path operands where supported.
 - Treat paths derived from environment variables as untrusted configuration. Reject filesystem-root and unsafe overlapping paths before destructive operations.
 - Keep generic and CUDA Dockerfiles behaviorally aligned unless a difference is CUDA-specific.
