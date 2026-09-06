@@ -67,6 +67,7 @@ for script in \
     "$ROOT/bin/setup-codex-idea" \
     "$ROOT/bin/codex-push" \
     "$ROOT/bin/codex-pull" \
+    "$ROOT/container/codex-entrypoint" \
     "$ROOT/container/codex-acp-entrypoint" \
     "$ROOT/container/codex-clojure-lsp-mcp" \
     "$ROOT/container/install-clojure-tools"; do
@@ -211,7 +212,21 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") does not install the LSP MCP bridge"
     grep -qE '^[[:space:]]+socat([[:space:]\\]|$)' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install the IntelliJ MCP relay"
+    grep -qE '^[[:space:]]+libnss-wrapper([[:space:]\\]|$)' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install arbitrary-user NSS support"
+    grep -Fxq 'USER 65532:65532' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not declare the portable non-root user"
+    grep -q 'container/codex-entrypoint /usr/local/bin/codex-entrypoint' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install the portable-user entrypoint"
+    if grep -qE '^ARG (UID|GID)=' "$dockerfile"; then
+        fail "$(basename "$dockerfile") still bakes the host UID/GID into the image"
+    fi
 done
+grep -Fq 'exec /opt/nvidia/nvidia_entrypoint.sh "$0" "$@"' \
+    "$ROOT/container/codex-entrypoint" ||
+    fail "portable-user entrypoint does not preserve NVIDIA initialization"
+grep -Fq 'exec 1>&3 3>&-' "$ROOT/container/codex-entrypoint" ||
+    fail "portable-user entrypoint does not restore CUDA ACP stdout"
 grep -Fq 'TCP4-LISTEN:${relay_port},bind=127.0.0.1' \
     "$ROOT/container/codex-acp-entrypoint" ||
     fail "ACP entrypoint does not restrict its MCP relay to container loopback"
@@ -229,7 +244,7 @@ printf '%s\n' \
     '        if [[ "${2:-}" == inspect && "${3:-}" == --format ]]; then' \
     '            case "${4:-}" in' \
     '                "{{.Id}}") printf "%s\\n" sha256:doctor-image ;;' \
-    '                "{{.Config.User}}") printf "%s:%s\\n" "$(id -u)" "$(id -g)" ;;' \
+    '                "{{.Config.User}}") printf "%s\\n" "${CODEX_TEST_IMAGE_USER:-65532:65532}" ;;' \
     '                *org.opencontainers.image.version*) printf "%s\\n" test-version ;;' \
     '                *org.opencontainers.image.revision*) printf "%s\\n" 0123456789abcdef ;;' \
     '            esac' \
@@ -314,6 +329,7 @@ assert_contains "$doctor_missing_output" \
 
 doctor_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --doctor smoke-project)"
 assert_contains "$doctor_output" "PASS  Required host commands are available"
+assert_contains "$doctor_output" "PASS  Host runtime identity is non-root ($(id -u):$(id -g))"
 assert_contains "$doctor_output" "PASS  Docker daemon is available"
 assert_contains "$doctor_output" "PASS  Project 'smoke-project' resolves to $TEST_ROOT/repo (generic)"
 assert_contains "$doctor_output" \
@@ -323,14 +339,23 @@ assert_contains "$doctor_output" "PASS  Local image is available: example/codex-
 assert_contains "$doctor_output" "image id: sha256:doctor-image"
 assert_contains "$doctor_output" "version:  test-version"
 assert_contains "$doctor_output" "revision: 0123456789abcdef"
-assert_contains "$doctor_output" "PASS  Image user matches host UID/GID ($(id -u):$(id -g))"
+assert_contains "$doctor_output" "PASS  Image declares a fixed non-root user (65532:65532)"
 assert_contains "$doctor_output" "PASS  AppArmor, seccomp, and Bubblewrap sandbox probe"
-assert_contains "$doctor_output" "PASS  Image tools and managed Codex policy"
+assert_contains "$doctor_output" \
+    "PASS  Portable runtime identity, read-only image, tools, and managed Codex policy"
 assert_contains "$doctor_output" "PASS  Clojure LSP MCP handshake and tool allowlist"
 assert_contains "$doctor_output" "Diagnostics passed with 0 warning(s)."
 assert_contains "$doctor_output" "--network none"
 assert_contains "$doctor_output" "--cap-drop=ALL"
 assert_not_contains "$doctor_output" "$TEST_ROOT/repo:"
+
+if "${launcher_env[@]}" CODEX_TEST_IMAGE_USER=0:0 \
+    "$ROOT/bin/run-codex" --doctor smoke-project \
+    >"$TEST_ROOT/doctor-root-image.out" 2>&1; then
+    fail "doctor accepted an image with a root default user"
+fi
+assert_contains "$(<"$TEST_ROOT/doctor-root-image.out")" \
+    "FAIL  Image must declare an explicit non-root numeric user: '0:0'"
 
 doctor_no_mcp_output="$(
     "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=0 \
@@ -356,6 +381,11 @@ new_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new)"
 resume_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project)"
 
 for output in "$new_output" "$resume_output"; do
+    assert_contains "$output" "--read-only"
+    assert_contains "$output" "--tmpfs /home/codex:rw,nosuid,nodev,uid=$(id -u),gid=$(id -g),mode=0700"
+    assert_contains "$output" "--tmpfs /tmp:rw,nosuid,nodev,mode=1777"
+    assert_contains "$output" \
+        "--tmpfs /run/codex-runtime:rw,nosuid,nodev,noexec,uid=$(id -u),gid=$(id -g),mode=0700"
     assert_contains "$output" "--cap-drop=ALL"
     assert_contains "$output" "--security-opt=no-new-privileges"
     assert_contains "$output" "--security-opt apparmor=codex-universal"
@@ -404,6 +434,8 @@ grep -Fxq -- '--model' "$forwarded_argv_log" ||
     fail "forwarded model flag is not a distinct Docker argument"
 grep -Fxq -- 'gpt-5.6-sol' "$forwarded_argv_log" ||
     fail "forwarded model value is not a distinct Docker argument"
+grep -Fxq -- 'codex' "$forwarded_argv_log" ||
+    fail "launcher did not select Codex through the portable-user entrypoint"
 grep -Fxq -- 'model_reasoning_effort=\"high\"' "$forwarded_argv_log" ||
     fail "forwarded reasoning setting changed argument boundaries"
 grep -Fxq -- '/workspace/smoke-project/prompt-image.png' "$forwarded_argv_log" ||
@@ -464,7 +496,8 @@ assert_contains "$(<"$TEST_ROOT/outside-image.out")" \
     "Codex image must resolve inside the registered project"
 
 idea_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --idea smoke-project)"
-assert_contains "$idea_output" "--entrypoint codex-acp-entrypoint"
+assert_contains "$idea_output" "--entrypoint /usr/local/bin/codex-entrypoint"
+assert_contains "$idea_output" "/usr/local/bin/codex-acp-entrypoint"
 assert_contains "$idea_output" "INITIAL_AGENT_MODE=read-only"
 assert_contains "$idea_output" 'CODEX_PATH=/usr/local/share/npm-global/bin/codex'
 assert_contains "$idea_output" 'approval_policy":"on-request"'
@@ -626,30 +659,23 @@ jq -e \
     fail "IDEA setup did not create the expected Dockerized Codex agent"
 pass "JetBrains ACP configuration"
 
-# Verify that the build helper propagates the invoking user rather than using
-# root. A root invocation must fail before reaching Docker.
-if ((EUID == 0 || $(id -g) == 0)); then
-    if "${launcher_env[@]}" "$ROOT/docker-build.sh" generic >/dev/null 2>&1; then
-        fail "build helper accepted UID/GID 0"
-    fi
-else
-    build_output="$(
-        "${launcher_env[@]}" \
-            IMAGE_SLUG=codex-host-smoke \
-            IMAGE_VERSION=test-version \
-            TAG_LATEST=1 \
-            PULL=0 \
-            "$ROOT/docker-build.sh" generic
-    )"
-    assert_contains "$build_output" "--build-arg UID=$(id -u)"
-    assert_contains "$build_output" "--build-arg GID=$(id -g)"
-    assert_contains "$build_output" "--build-arg CODEX_ACP_VERSION=latest"
-    assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=latest"
-    assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
-    assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
-    assert_contains "$build_output" "-t codex-host-smoke-generic:latest"
-fi
-pass "non-root image build policy"
+# Verify that one build is portable instead of capturing the builder's UID/GID.
+build_output="$(
+    "${launcher_env[@]}" \
+        IMAGE_SLUG=codex-host-smoke \
+        IMAGE_VERSION=test-version \
+        TAG_LATEST=1 \
+        PULL=0 \
+        "$ROOT/docker-build.sh" generic
+)"
+assert_not_contains "$build_output" "--build-arg UID="
+assert_not_contains "$build_output" "--build-arg GID="
+assert_contains "$build_output" "--build-arg CODEX_ACP_VERSION=latest"
+assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=latest"
+assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
+assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
+assert_contains "$build_output" "-t codex-host-smoke-generic:latest"
+pass "portable non-root image build policy"
 
 # A local checkout without an origin remote must still derive a version and
 # use the documented fallback image slug without tripping Bash nounset mode.
@@ -663,16 +689,14 @@ git -C "$TEST_ROOT/no-origin" \
     -c commit.gpgSign=false \
     commit -q -m initial
 
-if ((EUID != 0 && $(id -g) != 0)); then
-    no_origin_output="$(
-        "${launcher_env[@]}" \
-            TAG_LATEST=0 \
-            PULL=0 \
-            "$TEST_ROOT/no-origin/docker-build.sh" generic
-    )"
-    assert_contains "$no_origin_output" "leafclick/codex-universal-generic:dev-"
-    assert_contains "$no_origin_output" "--build-arg IMAGE_SOURCE="
-fi
+no_origin_output="$(
+    "${launcher_env[@]}" \
+        TAG_LATEST=0 \
+        PULL=0 \
+        "$TEST_ROOT/no-origin/docker-build.sh" generic
+)"
+assert_contains "$no_origin_output" "leafclick/codex-universal-generic:dev-"
+assert_contains "$no_origin_output" "--build-arg IMAGE_SOURCE="
 pass "Git metadata fallback without origin"
 
 if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
@@ -784,35 +808,55 @@ CUDA_TEST_IMAGE="${CODEX_TEST_CUDA_IMAGE:-leafclick/codex-universal-cuda:latest}
 smoke_image() {
     local profile="$1"
     local image="$2"
+    local runtime_uid=42424
+    local runtime_gid=42425
     local docker_args=(
         run
         --rm
         --pull=never
         --network none
+        --read-only
+        --tmpfs "/home/codex:rw,nosuid,nodev,uid=$runtime_uid,gid=$runtime_gid,mode=0700"
+        --tmpfs "/tmp:rw,nosuid,nodev,mode=1777"
+        --tmpfs "/run/codex-runtime:rw,nosuid,nodev,noexec,uid=$runtime_uid,gid=$runtime_gid,mode=0700"
+        --tmpfs "/workspace:rw,nosuid,nodev,uid=$runtime_uid,gid=$runtime_gid,mode=0700"
         --cap-drop=ALL
         --security-opt=no-new-privileges
         --security-opt apparmor=codex-universal
         --security-opt "seccomp=$ROOT/security/seccomp/codex-bwrap.json"
+        --user "$runtime_uid:$runtime_gid"
+        -e HOME=/home/codex
+        --entrypoint /usr/local/bin/codex-entrypoint
     )
 
     if [[ "$profile" == cuda ]]; then
-        docker_args+=(
-            --gpus all
-            --entrypoint /opt/nvidia/nvidia_entrypoint.sh
-        )
-    else
-        docker_args+=(--entrypoint /bin/bash)
+        docker_args+=(--gpus all)
     fi
 
-    docker_args+=("$image")
-    if [[ "$profile" == cuda ]]; then
-        docker_args+=(/bin/bash)
-    fi
+    docker_args+=("$image" /bin/bash)
 
     docker "${docker_args[@]}" -c '
         set -Eeuo pipefail
-        (( $(id -u) > 0 ))
-        (( $(id -g) > 0 ))
+        [[ "$(id -u)" == "$2" ]]
+        [[ "$(id -g)" == "$3" ]]
+        [[ "$(id -un)" == codex ]]
+        [[ "$(id -gn)" == codex ]]
+        [[ "$NSS_WRAPPER_PASSWD" == /run/codex-runtime/* ]]
+        [[ -r "$NSS_WRAPPER_PASSWD" && -r "$NSS_WRAPPER_GROUP" ]]
+        touch "$HOME/runtime-home-is-writable"
+        touch /tmp/runtime-tmp-is-writable
+        touch /workspace/runtime-workspace-is-writable
+        if touch /usr/local/bin/image-root-is-read-only 2>/dev/null; then
+            exit 1
+        fi
+        root_mount_options=""
+        while read -r _ mountpoint _ options _; do
+            if [[ "$mountpoint" == / ]]; then
+                root_mount_options="$options"
+                break
+            fi
+        done < /proc/mounts
+        [[ ",$root_mount_options," == *,ro,* ]]
         command -v bwrap >/dev/null
         command -v codex >/dev/null
         command -v codex-acp >/dev/null
@@ -826,13 +870,17 @@ smoke_image() {
         command -v socat >/dev/null
         command -v zstd >/dev/null
         test -r /etc/codex/requirements.toml
+        [[ "$(stat -c %u /usr/local/bin/codex-entrypoint)" == 0 ]]
+        [[ "$(stat -c %u /usr/local/share/npm-global/bin/codex)" == 0 ]]
+        [[ "$(stat -c %u /etc/codex/requirements.toml)" == 0 ]]
         bwrap \
             --unshare-user \
             --unshare-pid \
             --unshare-net \
             --ro-bind / / \
             --tmpfs /proc \
-            /bin/true
+            --tmpfs /tmp \
+            /bin/bash -c '\''[[ "$(id -un)" == codex && "$(id -gn)" == codex ]]'\''
         coproc MCP_BRIDGE {
             exec codex-clojure-lsp-mcp clojure:clojure-lsp
         }
@@ -866,6 +914,7 @@ smoke_image() {
             -c '\''approvals_reviewer="user"'\'' \
             --help >/dev/null
         if [[ "$1" == cuda ]]; then
+            [[ "${CODEX_NVIDIA_ENTRYPOINT_RAN:-}" == 1 ]]
             command -v nvcc >/dev/null
             command -v nvidia-smi >/dev/null
             test -f /usr/local/cuda/include/cuda.h
@@ -873,7 +922,7 @@ smoke_image() {
             nvcc --version
             nvidia-smi >/dev/null
         fi
-    ' host-smoke "$profile"
+    ' host-smoke "$profile" "$runtime_uid" "$runtime_gid"
     pass "$profile container image $image"
 }
 

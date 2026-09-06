@@ -135,15 +135,6 @@ resolve_git_metadata
 [[ "$IMAGE_VERSION" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] ||
     die "Invalid Docker IMAGE_VERSION: $IMAGE_VERSION"
 
-HOST_UID="$(id -u)"
-HOST_GID="$(id -g)"
-
-if [[ "$HOST_UID" == 0 || "$HOST_GID" == 0 ]]; then
-    echo "ERROR: Refusing to build a Codex image for UID/GID 0." >&2
-    echo "Run this script as the non-root user who will run Codex." >&2
-    exit 1
-fi
-
 command -v docker >/dev/null 2>&1 || die "docker is not installed"
 
 docker info >/dev/null 2>&1 || die "Docker daemon is not available"
@@ -162,8 +153,6 @@ build_one() {
     local args=(
         build
         -f "$dockerfile"
-        --build-arg "UID=$HOST_UID"
-        --build-arg "GID=$HOST_GID"
         --build-arg "CODEX_VERSION=$CODEX_VERSION"
         --build-arg "CODEX_ACP_VERSION=$CODEX_ACP_VERSION"
         --build-arg "AGENT_LSP_VERSION=$AGENT_LSP_VERSION"

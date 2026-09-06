@@ -95,10 +95,11 @@ run-codex --doctor my-project
 
 The doctor is local-only and does not pull or build images, access the network,
 invoke `sudo`, mount the project into its diagnostic container, or modify
-persistent Codex state. It reports the registered project and profile, local
-image identity, host UID/GID match, sandbox operation, installed tool versions,
-and the Clojure LSP MCP initialize handshake. A CUDA project additionally
-checks GPU access. Optional integrations are reported as warnings or skips.
+persistent Codex state. It reports the registered project and profile, fixed
+non-root image identity, host runtime UID/GID, read-only image boundary,
+sandbox operation, installed tool versions, and the Clojure LSP MCP initialize
+handshake. A CUDA project additionally checks GPU access and NVIDIA entrypoint
+execution. Optional integrations are reported as warnings or skips.
 
 Then exit Codex and run the host smoke suite from the `codex-universal`
 checkout. This short form skips optional state-synchronization tests but still
@@ -317,15 +318,25 @@ IMAGE_SLUG=ghcr.io/myorg/codex-universal ./docker-build.sh all
 
 `IMAGE_PREFIX` and `TAG` remain supported as compatibility aliases for `IMAGE_SLUG` and `IMAGE_VERSION`.
 
-`run-codex` uses the `latest` alias unless told otherwise. To select the immutable tag produced by the build:
+`run-codex` uses the `latest` alias unless told otherwise. A pre-built image can
+be pulled once and selected by its immutable tag without rebuilding it for the
+local UID/GID:
 
 ```bash
+docker pull ghcr.io/myorg/codex-universal-generic:1.0.0
 CODEX_IMAGE_SLUG=ghcr.io/myorg/codex-universal \
 CODEX_IMAGE_TAG=1.0.0 \
   run-codex my-project
 ```
 
-The images are built using the host numeric UID and GID so bind-mounted files remain owned by the host user. Run the build helper as that non-root user; it rejects UID or GID 0 rather than creating a root Codex image.
+Images use a fixed non-root default identity (`65532:65532`) and do not capture
+the builder's UID or GID. `run-codex` replaces that identity with the invoking
+host user's numeric UID/GID, supplies the stable `codex` name through a private
+NSS database, and starts the container with a read-only root filesystem.
+Consequently, the same immutable pre-built image can be used on machines whose
+users have different numeric identities. Installed image content remains
+root-owned; writable state is provided only through explicit bind mounts and
+per-container tmpfs mounts.
 
 ## Clojure command-line tooling
 
@@ -572,9 +583,13 @@ env \
   ./tests/host-smoke.sh
 ```
 
-This is a lightweight container/runtime check: it verifies the CUDA compiler,
-headers, and GPU visibility through `nvidia-smi`. Project-level CUDA workloads
-remain the responsibility of the project using the image.
+This is a lightweight container/runtime check: it runs the image under a
+numeric UID/GID different from its built-in identity, verifies the read-only
+root and writable tmpfs boundaries, confirms that NVIDIA's upstream entrypoint
+hands off the requested command, and checks the CUDA compiler, headers, and
+GPU visibility through `nvidia-smi`. In IDEA mode the NVIDIA initialization
+banner is routed to stderr so ACP stdout remains protocol-only. Project-level
+CUDA workloads remain the responsibility of the project using the image.
 
 Set `CODEX_TEST_SKIP_CUDA=1` to omit the CUDA image check on a host without an
 NVIDIA runtime. Set `CODEX_TEST_SKIP_IMAGE=1` to omit all real-image checks.
@@ -769,7 +784,8 @@ run-codex --doctor my-project
 ```
 
 The command exits successfully only when the required host commands, Docker
-daemon, registered project, selected image, image UID/GID, managed policy,
+daemon, registered project, selected image, fixed non-root image identity,
+host runtime identity, read-only root, managed policy,
 AppArmor/seccomp/Bubblewrap sandbox, and image runtime checks pass. When the
 terminal Clojure MCP integration is enabled, the runtime check performs a real
 MCP initialize handshake and verifies that the selected image advertises every
@@ -912,9 +928,9 @@ run-codex my-project --new
 ```
 
 Use `--new` for this first launch because there is no earlier session to resume.
-The launcher creates host `~/.codex` with restrictive permissions, mounts it at
-the container user's home with the invoking user's numeric UID/GID, and then
-starts Codex's interactive login.
+The launcher creates host `~/.codex` with restrictive permissions, mounts it
+under the container user's ephemeral home, runs with the invoking user's
+numeric UID/GID, and then starts Codex's interactive login.
 
 For a headless or container installation, the recommended ChatGPT login path is:
 
@@ -1239,11 +1255,18 @@ A project such as `my-project` is launched approximately as:
 host project       -> /workspace/my-project
 ~/.codex           -> container user's ~/.codex
 ~/.m2              -> container user's ~/.m2
+per-container tmpfs -> container user's home, /tmp, and private runtime metadata
 ```
 
 Sharing `~/.m2` avoids repeatedly downloading large Maven/Clojure dependencies, particularly CUDA libraries.
 
-The container runs using the host numeric UID/GID.
+The container runs using the host numeric UID/GID, regardless of the fixed
+identity stored in the image. Its root filesystem is read-only. The project,
+`~/.codex`, and `~/.m2` bind mounts remain writable, while ephemeral home/cache
+files and `/tmp` live in tmpfs. A private NSS database maps the host numeric
+identity to the stable in-container name `codex`; it resides in a dedicated
+runtime tmpfs that remains visible but read-only inside nested sandboxes. This
+does not modify `/etc` or require starting as root.
 
 ## Codex state synchronization
 
@@ -1298,7 +1321,10 @@ See [Codex state synchronization](docs/codex-sync.md) for required host software
 
 ## Security
 
-Security is layered: Docker limits host exposure, and Codex applies its `workspace-write` sandbox to spawned commands. The launcher also drops all Linux capabilities and enables Docker's `no-new-privileges` control.
+Security is layered: Docker limits host exposure, mounts the image filesystem
+read-only, and Codex applies its `workspace-write` sandbox to spawned commands.
+The launcher also drops all Linux capabilities and enables Docker's
+`no-new-privileges` control.
 
 The container receives access to:
 

@@ -7,8 +7,8 @@ Contributions should preserve the project's non-root runtime, explicit approval 
 Use a Debian, Ubuntu, or comparable GNU/Linux host. Install the base requirements from the [README](README.md#host-requirements) and the synchronization dependencies from [docs/codex-sync.md](docs/codex-sync.md#install-required-software).
 
 Install the host sandbox policy and commands, then build the relevant image as
-described in the README. Run builds as the same non-root user who will run
-Codex.
+described in the README. Images use a fixed non-root identity and must remain
+portable across builder and runtime UID/GID values.
 
 ## Making changes
 
@@ -32,7 +32,8 @@ It does not require a host Codex installation or internet access. With the
 documented synchronization tools installed, it exercises push/pull behavior
 using temporary directories. When Docker and the default generic or CUDA
 images are available, it validates each already-local image in a container
-started with networking disabled. It does not pull or build images.
+started with networking disabled, an arbitrary non-root identity, and a
+read-only root filesystem. It does not pull or build images.
 
 Stop all `codex-*` containers before running the complete suite. This is required because the synchronization commands refuse to operate while a Codex session is active. Use `CODEX_TEST_SKIP_SYNC=1` only for a reduced run that intentionally omits synchronization behavior.
 
@@ -51,7 +52,7 @@ intentionally running without that optional profile.
 For focused shell changes, also run:
 
 ```bash
-bash -n docker-build.sh bin/run-codex bin/setup-codex-host-security bin/setup-codex-idea bin/codex-push bin/codex-pull container/codex-acp-entrypoint tests/host-smoke.sh
+bash -n docker-build.sh bin/run-codex bin/setup-codex-host-security bin/setup-codex-idea bin/codex-push bin/codex-pull container/codex-entrypoint container/codex-acp-entrypoint container/codex-clojure-lsp-mcp tests/host-smoke.sh
 git diff --check
 git diff --cached --check
 ```

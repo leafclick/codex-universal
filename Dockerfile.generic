@@ -1,8 +1,5 @@
 FROM ubuntu:24.04
 
-ARG UNAME=codex
-ARG UID=1000
-ARG GID=1000
 ARG DEBIAN_FRONTEND=noninteractive
 
 ENV LANG=C.UTF-8
@@ -47,6 +44,7 @@ RUN apt-get update \
         libgssapi-krb5-2 \
         liblzma-dev \
         libncurses-dev \
+        libnss-wrapper \
         libnss3-dev \
         libpq-dev \
         libpsl-dev \
@@ -88,37 +86,25 @@ RUN apt-get update \
         zstd \
     && rm -rf /var/lib/apt/lists/*
 
-# Create a stable in-container user name while matching the host's numeric
-# UID/GID. Ubuntu images may already contain UID/GID 1000 (usually "ubuntu").
-RUN set -eux; \
-    [ "${UID}" -gt 0 ]; \
-    [ "${GID}" -gt 0 ]; \
-    if getent group "${GID}" >/dev/null; then \
-        group_name="$(getent group "${GID}" | cut -d: -f1)"; \
-    else \
-        group_name="${UNAME}"; \
-        groupadd --gid "${GID}" "${group_name}"; \
-    fi; \
-    existing_user="$(getent passwd "${UID}" | cut -d: -f1 || true)"; \
-    if [ -n "${existing_user}" ] && [ "${existing_user}" != "${UNAME}" ]; then \
-        usermod --login "${UNAME}" "${existing_user}"; \
-        usermod --home "/home/${UNAME}" --move-home "${UNAME}"; \
-        usermod --gid "${GID}" --shell /bin/bash "${UNAME}"; \
-    elif id "${UNAME}" >/dev/null 2>&1; then \
-        usermod --uid "${UID}" --gid "${GID}" --home "/home/${UNAME}" --shell /bin/bash "${UNAME}"; \
-    else \
-        useradd --create-home --uid "${UID}" --gid "${GID}" --shell /bin/bash "${UNAME}"; \
-    fi
+# Give the image a fixed non-root default identity. run-codex replaces this
+# with the invoking host user's numeric identity and supplies a writable tmpfs
+# home, so one immutable image can run on hosts with different UID/GID values.
+RUN groupadd --gid 65532 codex \
+    && useradd \
+        --uid 65532 \
+        --gid 65532 \
+        --home-dir /home/codex \
+        --shell /bin/bash \
+        --no-create-home \
+        codex
 
 # Node.js 24.
 RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Global npm directory writable by the runtime user.
-RUN mkdir -p /usr/local/share/npm-global \
-    && chown "${UID}:${GID}" /usr/local/share/npm-global \
-    && chmod 755 /usr/local/share/npm-global
+# Installed tools are root-owned and immutable at runtime.
+RUN install -d -o root -g root -m 0755 /usr/local/share/npm-global
 
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=${PATH}:/usr/local/share/npm-global/bin
@@ -178,20 +164,26 @@ RUN npm install -g \
 # requirements.toml is an enforced Codex policy layer. In particular, an IDE
 # cannot switch the ACP session to automatic review or full access.
 COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
+COPY --chmod=0755 container/codex-entrypoint /usr/local/bin/codex-entrypoint
 COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint
 COPY --chmod=0755 container/codex-clojure-lsp-mcp /usr/local/bin/codex-clojure-lsp-mcp
 
-ENV HOME=/home/${UNAME}
+ENV HOME=/home/codex
 
-RUN mkdir -p /workspace "/home/${UNAME}/.codex" "/home/${UNAME}/.m2" \
-    && chown -R "${UID}:${GID}" /workspace "/home/${UNAME}"
+RUN install -d -o root -g root -m 0555 \
+        /workspace \
+        /home/codex \
+        /home/codex/.codex \
+        /home/codex/.m2 \
+        /run/codex-runtime \
+        /run/codex-idea-mcp
 
 WORKDIR /workspace
-USER ${UID}:${GID}
+USER 65532:65532
 
 # Make the image an executable Codex image. Arguments passed after the image
 # name become Codex arguments, e.g. `docker run ... IMAGE resume --last`.
-ENTRYPOINT ["codex"]
+ENTRYPOINT ["/usr/local/bin/codex-entrypoint", "codex"]
 
 # Keep Git-derived metadata after every expensive filesystem layer. A new
 # source revision should update the image identity without invalidating the

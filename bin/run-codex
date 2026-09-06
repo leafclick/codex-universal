@@ -17,6 +17,8 @@ CLOJURE_LSP_MCP_OVERRIDE="${CODEX_CLOJURE_LSP_MCP:-}"
 IDEA_MCP="${CODEX_IDEA_MCP:-1}"
 IDEA_MCP_PORT="${CODEX_IDEA_MCP_PORT:-64342}"
 IDEA_MCP_PATH="${CODEX_IDEA_MCP_PATH:-/stream}"
+HOST_UID="$EUID"
+HOST_GID="${GROUPS[0]}"
 IDEA_MCP_ALLOWED_TOOLS='[
     "analyze_calls",
     "get_file_problems",
@@ -118,6 +120,24 @@ die() {
     exit 1
 }
 
+validate_container_mount_path() {
+    local variable="$1"
+    local value="${!variable}"
+
+    [[ "$value" == /* && "$value" != / ]] ||
+        die "$variable must be an absolute non-root container path: $value"
+    [[ "$value" != *:* && "$value" != *,* && "$value" != *$'\n'* ]] ||
+        die "$variable contains a Docker mount delimiter: $value"
+    [[ "$value" != */ && "$value" != *//* &&
+       "$value" != */./* && "$value" != */../* &&
+       "$value" != */. && "$value" != */.. ]] ||
+        die "$variable must be lexically normalized: $value"
+}
+
+container_paths_overlap() {
+    [[ "$1" == "$2" || "$1" == "$2/"* || "$2" == "$1/"* ]]
+}
+
 need() {
     command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
@@ -131,6 +151,28 @@ case "$IDEA_MCP" in
     0|1) ;;
     *) die "CODEX_IDEA_MCP must be 0 or 1" ;;
 esac
+
+validate_container_mount_path CONTAINER_HOME
+validate_container_mount_path WORKSPACE_ROOT
+container_paths_overlap "$CONTAINER_HOME" /workspace &&
+    die "CODEX_CONTAINER_HOME must not overlap the image workspace"
+container_paths_overlap "$CONTAINER_HOME" "$WORKSPACE_ROOT" &&
+    die "CODEX_CONTAINER_HOME and CODEX_WORKSPACE_ROOT must not overlap"
+for reserved_runtime_path in \
+    /tmp \
+    /run/codex-runtime \
+    /run/codex-idea-mcp; do
+    container_paths_overlap "$CONTAINER_HOME" "$reserved_runtime_path" &&
+        die "CODEX_CONTAINER_HOME overlaps reserved runtime path $reserved_runtime_path"
+    container_paths_overlap "$WORKSPACE_ROOT" "$reserved_runtime_path" &&
+        die "CODEX_WORKSPACE_ROOT overlaps reserved runtime path $reserved_runtime_path"
+done
+unset reserved_runtime_path
+
+HOME_TMPFS_SPEC="${CONTAINER_HOME}:rw,nosuid,nodev,uid=${HOST_UID},gid=${HOST_GID},mode=0700"
+TMP_TMPFS_SPEC="/tmp:rw,nosuid,nodev,mode=1777"
+RUNTIME_TMPFS_SPEC="/run/codex-runtime:rw,nosuid,nodev,noexec,uid=${HOST_UID},gid=${HOST_GID},mode=0700"
+DOCTOR_WORKSPACE_TMPFS_SPEC="/workspace:rw,nosuid,nodev,uid=${HOST_UID},gid=${HOST_GID},mode=0700"
 
 validate_project_name() {
     local name="$1"
@@ -806,7 +848,7 @@ run_sandbox_probe() {
         --security-opt=no-new-privileges \
         --security-opt "apparmor=$APPARMOR_PROFILE" \
         --security-opt "seccomp=$SECCOMP_PROFILE" \
-        --user "$(id -u):$(id -g)" \
+        --user "$HOST_UID:$HOST_GID" \
         --entrypoint /bin/sh \
         "$image" \
         -c 'exec /usr/bin/bwrap "$@"' \
@@ -863,8 +905,14 @@ doctor_runtime_probe() {
         --security-opt=no-new-privileges
         --security-opt "apparmor=$APPARMOR_PROFILE"
         --security-opt "seccomp=$SECCOMP_PROFILE"
-        --user "$(id -u):$(id -g)"
-        --entrypoint /bin/bash
+        --read-only
+        --tmpfs "$HOME_TMPFS_SPEC"
+        --tmpfs "$TMP_TMPFS_SPEC"
+        --tmpfs "$RUNTIME_TMPFS_SPEC"
+        --tmpfs "$DOCTOR_WORKSPACE_TMPFS_SPEC"
+        --user "$HOST_UID:$HOST_GID"
+        -e "HOME=$CONTAINER_HOME"
+        --entrypoint /usr/local/bin/codex-entrypoint
     )
 
     if [[ "$profile" == cuda ]]; then
@@ -873,14 +921,24 @@ doctor_runtime_probe() {
 
     docker_args+=("$image")
 
-    # This container gets an ephemeral writable layer because agent-lsp may
-    # initialize caches during its MCP handshake. It has no host mounts and is
-    # removed on exit, so the project and persistent Codex state stay untouched.
-    docker "${docker_args[@]}" -c '
+    # Writable runtime data is confined to disposable tmpfs mounts. There are
+    # no host mounts, so the project and persistent Codex state stay untouched.
+    docker "${docker_args[@]}" /bin/bash -c '
         set -Eeuo pipefail
 
-        (( $(id -u) > 0 ))
-        (( $(id -g) > 0 ))
+        [[ "$(id -u)" == "$1" ]]
+        [[ "$(id -g)" == "$2" ]]
+        [[ "$(id -un)" == codex ]]
+        [[ "$(id -gn)" == codex ]]
+        [[ "$NSS_WRAPPER_PASSWD" == /run/codex-runtime/* ]]
+        [[ -r "$NSS_WRAPPER_PASSWD" && -r "$NSS_WRAPPER_GROUP" ]]
+        touch "$HOME/.codex-runtime-write-probe"
+        rm "$HOME/.codex-runtime-write-probe"
+        touch /tmp/codex-runtime-write-probe
+        rm /tmp/codex-runtime-write-probe
+        if touch /usr/local/bin/.codex-runtime-write-probe 2>/dev/null; then
+            exit 1
+        fi
         test -r /etc/codex/requirements.toml
         grep -Fxq '\''allowed_approval_policies = ["on-request"]'\'' \
             /etc/codex/requirements.toml
@@ -904,12 +962,13 @@ doctor_runtime_probe() {
         printf '\''clojure-lsp: '\''
         clojure-lsp --version
 
-        if [[ "$1" == cuda ]]; then
+        if [[ "$3" == cuda ]]; then
+            [[ "${CODEX_NVIDIA_ENTRYPOINT_RAN:-}" == 1 ]]
             command -v nvcc >/dev/null
             command -v nvidia-smi >/dev/null
             nvidia-smi >/dev/null
         fi
-    ' run-codex-doctor "$profile"
+    ' run-codex-doctor "$HOST_UID" "$HOST_GID" "$profile"
 }
 
 doctor_mcp_probe() {
@@ -924,9 +983,15 @@ doctor_mcp_probe() {
         --security-opt=no-new-privileges \
         --security-opt "apparmor=$APPARMOR_PROFILE" \
         --security-opt "seccomp=$SECCOMP_PROFILE" \
-        --user "$(id -u):$(id -g)" \
-        --entrypoint /bin/bash \
-        "$image" -c '
+        --read-only \
+        --tmpfs "$HOME_TMPFS_SPEC" \
+        --tmpfs "$TMP_TMPFS_SPEC" \
+        --tmpfs "$RUNTIME_TMPFS_SPEC" \
+        --tmpfs "$DOCTOR_WORKSPACE_TMPFS_SPEC" \
+        --user "$HOST_UID:$HOST_GID" \
+        -e "HOME=$CONTAINER_HOME" \
+        --entrypoint /usr/local/bin/codex-entrypoint \
+        "$image" /bin/bash -c '
             set -Eeuo pipefail
 
             coproc MCP_BRIDGE {
@@ -1002,6 +1067,16 @@ run_doctor() {
     fi
     doctor_pass "Required host commands are available"
 
+    if ((HOST_UID == 0 || HOST_GID == 0)); then
+        doctor_fail "Host UID/GID must both be non-root ($HOST_UID:$HOST_GID)"
+        doctor_note "Run Codex as a regular Docker user."
+        echo
+        printf 'Diagnostics failed: %d failure(s), %d warning(s).\n' \
+            "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
+        return 1
+    fi
+    doctor_pass "Host runtime identity is non-root ($HOST_UID:$HOST_GID)"
+
     if ! docker info >/dev/null 2>&1; then
         doctor_fail "Docker daemon is not available"
         doctor_note "Start Docker Engine and confirm this user can run 'docker info'."
@@ -1050,11 +1125,11 @@ run_doctor() {
         printf '      version:  %s\n' "${image_version:-unknown}"
         printf '      revision: %s\n' "${image_revision:-unknown}"
 
-        if [[ "$image_user" == "$(id -u):$(id -g)" ]]; then
-            doctor_pass "Image user matches host UID/GID ($image_user)"
+        if [[ "$image_user" =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]]; then
+            doctor_pass "Image declares a fixed non-root user ($image_user)"
         else
-            doctor_fail "Image user '$image_user' does not match host UID/GID $(id -u):$(id -g)"
-            doctor_note "Rebuild the image as the non-root user who runs Codex."
+            doctor_fail "Image must declare an explicit non-root numeric user: '$image_user'"
+            doctor_note "Select a portable codex-universal image with a fixed non-root USER."
         fi
 
         if ((DOCTOR_FAILURES == 0)); then
@@ -1069,12 +1144,12 @@ run_doctor() {
 
             local runtime_output=""
             if runtime_output="$(doctor_runtime_probe "$IMAGE" "$PROFILE" 2>&1)"; then
-                doctor_pass "Image tools and managed Codex policy"
+                doctor_pass "Portable runtime identity, read-only image, tools, and managed Codex policy"
                 while IFS= read -r line; do
                     [[ -z "$line" ]] || printf '      %s\n' "$line"
                 done <<<"$runtime_output"
             else
-                doctor_fail "Image tools, managed Codex policy, or CUDA runtime probe failed"
+                doctor_fail "Portable runtime, image boundary, tools, policy, or CUDA probe failed"
                 [[ -z "$runtime_output" ]] || printf '      %s\n' "$runtime_output"
                 doctor_note "Rebuild or replace the selected image, then rerun the doctor."
             fi
@@ -1180,6 +1255,9 @@ if $DOCTOR_MODE; then
     run_doctor "$PROJECT"
     exit $?
 fi
+
+((HOST_UID > 0 && HOST_GID > 0)) ||
+    die "Run this command as a non-root user with a non-root primary group"
 
 if $IDEA_MODE; then
     need jq
@@ -1343,10 +1421,15 @@ docker_args=(
     run
     --rm
     --init
+    --read-only
+    --tmpfs "$HOME_TMPFS_SPEC"
+    --tmpfs "$TMP_TMPFS_SPEC"
+    --tmpfs "$RUNTIME_TMPFS_SPEC"
     --cap-drop=ALL
     --security-opt=no-new-privileges
     --security-opt "apparmor=$APPARMOR_PROFILE"
     --security-opt "seccomp=$SECCOMP_PROFILE"
+    --entrypoint /usr/local/bin/codex-entrypoint
 )
 
 if $IDEA_MODE; then
@@ -1438,7 +1521,6 @@ if $IDEA_MODE; then
         --cidfile "$IDEA_CID_FILE"
         --label codex-universal.mode=idea
         --label "codex-universal.project=$PROJECT"
-        --entrypoint codex-acp-entrypoint
     )
     if [[ "$IDEA_MCP" == 1 ]]; then
         docker_args+=(
@@ -1460,7 +1542,7 @@ if [[ "$PROFILE" == cuda ]]; then
 fi
 
 docker_args+=(
-    --user "$(id -u):$(id -g)"
+    --user "$HOST_UID:$HOST_GID"
     -e "HOME=$CONTAINER_HOME"
 )
 
@@ -1591,13 +1673,13 @@ else
     echo "  policy:  workspace-write; Git metadata and network writes need your approval"
 fi
 
-# Docker appends these arguments to the image ENTRYPOINT. The generic image has
-# ENTRYPOINT ["codex"]. The CUDA image preserves NVIDIA's entrypoint and appends
-# "codex" to it, so both profiles have the same command-line contract.
+# The launcher selects the portable-user entrypoint explicitly. Terminal mode
+# then supplies "codex" plus its arguments; IDEA mode supplies the ACP adapter.
+# The CUDA wrapper runs NVIDIA initialization before either command.
 if $IDEA_MODE; then
-    docker "${docker_args[@]}"
+    docker "${docker_args[@]}" /usr/local/bin/codex-acp-entrypoint
 else
-    session_args=("${codex_args[@]}")
+    session_args=(codex "${codex_args[@]}")
     if ! $NEW_SESSION; then
         session_args+=(resume --last)
     fi

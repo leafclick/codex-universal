@@ -8,7 +8,9 @@ Bubblewrap needs, so `run-codex` uses the profiles in this directory.
 commit `61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31`. It keeps the outer
 restrictions and additionally permits unprivileged user namespaces and their
 mount operations. Docker still drops every capability and enables
-`no-new-privileges`. Consequently, mount capabilities are unavailable in the
+`no-new-privileges`. The image root filesystem is read-only; only the selected
+project, persistent Codex/Maven state, and narrowly scoped runtime tmpfs mounts
+are writable. Consequently, mount capabilities are unavailable in the
 container's initial namespace; Bubblewrap can use them only inside the user
 namespace it creates. Bubblewrap drops those namespaced capabilities before
 executing a sandboxed command.
