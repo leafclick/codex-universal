@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Local MCP servers do not inherit Codex's shell sandbox. Put the LSP bridge in
+# an equivalent networkless filesystem boundary: the project and container
+# home are writable, while Codex state and Git metadata stay read-only.
+project_root="$(pwd -P)"
+container_home="${HOME:?HOME must be set}"
+
+[[ "$project_root" != / ]] || {
+    echo "Refusing to expose the filesystem root to agent-lsp" >&2
+    exit 1
+}
+[[ "$container_home" != / ]] || {
+    echo "Refusing to expose the filesystem root as HOME to agent-lsp" >&2
+    exit 1
+}
+
+bwrap_args=(
+    --unshare-user
+    --unshare-ipc
+    --unshare-pid
+    --unshare-net
+    --unshare-uts
+    --unshare-cgroup-try
+    --die-with-parent
+    --new-session
+    --ro-bind / /
+    --dev /dev
+    --proc /proc
+    --tmpfs /tmp
+    --bind "$container_home" "$container_home"
+    --bind "$project_root" "$project_root"
+    --ro-bind-try "$container_home/.codex" "$container_home/.codex"
+)
+
+# Match Codex's recursive protection instead of guarding only the repository
+# root. This also covers nested repositories and checked-out submodules.
+while IFS= read -r -d '' protected_path; do
+    bwrap_args+=(--ro-bind "$protected_path" "$protected_path")
+done < <(
+    find "$project_root" -xdev \
+        \( -name .git -o -name .codex \) -prune -print0
+)
+
+bwrap_args+=(--chdir "$project_root")
+
+exec bwrap "${bwrap_args[@]}" -- \
+    /usr/local/share/npm-global/bin/agent-lsp "$@"

@@ -163,6 +163,7 @@ Building and running the containers requires:
 - GNU `coreutils`, including `realpath`
 - `util-linux`, including `flock`
 - `jq`
+- `socat` for the optional IntelliJ MCP relay
 - AppArmor and `apparmor_parser`
 - `sudo` for the one-time AppArmor policy installation
 
@@ -198,16 +199,20 @@ Override the Git-derived version or disable the moving `latest` alias:
 IMAGE_VERSION=1.0.0 TAG_LATEST=0 ./docker-build.sh all
 ```
 
-A specific Codex version can be used:
+A specific Codex, ACP adapter, or LSP bridge version can be used:
 
 ```bash
-CODEX_VERSION=latest CODEX_ACP_VERSION=latest ./docker-build.sh all
+CODEX_VERSION=latest \
+CODEX_ACP_VERSION=latest \
+AGENT_LSP_VERSION=latest \
+  ./docker-build.sh all
 ```
 
 `CODEX_ACP_VERSION` selects the `@agentclientprotocol/codex-acp` npm version
-used by the optional IntelliJ integration.
+used by the optional IntelliJ integration. `AGENT_LSP_VERSION` selects the
+`agent-lsp` MCP bridge used for Clojure semantic navigation.
 
-For a release build, set both package versions explicitly instead of using
+For a release build, set all three package versions explicitly instead of using
 `latest`. The Git-derived image tag records the source revision and build
 configuration, but builds are not byte-for-byte reproducible: Ubuntu package
 repositories and several upstream installer channels are resolved at build
@@ -231,6 +236,48 @@ CODEX_IMAGE_TAG=1.0.0 \
 ```
 
 The images are built using the host numeric UID and GID so bind-mounted files remain owned by the host user. Run the build helper as that non-root user; it rejects UID or GID 0 rather than creating a root Codex image.
+
+## Clojure command-line tooling
+
+Both image profiles install the latest stable native releases of:
+
+- `bb` (Babashka)
+- `cljfmt`
+- `clj-kondo`
+- `clojure-lsp`
+
+The build uses each project's supported installer, which selects the native
+binary for the image architecture. `cljfmt` is the standalone GraalVM native
+executable, so `cljfmt check` and `cljfmt fix` do not launch `clj`. Each tool
+uses its upstream defaults and still discovers project-local configuration such
+as `bb.edn`, `.cljfmt.edn`, `.clj-kondo/config.edn`, and `.lsp/config.edn`.
+
+In terminal mode, `run-codex` also enables a container-local `clojure_lsp` MCP
+server by default. It uses `agent-lsp` to keep `clojure-lsp` indexed and expose
+symbol-aware navigation, references, diagnostics, formatting, and refactoring
+tools to Codex. The first semantic tool call starts analysis for the current
+project; in the Codex TUI, use `/mcp` to inspect the connection. For example,
+ask Codex to “use the Clojure LSP tools to find every reference to
+`my.app/foo` and check diagnostics before editing” rather than asking for a
+text search.
+
+The terminal bridge runs in a nested networkless Bubblewrap sandbox. It can
+update the working tree and its caches, but `.git` and `.codex` remain
+read-only; Codex prompts before invoking MCP tools declared as write-capable.
+This preserves the same outer boundary as ordinary Codex commands. Disable the
+terminal integration for a session if needed:
+
+```bash
+CODEX_CLOJURE_LSP_MCP=0 run-codex my-project
+```
+
+The integration follows the persistent MCP/LSP design described in the
+[agent-lsp blog post](https://blog.blackwell-systems.com/posts/agent-lsp/).
+`clojure-lsp` also remains directly usable from the terminal; its CLI supports
+`diagnostics`, `references`, `rename`, `clean-ns`, `format`, and analysis
+`dump` commands. IDEA mode instead receives IntelliJ's integrated MCP server
+through a private loopback relay, avoiding a second language-server index and
+exposing the IDE's project-aware tools to Codex.
 
 ## Codex sandboxing inside Docker
 
@@ -261,7 +308,7 @@ default seccomp and AppArmor policies intentionally block. Install this
 project's host policy once from the checkout:
 
 ```bash
-sudo apt install apparmor apparmor-utils jq
+sudo apt install apparmor apparmor-utils jq socat
 bin/setup-codex-host-security
 ```
 
@@ -672,8 +719,10 @@ IDEA AI Chat <-> run-codex --idea <-> docker run -i <-> codex-acp
 ```
 
 IDEA starts the configured host command, and Docker carries the same stdin and
-stdout streams into the container. No TCP listener, published Docker port, or
-host network service is involved.
+stdout streams into the container. No ACP TCP listener or published Docker
+port is involved. IntelliJ's MCP server is separate: because it binds only to
+host loopback, `run-codex --idea` relays its one TCP port through a private
+per-chat Unix socket instead of giving the Codex container host networking.
 
 JetBrains exposes registry agents and custom agents through different parts of
 the UI:
@@ -692,10 +741,11 @@ project's container launcher.
 
 Setup:
 
-1. Install `jq` and the current `run-codex` and `setup-codex-idea` commands as
-   described in [Installation overview](#installation-overview). Images built
-   from the current Dockerfiles already contain `codex-acp`; rebuild only if
-   the local image predates IDEA integration.
+1. Install `jq`, `socat`, and the current `run-codex` and
+   `setup-codex-idea` commands as described in
+   [Installation overview](#installation-overview). Images built from the
+   current Dockerfiles already contain `codex-acp` and the container side of
+   the relay. Rebuild if the local image predates this integration.
 
 2. Register the project and verify the terminal client first. Complete the
    Codex login, then exit the terminal client.
@@ -714,7 +764,11 @@ Setup:
 
 4. In IDEA, open **AI Chat**, use its upper-right menu, and select **Add Custom
    Agent (Beta)**. IDEA opens the `acp.json` file it reads. Confirm that it
-   contains **Dockerized Codex (my-project)**, then save it.
+   contains **Dockerized Codex (my-project)**, then save it. In **Settings →
+   Tools → MCP Server**, also select **Enable MCP Server** if it is not already
+   enabled. Leave **Project Clients Auto-Configuration**, **Clients
+   Auto-Configuration**, and **Manual Client Configuration** unused for this
+   agent; the launcher supplies its private Streamable HTTP connection.
 
 5. Start a new agent chat and select **Dockerized Codex (my-project)** from
    the AI Chat agent selector. Custom entries normally appear immediately;
@@ -748,13 +802,54 @@ to:
 }
 ```
 
-Host MCP forwarding is disabled for this agent. JetBrains otherwise forwards
-host-side MCP launch commands into the container, where host and Snap paths do
-not exist. This avoids `mcp__idea__startup` errors. ACP chat, editor context,
-file-change presentation, and the mounted project continue to work; only
-IDE-specific MCP tools and other host-configured MCP servers are unavailable.
-Run `setup-codex-idea my-project` again to update an entry created by an older
-version of this project, then start a new chat.
+`use_idea_mcp` is intentionally disabled. IDEA's ACP integration otherwise
+forwards a host-only STDIO launcher path, which does not exist inside the
+container and fails with `No such file or directory`. Instead, IDEA mode
+connects Codex to `http://127.0.0.1:64342/stream` inside the container. Two
+`socat` processes carry that connection through a mode-0600 Unix socket to
+IDEA's host-only `127.0.0.1:64342` listener:
+
+```text
+Codex -> container loopback -> private Unix socket -> host loopback -> IDEA
+```
+
+The container gets a read-only mount of only the per-chat relay directory. It
+does not get host networking, a published port, or the IDEA or Snap
+installation. The relay is stopped and its socket removed with the ACP
+container. Separate IDEA chats use separate sockets and isolated container
+loopback listeners.
+
+IDEA mode mounts the checkout at the same absolute host path inside the
+container, so `projectPath` values and file paths returned by IDE tools
+identify the same files Codex reads and edits. This solves path identity
+without creating a second project symlink.
+
+The launcher's Codex MCP configuration uses `enabled_tools` to expose only
+project analysis, inspection, symbol, search, navigation, and read tools. Host
+terminal execution, run configurations, database/debugger control,
+refactoring, formatting, patching, and other IDE-side writes are not exposed,
+so IDE MCP cannot bypass the container's approval and filesystem boundaries.
+Working-tree changes still go through Codex inside the hardened container.
+
+`use_custom_mcp` also remains disabled. Together, these ACP flags prevent
+arbitrary host-configured MCP launch commands, including host or Snap-specific
+paths, from being forwarded into the container. Run `setup-codex-idea
+my-project` again to replace an older entry, then start a new chat. JetBrains
+documents both flags in its
+[ACP configuration reference](https://www.jetbrains.com/help/ai-assistant/acp.html).
+
+The defaults match IDEA 2026.2.2's Streamable HTTP endpoint. If IDEA displays
+a different loopback port or Streamable HTTP path, ensure those environment
+variables are visible to the IDEA process that launches the custom agent:
+
+```bash
+CODEX_IDEA_MCP_PORT=64342
+CODEX_IDEA_MCP_PATH=/stream
+```
+
+The legacy `/sse` endpoint is not the default because current Codex clients
+use Streamable HTTP. Set `CODEX_IDEA_MCP=0` only to start IDEA mode without the
+IDE MCP connection.
 
 To retry IDEA after updating the launcher or host policy, close the affected
 agent chat, reinstall the host policy, and refresh the generated ACP entry:
@@ -826,7 +921,11 @@ and human review. OpenAI documents this non-overridable policy layer under
 IDEA supplies its host project path in ACP requests, so IDEA mode mounts only
 the registered checkout at the same absolute path inside the container. This
 keeps file references clickable in the IDE. Terminal mode retains the stable
-`/workspace/<project>` path.
+`/workspace/<project>` path. Codex resume selection is working-directory
+scoped, and the ACP adapter filters IDEA sessions by their exact working
+directory, so the two path forms create separate resumable session histories.
+They share authentication and persisted Codex state, but a conversation should
+not be moved between terminal and IDEA modes.
 
 Multiple IDEA chats may run for the same project, each in its own container.
 Terminal mode remains mutually exclusive with all IDEA chats for that project,

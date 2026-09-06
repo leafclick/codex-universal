@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Use each project's supported installer so the image gets the upstream native
+# executable rather than a JVM wrapper. The installers select amd64/aarch64 and
+# the latest stable release for the current platform.
+install_root="$(mktemp -d)"
+trap 'rm -rf -- "$install_root"' EXIT
+
+download_and_run() {
+    local name="$1"
+    local url="$2"
+    local installer="$install_root/$name"
+
+    curl -4 -fsSL -o "$installer" "$url"
+    chmod 0755 "$installer"
+    "$installer"
+}
+
+download_and_run babashka \
+    https://raw.githubusercontent.com/babashka/babashka/master/install
+download_and_run cljfmt \
+    https://raw.githubusercontent.com/weavejester/cljfmt/master/install.sh
+download_and_run clj-kondo \
+    https://raw.githubusercontent.com/clj-kondo/clj-kondo/master/script/install-clj-kondo
+download_and_run clojure-lsp \
+    https://raw.githubusercontent.com/clojure-lsp/clojure-lsp/master/install
+
+# Fail the image build if an installer returned success without leaving a
+# runnable native tool behind.
+bb --version
+cljfmt --version
+clj-kondo --version
+clojure-lsp --version

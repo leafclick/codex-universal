@@ -127,6 +127,6 @@ trap - EXIT
 echo "Configured JetBrains ACP agent '$AGENT_NAME':"
 echo "  file:    $ACP_FILE"
 echo "  command: $RUN_CODEX --idea $PROJECT"
-echo "  MCP:     host MCP forwarding disabled"
+echo "  MCP:     private IntelliJ HTTP relay enabled; ACP host forwarding disabled"
 echo "Select '$AGENT_NAME' (not the registry-managed 'Codex') in AI Chat."
 echo "Restart the IDE only if the new custom entry does not appear."

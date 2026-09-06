@@ -28,6 +28,14 @@ assert_contains() {
         fail "expected launcher output to contain: $expected"
 }
 
+assert_not_contains() {
+    local value="$1"
+    local unexpected="$2"
+
+    [[ "$value" != *"$unexpected"* ]] ||
+        fail "expected launcher output not to contain: $unexpected"
+}
+
 for command in bash git grep jq realpath; do
     need "$command"
 done
@@ -59,7 +67,9 @@ for script in \
     "$ROOT/bin/setup-codex-idea" \
     "$ROOT/bin/codex-push" \
     "$ROOT/bin/codex-pull" \
-    "$ROOT/container/codex-acp-entrypoint"; do
+    "$ROOT/container/codex-acp-entrypoint" \
+    "$ROOT/container/codex-clojure-lsp-mcp" \
+    "$ROOT/container/install-clojure-tools"; do
     bash -n "$script"
 done
 
@@ -98,6 +108,11 @@ grep -Fq -- '--entrypoint /bin/sh' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not start under the outer AppArmor profile"
 grep -Fq -- "-c 'exec /usr/bin/bwrap \"\$@\"'" "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not exercise the AppArmor transition"
+grep -Fq -- '--unshare-net' "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP MCP bridge is not network-isolated"
+grep -Fq -- '\( -name .git -o -name .codex \) -prune -print0' \
+    "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP MCP bridge does not protect nested Git/Codex metadata"
 grep -q '^profile codex-universal ' \
     "$ROOT/security/apparmor/codex-universal" ||
     fail "outer AppArmor profile is missing"
@@ -144,7 +159,16 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") does not install codex-acp"
     grep -q 'container/requirements.toml /etc/codex/requirements.toml' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install managed requirements"
+    grep -q 'container/install-clojure-tools /usr/local/src/install-clojure-tools' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install native Clojure tools"
+    grep -q '@blackwell-systems/agent-lsp@' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install the LSP MCP bridge"
+    grep -qE '^[[:space:]]+socat([[:space:]\\]|$)' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install the IntelliJ MCP relay"
 done
+grep -Fq 'TCP4-LISTEN:${relay_port},bind=127.0.0.1' \
+    "$ROOT/container/codex-acp-entrypoint" ||
+    fail "ACP entrypoint does not restrict its MCP relay to container loopback"
 pass "shell syntax and static security invariants"
 
 # The launcher smoke test uses echo as a Docker frontend. This verifies the
@@ -161,6 +185,11 @@ printf '%s\n' \
     'esac' \
     > "$TEST_ROOT/fake-bin/docker"
 chmod 755 "$TEST_ROOT/fake-bin/docker"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'exit 0' \
+    > "$TEST_ROOT/fake-bin/socat"
+chmod 755 "$TEST_ROOT/fake-bin/socat"
 git -C "$TEST_ROOT/repo" init -q
 
 launcher_env=(
@@ -171,6 +200,7 @@ launcher_env=(
     "CODEX_IMAGE_TAG=test-version"
     "CODEX_GIT_USER_NAME=host-smoke"
     "CODEX_GIT_USER_EMAIL=host-smoke.invalid"
+    "CODEX_TEST_SKIP_IDEA_MCP_RELAY=1"
     "CODEX_SECCOMP_PROFILE=$ROOT/security/seccomp/codex-bwrap.json"
     "PATH=$TEST_ROOT/fake-bin:$PATH"
 )
@@ -206,6 +236,10 @@ for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "--ask-for-approval on-request"
     assert_contains "$output" 'approvals_reviewer="user"'
     assert_contains "$output" "sandbox_workspace_write.network_access=false"
+    assert_contains "$output" 'mcp_servers.clojure_lsp.command="/usr/local/bin/codex-clojure-lsp-mcp"'
+    assert_contains "$output" 'mcp_servers.clojure_lsp.args=["clojure:clojure-lsp"]'
+    assert_contains "$output" 'mcp_servers.clojure_lsp.default_tools_approval_mode="writes"'
+    assert_contains "$output" "$TEST_ROOT/repo:/workspace/smoke-project"
     assert_contains "$output" "example/codex-universal-generic:test-version"
 done
 assert_contains "$resume_output" "resume --last"
@@ -215,6 +249,14 @@ assert_contains "$idea_output" "--entrypoint codex-acp-entrypoint"
 assert_contains "$idea_output" "INITIAL_AGENT_MODE=read-only"
 assert_contains "$idea_output" 'CODEX_PATH=/usr/local/share/npm-global/bin/codex'
 assert_contains "$idea_output" 'approval_policy":"on-request"'
+assert_contains "$idea_output" 'mcp_servers":{"idea":{"url":"http://127.0.0.1:64342/stream"'
+assert_contains "$idea_output" 'enabled_tools":["analyze_calls","get_file_problems"'
+assert_contains "$idea_output" 'default_tools_approval_mode":"writes"'
+assert_contains "$idea_output" 'CODEX_IDEA_MCP_RELAY_SOCKET=/run/codex-idea-mcp/idea-mcp.sock'
+assert_contains "$idea_output" 'CODEX_IDEA_MCP_RELAY_PORT=64342'
+assert_contains "$idea_output" ':/run/codex-idea-mcp:ro'
+assert_not_contains "$idea_output" '--network host'
+assert_not_contains "$idea_output" 'mcp_servers":{"clojure_lsp'
 assert_contains "$idea_output" "--name codex-smoke-project-idea-"
 assert_contains "$idea_output" "$TEST_ROOT/repo:$TEST_ROOT/repo"
 assert_contains "$idea_output" "--cidfile"
@@ -223,6 +265,12 @@ assert_contains "$idea_output" "--label codex-universal.project=smoke-project"
 if [[ "$idea_output" == *"-it"* ]]; then
     fail "IDEA launcher allocated a TTY and would corrupt ACP stdio"
 fi
+
+lsp_disabled_output="$(
+    "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=0 \
+        "$ROOT/bin/run-codex" smoke-project --new
+)"
+assert_not_contains "$lsp_disabled_output" "mcp_servers.clojure_lsp"
 
 # IDEA may terminate the attached ACP launcher abruptly. Verify that the host
 # launcher retains ownership of the container and removes its exact ID when
@@ -254,10 +302,11 @@ env \
     "CODEX_IMAGE_TAG=test-version" \
     "CODEX_GIT_USER_NAME=host-smoke" \
     "CODEX_GIT_USER_EMAIL=host-smoke.invalid" \
+    "CODEX_TEST_SKIP_IDEA_MCP_RELAY=1" \
     "CODEX_SECCOMP_PROFILE=$ROOT/security/seccomp/codex-bwrap.json" \
     "CODEX_TEST_CLEANUP_CID=$cleanup_cid" \
     "CODEX_TEST_CLEANUP_LOG=$cleanup_log" \
-    "PATH=$TEST_ROOT/cleanup-bin:$PATH" \
+    "PATH=$TEST_ROOT/cleanup-bin:$TEST_ROOT/fake-bin:$PATH" \
     "$ROOT/bin/run-codex" --idea smoke-project >/dev/null 2>&1
 
 grep -Fxq "rm -f -- $cleanup_cid" "$cleanup_log" ||
@@ -322,6 +371,7 @@ else
     assert_contains "$build_output" "--build-arg UID=$(id -u)"
     assert_contains "$build_output" "--build-arg GID=$(id -g)"
     assert_contains "$build_output" "--build-arg CODEX_ACP_VERSION=latest"
+    assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=latest"
     assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
     assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
     assert_contains "$build_output" "-t codex-host-smoke-generic:latest"
@@ -494,6 +544,13 @@ smoke_image() {
         command -v codex >/dev/null
         command -v codex-acp >/dev/null
         command -v codex-acp-entrypoint >/dev/null
+        command -v agent-lsp >/dev/null
+        command -v codex-clojure-lsp-mcp >/dev/null
+        command -v bb >/dev/null
+        command -v cljfmt >/dev/null
+        command -v clj-kondo >/dev/null
+        command -v clojure-lsp >/dev/null
+        command -v socat >/dev/null
         command -v zstd >/dev/null
         test -r /etc/codex/requirements.toml
         bwrap \
@@ -502,6 +559,10 @@ smoke_image() {
             --ro-bind / / \
             /bin/true
         codex --version
+        bb --version
+        cljfmt --version
+        clj-kondo --version
+        clojure-lsp --version
         codex \
             --sandbox workspace-write \
             --ask-for-approval on-request \

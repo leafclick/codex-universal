@@ -5,6 +5,7 @@ ARG UID=1000
 ARG GID=1000
 ARG CODEX_VERSION=latest
 ARG CODEX_ACP_VERSION=latest
+ARG AGENT_LSP_VERSION=latest
 ARG IMAGE_VERSION=dev
 ARG VCS_REF=unknown
 ARG IMAGE_SOURCE=https://github.com/leafclick/codex-universal
@@ -81,6 +82,7 @@ RUN apt-get update \
         ripgrep \
         rsync \
         software-properties-common \
+        socat \
         sqlite3 \
         sudo \
         swig \
@@ -136,12 +138,14 @@ ENV PATH=${PATH}:/usr/local/share/npm-global/bin
 RUN npm install -g \
         "@openai/codex@${CODEX_VERSION}" \
         "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
+        "@blackwell-systems/agent-lsp@${AGENT_LSP_VERSION}" \
     && npm cache clean --force
 
 # requirements.toml is an enforced Codex policy layer. In particular, an IDE
 # cannot switch the ACP session to automatic review or full access.
 COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
 COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint
+COPY --chmod=0755 container/codex-clojure-lsp-mcp /usr/local/bin/codex-clojure-lsp-mcp
 
 # Eclipse Temurin 25 JDK.
 RUN install -d -m 0755 /etc/apt/keyrings \
@@ -177,6 +181,12 @@ RUN cd /tmp \
     && wget -q https://raw.githubusercontent.com/borkdude/deps.clj/master/install \
     && bash ./install \
     && rm -f install
+
+# Native Clojure developer tools. Keep this shared installer identical in the
+# generic and CUDA images.
+COPY --chmod=0755 container/install-clojure-tools /usr/local/src/install-clojure-tools
+RUN /usr/local/src/install-clojure-tools \
+    && rm -f /usr/local/src/install-clojure-tools
 
 ENV HOME=/home/${UNAME}
 

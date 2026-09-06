@@ -13,6 +13,25 @@ IMAGE_TAG="${CODEX_IMAGE_TAG:-latest}"
 DEFAULT_PROFILE="${CODEX_DEFAULT_PROFILE:-generic}"
 APPARMOR_PROFILE="${CODEX_APPARMOR_PROFILE:-codex-universal}"
 SECCOMP_PROFILE="${CODEX_SECCOMP_PROFILE:-$CONFIG_ROOT/security/codex-bwrap.json}"
+CLOJURE_LSP_MCP="${CODEX_CLOJURE_LSP_MCP:-1}"
+IDEA_MCP="${CODEX_IDEA_MCP:-1}"
+IDEA_MCP_PORT="${CODEX_IDEA_MCP_PORT:-64342}"
+IDEA_MCP_PATH="${CODEX_IDEA_MCP_PATH:-/stream}"
+IDEA_MCP_ALLOWED_TOOLS='[
+    "analyze_calls",
+    "get_file_problems",
+    "get_project_dependencies",
+    "get_project_modules",
+    "lint_files",
+    "get_symbol_info",
+    "get_all_open_file_paths",
+    "list_directory_tree",
+    "read_file",
+    "search_file",
+    "search_regex",
+    "search_symbol",
+    "search_text"
+]'
 
 usage() {
     cat <<'USAGE'
@@ -41,6 +60,10 @@ Environment:
   CODEX_IMAGE_TAG=latest
   CODEX_APPARMOR_PROFILE=codex-universal
   CODEX_SECCOMP_PROFILE=~/.config/run-codex/security/codex-bwrap.json
+  CODEX_CLOJURE_LSP_MCP=1  Enable the local bridge in terminal mode
+  CODEX_IDEA_MCP=1         Enable the private IntelliJ HTTP relay in IDEA mode
+  CODEX_IDEA_MCP_PORT=64342
+  CODEX_IDEA_MCP_PATH=/stream
 USAGE
 }
 
@@ -52,6 +75,16 @@ die() {
 need() {
     command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
+
+case "$CLOJURE_LSP_MCP" in
+    0|1) ;;
+    *) die "CODEX_CLOJURE_LSP_MCP must be 0 or 1" ;;
+esac
+
+case "$IDEA_MCP" in
+    0|1) ;;
+    *) die "CODEX_IDEA_MCP must be 0 or 1" ;;
+esac
 
 validate_project_name() {
     local name="$1"
@@ -523,6 +556,15 @@ esac
 
 if $IDEA_MODE; then
     need jq
+    if [[ "$IDEA_MCP" == 1 ]]; then
+        need socat
+        [[ "$IDEA_MCP_PORT" =~ ^[0-9]{1,5}$ ]] &&
+            ((10#$IDEA_MCP_PORT >= 1024 && 10#$IDEA_MCP_PORT <= 65535)) ||
+            die "CODEX_IDEA_MCP_PORT must be an unprivileged TCP port (1024-65535)"
+        IDEA_MCP_PORT="$((10#$IDEA_MCP_PORT))"
+        [[ "$IDEA_MCP_PATH" =~ ^/[A-Za-z0-9._~/-]+$ ]] ||
+            die "CODEX_IDEA_MCP_PATH must be an absolute URL path"
+    fi
 fi
 
 # Resolve first so an unconfigured project gets useful setup instructions even
@@ -704,23 +746,48 @@ if $IDEA_MODE; then
     # client enough time to stop the container. Keep this launcher process
     # around, record the exact container ID created by this invocation, and
     # remove only that container when the ACP process exits or is signaled.
-    IDEA_RUNTIME_DIR="$(mktemp -d -- "$CONFIG_ROOT/.idea-runtime.XXXXXX")"
+    # Keep the path short enough for the platform Unix-socket length limit.
+    # mktemp creates this directory mode 0700, so no other host user can
+    # connect to the unauthenticated loopback MCP service through the relay.
+    IDEA_RUNTIME_DIR="$(mktemp -d -- /tmp/codex-idea-mcp.XXXXXX)"
     IDEA_CID_FILE="$IDEA_RUNTIME_DIR/container.cid"
+    IDEA_MCP_RELAY_SOCKET="$IDEA_RUNTIME_DIR/idea-mcp.sock"
+    IDEA_MCP_RELAY_LOG="$IDEA_RUNTIME_DIR/idea-mcp-relay.log"
+    IDEA_MCP_RELAY_PID=""
     IDEA_INSTANCE="${IDEA_RUNTIME_DIR##*.}"
     CONTAINER_NAME="$CONTAINER_BASE_NAME-idea-$IDEA_INSTANCE"
 
     cleanup_idea_container() {
         local status=$?
         local container_id=""
+        local job_pid=""
+        local relay_is_our_job=false
 
         trap - EXIT HUP INT TERM
+        if [[ "$IDEA_MCP_RELAY_PID" =~ ^[0-9]+$ ]]; then
+            # Only signal a process Bash still tracks as our background job;
+            # never risk acting on a PID that exited and was later reused.
+            for job_pid in $(jobs -pr); do
+                if [[ "$job_pid" == "$IDEA_MCP_RELAY_PID" ]]; then
+                    relay_is_our_job=true
+                    break
+                fi
+            done
+            if $relay_is_our_job; then
+                kill "$IDEA_MCP_RELAY_PID" >/dev/null 2>&1 || true
+            fi
+            wait "$IDEA_MCP_RELAY_PID" 2>/dev/null || true
+        fi
         if [[ -s "$IDEA_CID_FILE" ]]; then
             container_id="$(<"$IDEA_CID_FILE")"
             if [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
                 docker rm -f -- "$container_id" >/dev/null 2>&1 || true
             fi
         fi
-        rm -f -- "$IDEA_CID_FILE"
+        rm -f -- \
+            "$IDEA_CID_FILE" \
+            "$IDEA_MCP_RELAY_SOCKET" \
+            "$IDEA_MCP_RELAY_LOG"
         rmdir -- "$IDEA_RUNTIME_DIR" 2>/dev/null || true
         return "$status"
     }
@@ -729,6 +796,32 @@ if $IDEA_MODE; then
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
+
+    if [[ "$IDEA_MCP" == 1 &&
+          "${CODEX_TEST_SKIP_IDEA_MCP_RELAY:-0}" != 1 ]]; then
+        # IDEA deliberately listens on host loopback. Bridge only that one TCP
+        # port into a private per-chat Unix socket; do not publish a host port
+        # or give the Codex container the host network namespace.
+        socat \
+            "UNIX-LISTEN:${IDEA_MCP_RELAY_SOCKET},fork,mode=0600" \
+            "TCP4:127.0.0.1:${IDEA_MCP_PORT}" \
+            >"$IDEA_MCP_RELAY_LOG" 2>&1 &
+        IDEA_MCP_RELAY_PID=$!
+
+        relay_ready=false
+        for _ in {1..100}; do
+            if [[ -S "$IDEA_MCP_RELAY_SOCKET" ]]; then
+                relay_ready=true
+                break
+            fi
+            kill -0 "$IDEA_MCP_RELAY_PID" 2>/dev/null || break
+            sleep 0.05
+        done
+        if ! $relay_ready; then
+            [[ ! -s "$IDEA_MCP_RELAY_LOG" ]] || cat -- "$IDEA_MCP_RELAY_LOG" >&2
+            die "Failed to start the host-side IntelliJ MCP relay"
+        fi
+    fi
 
     # ACP is a line-oriented stdio protocol. Allocating a TTY or printing
     # launcher diagnostics to stdout would corrupt the protocol stream.
@@ -739,6 +832,13 @@ if $IDEA_MODE; then
         --label "codex-universal.project=$PROJECT"
         --entrypoint codex-acp-entrypoint
     )
+    if [[ "$IDEA_MCP" == 1 ]]; then
+        docker_args+=(
+            -v "$IDEA_RUNTIME_DIR:/run/codex-idea-mcp:ro"
+            -e "CODEX_IDEA_MCP_RELAY_SOCKET=/run/codex-idea-mcp/idea-mcp.sock"
+            -e "CODEX_IDEA_MCP_RELAY_PORT=$IDEA_MCP_PORT"
+        )
+    fi
 else
     docker_args+=(
         -it
@@ -757,6 +857,51 @@ docker_args+=(
 )
 
 if $IDEA_MODE; then
+    if [[ "$IDEA_MCP" == 1 ]]; then
+        IDEA_MCP_URL="http://127.0.0.1:${IDEA_MCP_PORT}${IDEA_MCP_PATH}"
+        IDEA_CODEX_CONFIG="$(
+            jq -cn \
+                --arg url "$IDEA_MCP_URL" \
+                --arg home "$CONTAINER_HOME" \
+                --argjson enabled_tools "$IDEA_MCP_ALLOWED_TOOLS" \
+                '{
+                    sandbox_mode: "workspace-write",
+                    approval_policy: "on-request",
+                    approvals_reviewer: "user",
+                    sandbox_workspace_write: {
+                        network_access: false,
+                        writable_roots: [$home]
+                    },
+                    mcp_optional_startup_grace_ms: 5000,
+                    mcp_servers: {
+                        idea: {
+                            url: $url,
+                            enabled: true,
+                            required: false,
+                            enabled_tools: $enabled_tools,
+                            default_tools_approval_mode: "writes",
+                            startup_timeout_sec: 30,
+                            tool_timeout_sec: 120
+                        }
+                    }
+                }'
+        )"
+    else
+        IDEA_CODEX_CONFIG="$(
+            jq -cn \
+                --arg home "$CONTAINER_HOME" \
+                '{
+                    sandbox_mode: "workspace-write",
+                    approval_policy: "on-request",
+                    approvals_reviewer: "user",
+                    sandbox_workspace_write: {
+                        network_access: false,
+                        writable_roots: [$home]
+                    }
+                }'
+        )"
+    fi
+
     docker_args+=(
         -e "CODEX_PATH=/usr/local/share/npm-global/bin/codex"
         # codex-acp calls this mode "read-only" internally but presents it as
@@ -765,7 +910,7 @@ if $IDEA_MODE; then
         # which is intentionally forbidden by the managed image policy.
         -e "INITIAL_AGENT_MODE=read-only"
         -e "NO_BROWSER=1"
-        -e 'CODEX_CONFIG={"sandbox_mode":"workspace-write","approval_policy":"on-request","approvals_reviewer":"user","sandbox_workspace_write":{"network_access":false,"writable_roots":["/home/codex"]}}'
+        -e "CODEX_CONFIG=$IDEA_CODEX_CONFIG"
     )
 fi
 
@@ -799,6 +944,18 @@ codex_args=(
     -c "sandbox_workspace_write.network_access=false"
     -c "sandbox_workspace_write.writable_roots=[\"$CONTAINER_HOME\"]"
 )
+
+if ! $IDEA_MODE && [[ "$CLOJURE_LSP_MCP" == 1 ]]; then
+    codex_args+=(
+        -c 'mcp_servers.clojure_lsp.command="/usr/local/bin/codex-clojure-lsp-mcp"'
+        -c 'mcp_servers.clojure_lsp.args=["clojure:clojure-lsp"]'
+        -c 'mcp_servers.clojure_lsp.enabled=true'
+        -c 'mcp_servers.clojure_lsp.required=false'
+        -c 'mcp_servers.clojure_lsp.default_tools_approval_mode="writes"'
+        -c 'mcp_servers.clojure_lsp.startup_timeout_sec=30'
+        -c 'mcp_servers.clojure_lsp.tool_timeout_sec=120'
+    )
+fi
 
 if $IDEA_MODE; then
     echo "Starting IntelliJ ACP agent for '$PROJECT'" >&2

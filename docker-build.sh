@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 TARGET="${1:-all}"
 CODEX_VERSION="${CODEX_VERSION:-latest}"
 CODEX_ACP_VERSION="${CODEX_ACP_VERSION:-latest}"
+AGENT_LSP_VERSION="${AGENT_LSP_VERSION:-latest}"
 IMAGE_SLUG="${IMAGE_SLUG:-${IMAGE_PREFIX:-}}"
 IMAGE_VERSION="${IMAGE_VERSION:-${TAG:-}}"
 TAG_LATEST="${TAG_LATEST:-1}"
@@ -24,6 +25,7 @@ Environment:
   TAG_LATEST=1                Also update the local latest alias
   CODEX_VERSION=latest        @openai/codex npm version
   CODEX_ACP_VERSION=latest    @agentclientprotocol/codex-acp npm version
+  AGENT_LSP_VERSION=latest    @blackwell-systems/agent-lsp npm version
   PULL=1                     Set to 0 to omit docker build --pull
 
 Compatibility:
@@ -164,6 +166,7 @@ build_one() {
         --build-arg "GID=$HOST_GID"
         --build-arg "CODEX_VERSION=$CODEX_VERSION"
         --build-arg "CODEX_ACP_VERSION=$CODEX_ACP_VERSION"
+        --build-arg "AGENT_LSP_VERSION=$AGENT_LSP_VERSION"
         --build-arg "IMAGE_VERSION=$IMAGE_VERSION"
         --build-arg "VCS_REF=${GIT_REVISION-}"
         --build-arg "IMAGE_SOURCE=${GIT_SOURCE-}"

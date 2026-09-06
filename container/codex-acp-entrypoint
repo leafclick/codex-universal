@@ -1,6 +1,45 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+if [[ -n "${CODEX_IDEA_MCP_RELAY_SOCKET:-}" ]]; then
+    relay_socket="$CODEX_IDEA_MCP_RELAY_SOCKET"
+    relay_port="${CODEX_IDEA_MCP_RELAY_PORT:-64342}"
+
+    [[ "$relay_socket" == /run/codex-idea-mcp/*.sock ]] || {
+        echo "Invalid IntelliJ MCP relay socket: $relay_socket" >&2
+        exit 1
+    }
+    [[ -S "$relay_socket" ]] || {
+        echo "IntelliJ MCP relay socket is unavailable: $relay_socket" >&2
+        exit 1
+    }
+    [[ "$relay_port" =~ ^[0-9]+$ ]] &&
+        ((10#$relay_port >= 1024 && 10#$relay_port <= 65535)) || {
+        echo "Invalid IntelliJ MCP relay port: $relay_port" >&2
+        exit 1
+    }
+    command -v socat >/dev/null 2>&1 || {
+        echo "Missing container command: socat" >&2
+        exit 1
+    }
+
+    # Codex supports an HTTP MCP URL but not a Unix-socket URL. Expose the
+    # per-chat, read-only-mounted host relay only on this container's loopback.
+    socat \
+        "TCP4-LISTEN:${relay_port},bind=127.0.0.1,reuseaddr,fork" \
+        "UNIX-CONNECT:${relay_socket}" \
+        1>&2 &
+    relay_pid=$!
+
+    # Catch immediate configuration or bind failures before starting ACP.
+    sleep 0.05
+    kill -0 "$relay_pid" 2>/dev/null || {
+        wait "$relay_pid" || true
+        echo "Failed to start the container-side IntelliJ MCP relay" >&2
+        exit 1
+    }
+fi
+
 # The CUDA base image uses this entrypoint to initialize its runtime before
 # starting the requested process. The generic image has no equivalent hook.
 if [[ -x /opt/nvidia/nvidia_entrypoint.sh ]]; then
