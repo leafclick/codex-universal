@@ -10,7 +10,13 @@ restrictions and additionally permits unprivileged user namespaces and their
 mount operations. Docker still drops every capability and enables
 `no-new-privileges`. The image root filesystem is read-only; only the selected
 project, persistent Codex/Maven state, and narrowly scoped runtime tmpfs mounts
-are writable. Consequently, mount capabilities are unavailable in the
+are writable. The ephemeral home and `/tmp` tmpfs mounts are executable for
+native-library extraction but remain `nosuid` and `nodev`. The arbitrary-user
+NSS module and its configuration are root-owned parts of the read-only image
+and use no process-wide loader shim.
+The CUDA profile's Bubblewrap wrapper rebinds only NVIDIA device nodes already
+authorized by Docker; it does not expose the host's complete `/dev` tree.
+Consequently, mount capabilities are unavailable in the
 container's initial namespace; Bubblewrap can use them only inside the user
 namespace it creates. Bubblewrap drops those namespaced capabilities before
 executing a sandboxed command.

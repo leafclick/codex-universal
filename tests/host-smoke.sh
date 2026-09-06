@@ -36,7 +36,7 @@ assert_not_contains() {
         fail "expected launcher output not to contain: $unexpected"
 }
 
-for command in bash git grep jq realpath; do
+for command in bash git grep jq realpath setpriv; do
     need "$command"
 done
 
@@ -212,8 +212,13 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") does not install the LSP MCP bridge"
     grep -qE '^[[:space:]]+socat([[:space:]\\]|$)' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install the IntelliJ MCP relay"
-    grep -qE '^[[:space:]]+libnss-wrapper([[:space:]\\]|$)' "$dockerfile" ||
+    grep -q 'container/libnss_codex.c /usr/local/src/libnss_codex.c' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install arbitrary-user NSS support"
+    if grep -qE '^[[:space:]]+libnss-wrapper([[:space:]\\]|$)' "$dockerfile"; then
+        fail "$(basename "$dockerfile") still installs the process-wide NSS preload shim"
+    fi
+    grep -qE '^[[:space:]]+rlwrap([[:space:]\\]|$)' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install Clojure REPL line editing"
     grep -Fxq 'USER 65532:65532' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not declare the portable non-root user"
     grep -q 'container/codex-entrypoint /usr/local/bin/codex-entrypoint' "$dockerfile" ||
@@ -222,14 +227,28 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") still bakes the host UID/GID into the image"
     fi
 done
+grep -q 'container/codex-bwrap-cuda /usr/local/bin/bwrap' "$ROOT/Dockerfile.cuda" ||
+    fail "CUDA image does not preserve NVIDIA devices inside Codex Bubblewrap"
+grep -Fq -- '--dev-bind' "$ROOT/container/codex-bwrap-cuda" ||
+    fail "CUDA Bubblewrap shim does not bind GPU devices"
+grep -Fq '/dev/nvidiactl' "$ROOT/container/codex-bwrap-cuda" ||
+    fail "CUDA Bubblewrap shim omits the NVIDIA control device"
 grep -Fq 'exec /opt/nvidia/nvidia_entrypoint.sh "$0" "$@"' \
     "$ROOT/container/codex-entrypoint" ||
     fail "portable-user entrypoint does not preserve NVIDIA initialization"
 grep -Fq 'exec 1>&3 3>&-' "$ROOT/container/codex-entrypoint" ||
     fail "portable-user entrypoint does not restore CUDA ACP stdout"
+if grep -Eq 'LD_PRELOAD|NSS_WRAPPER_' \
+    "$ROOT/container/codex-entrypoint" "$ROOT/container/libnss_codex.c"; then
+    fail "portable-user identity leaks NSS configuration into native loaders"
+fi
 grep -Fq 'TCP4-LISTEN:${relay_port},bind=127.0.0.1' \
     "$ROOT/container/codex-acp-entrypoint" ||
     fail "ACP entrypoint does not restrict its MCP relay to container loopback"
+grep -Fq 'setpriv --pdeathsig TERM --' "$ROOT/bin/run-codex" ||
+    fail "IDEA relay is not tied to the launcher lifetime"
+grep -Fq '8>&- 9>&- &' "$ROOT/bin/run-codex" ||
+    fail "IDEA relay inherits launcher lock descriptors"
 pass "shell syntax and static security invariants"
 
 # The launcher smoke test uses echo as a Docker frontend. This verifies the
@@ -382,10 +401,8 @@ resume_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project)"
 
 for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "--read-only"
-    assert_contains "$output" "--tmpfs /home/codex:rw,nosuid,nodev,uid=$(id -u),gid=$(id -g),mode=0700"
-    assert_contains "$output" "--tmpfs /tmp:rw,nosuid,nodev,mode=1777"
-    assert_contains "$output" \
-        "--tmpfs /run/codex-runtime:rw,nosuid,nodev,noexec,uid=$(id -u),gid=$(id -g),mode=0700"
+    assert_contains "$output" "--tmpfs /home/codex:rw,exec,nosuid,nodev,uid=$(id -u),gid=$(id -g),mode=0700"
+    assert_contains "$output" "--tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777"
     assert_contains "$output" "--cap-drop=ALL"
     assert_contains "$output" "--security-opt=no-new-privileges"
     assert_contains "$output" "--security-opt apparmor=codex-universal"
@@ -618,6 +635,133 @@ env \
 grep -Fxq "rm -f -- $cleanup_cid" "$cleanup_log" ||
     fail "IDEA launcher did not remove its container when ACP exited"
 
+# SIGKILL cannot run the launcher's EXIT trap. The relay guard must receive a
+# kernel parent-death signal, remove the exact container, and—most
+# importantly—not retain either launcher lock descriptor.
+test_idea_parent_death_cleanup() (
+    local guard_runtime=""
+    local guard_parent_pid=""
+    local guard_pid=""
+    local guard_relay_pid=""
+    local process_pid=""
+    local guard_ready=false
+    local guard_cleanup_log="$TEST_ROOT/idea-guard-cleanup.log"
+    local guard_cid="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+    local guard_lock="$TEST_ROOT/idea-guard.lock"
+    local guard_pid_file="$TEST_ROOT/idea-guard.pid"
+    local guard_relay_pid_file="$TEST_ROOT/idea-guard-relay.pid"
+
+    cleanup_guard_test() {
+        trap - EXIT
+        if [[ "$guard_parent_pid" =~ ^[0-9]+$ ]]; then
+            kill "$guard_parent_pid" >/dev/null 2>&1 || true
+            wait "$guard_parent_pid" 2>/dev/null || true
+        fi
+        if [[ "$guard_pid" =~ ^[0-9]+$ ]]; then
+            kill "$guard_pid" >/dev/null 2>&1 || true
+            wait "$guard_pid" 2>/dev/null || true
+        fi
+        if [[ -n "$guard_runtime" ]]; then
+            rm -f -- \
+                "$guard_runtime/container.cid" \
+                "$guard_runtime/idea-mcp.sock" \
+                "$guard_runtime/idea-mcp-relay.log"
+            rmdir -- "$guard_runtime" 2>/dev/null || true
+        fi
+    }
+    trap cleanup_guard_test EXIT
+
+    mkdir -p "$TEST_ROOT/guard-bin"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -Eeuo pipefail' \
+        'if [[ "${1:-}" == rm ]]; then' \
+        '    printf "%s\\n" "$*" >> "$CODEX_TEST_GUARD_CLEANUP_LOG"' \
+        'fi' \
+        > "$TEST_ROOT/guard-bin/docker"
+    chmod 755 "$TEST_ROOT/guard-bin/docker"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -Eeuo pipefail' \
+        'printf "%s\\n" "$BASHPID" > "$CODEX_TEST_GUARD_RELAY_PID_FILE"' \
+        'exec tail -f /dev/null' \
+        > "$TEST_ROOT/guard-bin/socat"
+    chmod 755 "$TEST_ROOT/guard-bin/socat"
+
+    guard_runtime="$(mktemp -d -- /tmp/codex-idea-mcp.XXXXXX)"
+    printf '%s\n' "$guard_cid" > "$guard_runtime/container.cid"
+
+    (
+        guard_launcher_pid="$BASHPID"
+        exec 8>"$guard_lock"
+        flock -x 8
+        env \
+            "CODEX_TEST_GUARD_CLEANUP_LOG=$guard_cleanup_log" \
+            "CODEX_TEST_GUARD_RELAY_PID_FILE=$guard_relay_pid_file" \
+            "PATH=$TEST_ROOT/guard-bin:$PATH" \
+            setpriv --pdeathsig TERM -- \
+            "$ROOT/bin/run-codex" --internal-idea-relay-guard \
+            "$guard_launcher_pid" \
+            "$guard_runtime" \
+            "$guard_runtime/idea-mcp.sock" \
+            "$guard_runtime/idea-mcp-relay.log" \
+            64342 \
+            "$guard_runtime/container.cid" \
+            8>&- 9>&- &
+        printf '%s\n' "$!" > "$guard_pid_file"
+        wait
+    ) &
+    guard_parent_pid=$!
+
+    for _ in {1..100}; do
+        if [[ -s "$guard_pid_file" && -s "$guard_relay_pid_file" ]]; then
+            guard_ready=true
+            break
+        fi
+        kill -0 "$guard_parent_pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    $guard_ready || fail "IntelliJ relay guard did not become ready"
+    guard_pid="$(<"$guard_pid_file")"
+    guard_relay_pid="$(<"$guard_relay_pid_file")"
+    [[ "$guard_pid" =~ ^[0-9]+$ ]] && kill -0 "$guard_pid" 2>/dev/null ||
+        fail "IntelliJ relay guard exited before parent-death test"
+    [[ "$guard_relay_pid" =~ ^[0-9]+$ ]] &&
+        kill -0 "$guard_relay_pid" 2>/dev/null ||
+        fail "IntelliJ relay exited before parent-death test"
+    for process_pid in "$guard_pid" "$guard_relay_pid"; do
+        [[ ! -e "/proc/$process_pid/fd/8" &&
+           ! -e "/proc/$process_pid/fd/9" ]] ||
+            fail "IntelliJ relay process inherited launcher lock descriptors"
+    done
+    if (exec 8>"$guard_lock"; flock -xn 8); then
+        fail "parent-death test did not acquire its launcher lock"
+    fi
+
+    kill -KILL "$guard_parent_pid"
+    wait "$guard_parent_pid" 2>/dev/null || true
+    guard_parent_pid=""
+
+    for _ in {1..100}; do
+        if [[ ! -e "$guard_runtime" ]] && ! kill -0 "$guard_pid" 2>/dev/null; then
+            guard_ready=true
+            break
+        fi
+        guard_ready=false
+        sleep 0.05
+    done
+    $guard_ready || fail "IntelliJ relay guard survived launcher SIGKILL"
+    (exec 8>"$guard_lock"; flock -xn 8) ||
+        fail "IntelliJ relay retained the project lock after launcher SIGKILL"
+    grep -Fxq "rm -f -- $guard_cid" "$guard_cleanup_log" ||
+        fail "IntelliJ relay guard did not remove its exact container"
+
+    guard_pid=""
+    guard_runtime=""
+    trap - EXIT
+)
+test_idea_parent_death_cleanup
+
 mkdir -p "$TEST_ROOT/no-jq-bin"
 ln -s "$(type -P bash)" "$TEST_ROOT/no-jq-bin/bash"
 ln -s "$(type -P dirname)" "$TEST_ROOT/no-jq-bin/dirname"
@@ -816,9 +960,8 @@ smoke_image() {
         --pull=never
         --network none
         --read-only
-        --tmpfs "/home/codex:rw,nosuid,nodev,uid=$runtime_uid,gid=$runtime_gid,mode=0700"
-        --tmpfs "/tmp:rw,nosuid,nodev,mode=1777"
-        --tmpfs "/run/codex-runtime:rw,nosuid,nodev,noexec,uid=$runtime_uid,gid=$runtime_gid,mode=0700"
+        --tmpfs "/home/codex:rw,exec,nosuid,nodev,uid=$runtime_uid,gid=$runtime_gid,mode=0700"
+        --tmpfs "/tmp:rw,exec,nosuid,nodev,mode=1777"
         --tmpfs "/workspace:rw,nosuid,nodev,uid=$runtime_uid,gid=$runtime_gid,mode=0700"
         --cap-drop=ALL
         --security-opt=no-new-privileges
@@ -841,11 +984,26 @@ smoke_image() {
         [[ "$(id -g)" == "$3" ]]
         [[ "$(id -un)" == codex ]]
         [[ "$(id -gn)" == codex ]]
-        [[ "$NSS_WRAPPER_PASSWD" == /run/codex-runtime/* ]]
-        [[ -r "$NSS_WRAPPER_PASSWD" && -r "$NSS_WRAPPER_GROUP" ]]
+        [[ -z "${LD_PRELOAD:-}" ]]
+        [[ -z "${NSS_WRAPPER_PASSWD:-}" ]]
+        [[ -z "${NSS_WRAPPER_GROUP:-}" ]]
+        passwd_entry="$(getent passwd "$2")"
+        group_entry="$(getent group "$3")"
+        [[ "$passwd_entry" == "codex:x:$2:$3:"*":$HOME:/bin/bash" ]]
+        [[ "$group_entry" == "codex:x:$3:" ]]
+        [[ "$(getent passwd codex)" == "$passwd_entry" ]]
+        [[ "$(getent group codex)" == "$group_entry" ]]
+        grep -Eq "^passwd:[[:space:]]+codex([[:space:]]|$)" /etc/nsswitch.conf
+        grep -Eq "^group:[[:space:]]+codex([[:space:]]|$)" /etc/nsswitch.conf
         touch "$HOME/runtime-home-is-writable"
         touch /tmp/runtime-tmp-is-writable
         touch /workspace/runtime-workspace-is-writable
+        printf "#!/bin/sh\nexit 0\n" > "$HOME/runtime-home-is-executable"
+        chmod 0700 "$HOME/runtime-home-is-executable"
+        "$HOME/runtime-home-is-executable"
+        printf "#!/bin/sh\nexit 0\n" > /tmp/runtime-tmp-is-executable
+        chmod 0700 /tmp/runtime-tmp-is-executable
+        /tmp/runtime-tmp-is-executable
         if touch /usr/local/bin/image-root-is-read-only 2>/dev/null; then
             exit 1
         fi
@@ -864,23 +1022,38 @@ smoke_image() {
         command -v agent-lsp >/dev/null
         command -v codex-clojure-lsp-mcp >/dev/null
         command -v bb >/dev/null
+        command -v clj >/dev/null
         command -v cljfmt >/dev/null
         command -v clj-kondo >/dev/null
         command -v clojure-lsp >/dev/null
+        command -v rlwrap >/dev/null
         command -v socat >/dev/null
         command -v zstd >/dev/null
+        rlwrap --version
         test -r /etc/codex/requirements.toml
         [[ "$(stat -c %u /usr/local/bin/codex-entrypoint)" == 0 ]]
         [[ "$(stat -c %u /usr/local/share/npm-global/bin/codex)" == 0 ]]
         [[ "$(stat -c %u /etc/codex/requirements.toml)" == 0 ]]
+        nss_module="$(find /usr/lib -name libnss_codex.so.2 -print -quit)"
+        [[ -n "$nss_module" && "$(stat -c %u:%g:%a "$nss_module")" == 0:0:644 ]]
         bwrap \
             --unshare-user \
-            --unshare-pid \
             --unshare-net \
             --ro-bind / / \
-            --tmpfs /proc \
+            --dev /dev \
+            --proc /proc \
             --tmpfs /tmp \
-            /bin/bash -c '\''[[ "$(id -un)" == codex && "$(id -gn)" == codex ]]'\''
+            -- \
+            /bin/bash -c '\''
+                set -Eeuo pipefail
+                [[ "$(id -un)" == codex && "$(id -gn)" == codex ]]
+                [[ -z "${LD_PRELOAD:-}" ]]
+                [[ -z "${NSS_WRAPPER_PASSWD:-}" ]]
+                [[ -z "${NSS_WRAPPER_GROUP:-}" ]]
+                printf "#!/bin/sh\nexit 0\n" > /tmp/sandbox-tmp-is-executable
+                chmod 0700 /tmp/sandbox-tmp-is-executable
+                /tmp/sandbox-tmp-is-executable
+            '\''
         coproc MCP_BRIDGE {
             exec codex-clojure-lsp-mcp clojure:clojure-lsp
         }
@@ -914,6 +1087,14 @@ smoke_image() {
             -c '\''approvals_reviewer="user"'\'' \
             --help >/dev/null
         if [[ "$1" == cuda ]]; then
+            bwrap \
+                --unshare-user \
+                --ro-bind / / \
+                --dev /dev \
+                --proc /proc \
+                --tmpfs /tmp \
+                -- \
+                /bin/bash -c "nvidia-smi >/dev/null"
             [[ "${CODEX_NVIDIA_ENTRYPOINT_RAN:-}" == 1 ]]
             command -v nvcc >/dev/null
             command -v nvidia-smi >/dev/null

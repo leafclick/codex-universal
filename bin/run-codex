@@ -142,6 +142,97 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
+run_idea_relay_guard() {
+    (($# == 6)) || die "Invalid IntelliJ relay guard invocation"
+
+    IDEA_GUARD_LAUNCHER_PID="$1"
+    IDEA_GUARD_RUNTIME_DIR="$2"
+    IDEA_GUARD_RELAY_SOCKET="$3"
+    IDEA_GUARD_RELAY_LOG="$4"
+    IDEA_GUARD_RELAY_PORT="$5"
+    IDEA_GUARD_CID_FILE="$6"
+    IDEA_GUARD_RELAY_PID=""
+    local runtime_owner_mode=""
+
+    [[ "$IDEA_GUARD_LAUNCHER_PID" =~ ^[0-9]+$ ]] &&
+        ((IDEA_GUARD_LAUNCHER_PID > 1)) ||
+        die "Invalid IntelliJ relay guard parent PID"
+    [[ "$IDEA_GUARD_RUNTIME_DIR" =~ ^/tmp/codex-idea-mcp\.[A-Za-z0-9]{6}$ ]] ||
+        die "Invalid IntelliJ relay guard runtime directory"
+    [[ -d "$IDEA_GUARD_RUNTIME_DIR" && ! -L "$IDEA_GUARD_RUNTIME_DIR" ]] ||
+        die "Invalid IntelliJ relay guard runtime directory"
+    [[ "$IDEA_GUARD_RELAY_SOCKET" == "$IDEA_GUARD_RUNTIME_DIR/idea-mcp.sock" &&
+       "$IDEA_GUARD_RELAY_LOG" == "$IDEA_GUARD_RUNTIME_DIR/idea-mcp-relay.log" &&
+       "$IDEA_GUARD_CID_FILE" == "$IDEA_GUARD_RUNTIME_DIR/container.cid" ]] ||
+        die "Invalid IntelliJ relay guard path"
+    [[ "$IDEA_GUARD_RELAY_PORT" =~ ^[0-9]+$ ]] &&
+        ((10#$IDEA_GUARD_RELAY_PORT >= 1024 && 10#$IDEA_GUARD_RELAY_PORT <= 65535)) ||
+        die "Invalid IntelliJ relay guard port"
+
+    cleanup_idea_relay_guard() {
+        local status=$?
+        local job_pid=""
+        local relay_is_our_job=false
+
+        trap - EXIT HUP INT TERM
+        if [[ "$IDEA_GUARD_RELAY_PID" =~ ^[0-9]+$ ]]; then
+            # Avoid signaling a recycled PID if socat exited independently.
+            for job_pid in $(jobs -pr); do
+                if [[ "$job_pid" == "$IDEA_GUARD_RELAY_PID" ]]; then
+                    relay_is_our_job=true
+                    break
+                fi
+            done
+            if $relay_is_our_job; then
+                kill "$IDEA_GUARD_RELAY_PID" >/dev/null 2>&1 || true
+            fi
+            wait "$IDEA_GUARD_RELAY_PID" 2>/dev/null || true
+        fi
+        if [[ -s "$IDEA_GUARD_CID_FILE" && ! -L "$IDEA_GUARD_CID_FILE" ]]; then
+            local container_id="$(<"$IDEA_GUARD_CID_FILE")"
+            if [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
+                docker rm -f -- "$container_id" >/dev/null 2>&1 || true
+            fi
+        fi
+        rm -f -- \
+            "$IDEA_GUARD_CID_FILE" \
+            "$IDEA_GUARD_RELAY_SOCKET" \
+            "$IDEA_GUARD_RELAY_LOG"
+        rmdir -- "$IDEA_GUARD_RUNTIME_DIR" 2>/dev/null || true
+        exit "$status"
+    }
+
+    trap cleanup_idea_relay_guard EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    # setpriv installs the parent-death signal before execing this guard. The
+    # trap and explicit check close the race where the launcher exits first.
+    [[ "$PPID" == "$IDEA_GUARD_LAUNCHER_PID" ]] ||
+        die "IntelliJ relay launcher exited before guard startup"
+
+    need stat
+    need docker
+    need socat
+    runtime_owner_mode="$(stat -c '%u:%a' -- "$IDEA_GUARD_RUNTIME_DIR")"
+    [[ "$runtime_owner_mode" == "$EUID:700" ]] ||
+        die "Unsafe IntelliJ relay guard runtime directory permissions"
+
+    socat \
+        "UNIX-LISTEN:${IDEA_GUARD_RELAY_SOCKET},fork,mode=0600" \
+        "TCP4:127.0.0.1:${IDEA_GUARD_RELAY_PORT}" \
+        >"$IDEA_GUARD_RELAY_LOG" 2>&1 &
+    IDEA_GUARD_RELAY_PID=$!
+    wait "$IDEA_GUARD_RELAY_PID"
+}
+
+if [[ "${1:-}" == --internal-idea-relay-guard ]]; then
+    shift
+    run_idea_relay_guard "$@"
+    exit $?
+fi
+
 case "$CLOJURE_LSP_MCP_OVERRIDE" in
     ''|auto|on|off|0|1) ;;
     *) die "CODEX_CLOJURE_LSP_MCP must be auto, on, off, 1, or 0" ;;
@@ -160,7 +251,6 @@ container_paths_overlap "$CONTAINER_HOME" "$WORKSPACE_ROOT" &&
     die "CODEX_CONTAINER_HOME and CODEX_WORKSPACE_ROOT must not overlap"
 for reserved_runtime_path in \
     /tmp \
-    /run/codex-runtime \
     /run/codex-idea-mcp; do
     container_paths_overlap "$CONTAINER_HOME" "$reserved_runtime_path" &&
         die "CODEX_CONTAINER_HOME overlaps reserved runtime path $reserved_runtime_path"
@@ -169,9 +259,11 @@ for reserved_runtime_path in \
 done
 unset reserved_runtime_path
 
-HOME_TMPFS_SPEC="${CONTAINER_HOME}:rw,nosuid,nodev,uid=${HOST_UID},gid=${HOST_GID},mode=0700"
-TMP_TMPFS_SPEC="/tmp:rw,nosuid,nodev,mode=1777"
-RUNTIME_TMPFS_SPEC="/run/codex-runtime:rw,nosuid,nodev,noexec,uid=${HOST_UID},gid=${HOST_GID},mode=0700"
+# Docker makes tmpfs mounts noexec by default. Native runtimes must be able to
+# map libraries from both temporary locations: JavaCPP defaults to
+# $HOME/.javacpp/cache, while others use java.io.tmpdir.
+HOME_TMPFS_SPEC="${CONTAINER_HOME}:rw,exec,nosuid,nodev,uid=${HOST_UID},gid=${HOST_GID},mode=0700"
+TMP_TMPFS_SPEC="/tmp:rw,exec,nosuid,nodev,mode=1777"
 DOCTOR_WORKSPACE_TMPFS_SPEC="/workspace:rw,nosuid,nodev,uid=${HOST_UID},gid=${HOST_GID},mode=0700"
 
 validate_project_name() {
@@ -908,7 +1000,6 @@ doctor_runtime_probe() {
         --read-only
         --tmpfs "$HOME_TMPFS_SPEC"
         --tmpfs "$TMP_TMPFS_SPEC"
-        --tmpfs "$RUNTIME_TMPFS_SPEC"
         --tmpfs "$DOCTOR_WORKSPACE_TMPFS_SPEC"
         --user "$HOST_UID:$HOST_GID"
         -e "HOME=$CONTAINER_HOME"
@@ -930,12 +1021,30 @@ doctor_runtime_probe() {
         [[ "$(id -g)" == "$2" ]]
         [[ "$(id -un)" == codex ]]
         [[ "$(id -gn)" == codex ]]
-        [[ "$NSS_WRAPPER_PASSWD" == /run/codex-runtime/* ]]
-        [[ -r "$NSS_WRAPPER_PASSWD" && -r "$NSS_WRAPPER_GROUP" ]]
-        touch "$HOME/.codex-runtime-write-probe"
+        [[ -z "${LD_PRELOAD:-}" ]]
+        [[ -z "${NSS_WRAPPER_PASSWD:-}" ]]
+        [[ -z "${NSS_WRAPPER_GROUP:-}" ]]
+        passwd_entry="$(getent passwd "$1")"
+        group_entry="$(getent group "$2")"
+        [[ "$passwd_entry" == "codex:x:$1:$2:"*":$HOME:/bin/bash" ]]
+        [[ "$group_entry" == "codex:x:$2:" ]]
+        [[ "$(getent passwd codex)" == "$passwd_entry" ]]
+        [[ "$(getent group codex)" == "$group_entry" ]]
+        grep -Eq "^passwd:[[:space:]]+codex([[:space:]]|$)" /etc/nsswitch.conf
+        grep -Eq "^group:[[:space:]]+codex([[:space:]]|$)" /etc/nsswitch.conf
+        nss_module="$(find /usr/lib -name libnss_codex.so.2 -print -quit)"
+        [[ -n "$nss_module" ]]
+        [[ "$(stat -c %u:%g:%a "$nss_module")" == 0:0:644 ]]
+        printf "#!/bin/sh\nexit 0\n" > "$HOME/.codex-runtime-write-probe"
+        chmod 0700 "$HOME/.codex-runtime-write-probe"
+        "$HOME/.codex-runtime-write-probe"
         rm "$HOME/.codex-runtime-write-probe"
         touch /tmp/codex-runtime-write-probe
         rm /tmp/codex-runtime-write-probe
+        printf "#!/bin/sh\nexit 0\n" > /tmp/codex-runtime-exec-probe
+        chmod 0700 /tmp/codex-runtime-exec-probe
+        /tmp/codex-runtime-exec-probe
+        rm /tmp/codex-runtime-exec-probe
         if touch /usr/local/bin/.codex-runtime-write-probe 2>/dev/null; then
             exit 1
         fi
@@ -961,11 +1070,22 @@ doctor_runtime_probe() {
         clj-kondo --version
         printf '\''clojure-lsp: '\''
         clojure-lsp --version
+        printf '\''rlwrap: '\''
+        rlwrap --version
+        command -v clj >/dev/null
 
         if [[ "$3" == cuda ]]; then
             [[ "${CODEX_NVIDIA_ENTRYPOINT_RAN:-}" == 1 ]]
             command -v nvcc >/dev/null
             command -v nvidia-smi >/dev/null
+            bwrap \
+                --unshare-user \
+                --ro-bind / / \
+                --dev /dev \
+                --proc /proc \
+                --tmpfs /tmp \
+                -- \
+                /bin/bash -c "nvidia-smi >/dev/null"
             nvidia-smi >/dev/null
         fi
     ' run-codex-doctor "$HOST_UID" "$HOST_GID" "$profile"
@@ -986,7 +1106,6 @@ doctor_mcp_probe() {
         --read-only \
         --tmpfs "$HOME_TMPFS_SPEC" \
         --tmpfs "$TMP_TMPFS_SPEC" \
-        --tmpfs "$RUNTIME_TMPFS_SPEC" \
         --tmpfs "$DOCTOR_WORKSPACE_TMPFS_SPEC" \
         --user "$HOST_UID:$HOST_GID" \
         -e "HOME=$CONTAINER_HOME" \
@@ -1172,14 +1291,14 @@ run_doctor() {
     fi
 
     local optional_missing=()
-    for command in jq socat; do
+    for command in jq socat setpriv; do
         if ! command -v "$command" >/dev/null 2>&1; then
             optional_missing+=("$command")
         fi
     done
     if ((${#optional_missing[@]})); then
         doctor_warn "Optional IntelliJ host commands missing: ${optional_missing[*]}"
-        doctor_note "Install both jq and socat before using IDEA integration."
+        doctor_note "Install jq, socat, and util-linux (setpriv) before using IDEA integration."
     else
         doctor_pass "Optional IntelliJ host commands are available"
     fi
@@ -1263,6 +1382,7 @@ if $IDEA_MODE; then
     need jq
     if [[ "$IDEA_MCP" == 1 ]]; then
         need socat
+        need setpriv
         [[ "$IDEA_MCP_PORT" =~ ^[0-9]{1,5}$ ]] &&
             ((10#$IDEA_MCP_PORT >= 1024 && 10#$IDEA_MCP_PORT <= 65535)) ||
             die "CODEX_IDEA_MCP_PORT must be an unprivileged TCP port (1024-65535)"
@@ -1424,7 +1544,6 @@ docker_args=(
     --read-only
     --tmpfs "$HOME_TMPFS_SPEC"
     --tmpfs "$TMP_TMPFS_SPEC"
-    --tmpfs "$RUNTIME_TMPFS_SPEC"
     --cap-drop=ALL
     --security-opt=no-new-privileges
     --security-opt "apparmor=$APPARMOR_PROFILE"
@@ -1469,7 +1588,7 @@ if $IDEA_MODE; then
             fi
             wait "$IDEA_MCP_RELAY_PID" 2>/dev/null || true
         fi
-        if [[ -s "$IDEA_CID_FILE" ]]; then
+        if [[ -s "$IDEA_CID_FILE" && ! -L "$IDEA_CID_FILE" ]]; then
             container_id="$(<"$IDEA_CID_FILE")"
             if [[ "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
                 docker rm -f -- "$container_id" >/dev/null 2>&1 || true
@@ -1493,10 +1612,20 @@ if $IDEA_MODE; then
         # IDEA deliberately listens on host loopback. Bridge only that one TCP
         # port into a private per-chat Unix socket; do not publish a host port
         # or give the Codex container the host network namespace.
-        socat \
-            "UNIX-LISTEN:${IDEA_MCP_RELAY_SOCKET},fork,mode=0600" \
-            "TCP4:127.0.0.1:${IDEA_MCP_PORT}" \
-            >"$IDEA_MCP_RELAY_LOG" 2>&1 &
+        RUN_CODEX_SELF="$(realpath -e -- "${BASH_SOURCE[0]}")"
+        # The guard gets a parent-death signal even if IDEA kills this launcher
+        # with SIGKILL. Closing the lock descriptors here prevents the relay or
+        # guard from making a finished chat look permanently active.
+        IDEA_LAUNCHER_PID="$BASHPID"
+        setpriv --pdeathsig TERM -- \
+            "$RUN_CODEX_SELF" --internal-idea-relay-guard \
+            "$IDEA_LAUNCHER_PID" \
+            "$IDEA_RUNTIME_DIR" \
+            "$IDEA_MCP_RELAY_SOCKET" \
+            "$IDEA_MCP_RELAY_LOG" \
+            "$IDEA_MCP_PORT" \
+            "$IDEA_CID_FILE" \
+            8>&- 9>&- &
         IDEA_MCP_RELAY_PID=$!
 
         relay_ready=false

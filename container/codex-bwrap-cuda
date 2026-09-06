@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Codex's Linux sandbox deliberately replaces /dev with a minimal device tree.
+# CUDA needs only these Docker-authorized NVIDIA nodes; expose no other host
+# devices. The NVIDIA Container Toolkit decides which nodes exist and Docker's
+# device cgroup remains the outer enforcement boundary.
+real_bwrap=/usr/bin/bwrap
+[[ -x "$real_bwrap" ]] || {
+    echo "Missing system Bubblewrap: $real_bwrap" >&2
+    exit 127
+}
+
+bind_args=()
+if [[ -d /proc/driver/nvidia ]]; then
+    bind_args+=(--ro-bind /proc/driver/nvidia /proc/driver/nvidia)
+fi
+for device in /dev/nvidia[0-9]*; do
+    [[ -e "$device" ]] || continue
+    bind_args+=(--dev-bind "$device" "$device")
+done
+for device in \
+    /dev/nvidiactl \
+    /dev/nvidia-modeset \
+    /dev/nvidia-uvm \
+    /dev/nvidia-uvm-tools \
+    /dev/nvidia-caps \
+    /dev/dxg; do
+    if [[ -e "$device" ]]; then
+        bind_args+=(--dev-bind "$device" "$device")
+    fi
+done
+
+command_args=()
+inserted=false
+for argument in "$@"; do
+    if [[ "$argument" == -- && "$inserted" == false ]]; then
+        command_args+=("${bind_args[@]}" --)
+        inserted=true
+    else
+        command_args+=("$argument")
+    fi
+done
+
+if [[ "$inserted" == false ]]; then
+    command_args+=("${bind_args[@]}")
+fi
+
+exec "$real_bwrap" "${command_args[@]}"

@@ -20,6 +20,8 @@ fi
     echo "HOME must be an absolute path without passwd delimiters" >&2
     exit 1
 }
+export USER=codex
+export LOGNAME=codex
 
 # Preserve NVIDIA's upstream initialization as the outer wrapper around the
 # requested CUDA command. It ultimately executes this script again with the
@@ -45,47 +47,5 @@ if [[ "${CODEX_NVIDIA_RESTORE_STDOUT:-0}" == 1 ]]; then
     exec 1>&3 3>&-
     unset CODEX_NVIDIA_RESTORE_STDOUT
 fi
-
-# Docker can run a pre-built image with any host UID/GID, but that numeric
-# identity may not exist in the image's passwd database. Supply a private NSS
-# view so tools that resolve the current user still see the stable "codex"
-# account. The launcher provides /run/codex-runtime as a private tmpfs which
-# remains visible when an inner sandbox replaces /tmp. The fallback supports
-# direct image commands that do not use run-codex.
-nss_parent=/run/codex-runtime
-[[ -d "$nss_parent" && -w "$nss_parent" ]] || nss_parent=/tmp
-readonly nss_parent
-nss_dir="$(mktemp -d "$nss_parent/nss.XXXXXX")"
-readonly nss_dir
-readonly passwd_file="$nss_dir/passwd"
-readonly group_file="$nss_dir/group"
-
-awk -F: -v uid="$runtime_uid" '
-    $1 != "codex" && $3 != uid { print }
-' /etc/passwd > "$passwd_file"
-printf 'codex:x:%s:%s:Codex runtime user:%s:/bin/bash\n' \
-    "$runtime_uid" "$runtime_gid" "$HOME" \
-    >> "$passwd_file"
-
-awk -F: -v gid="$runtime_gid" '
-    $1 != "codex" && $3 != gid { print }
-' /etc/group > "$group_file"
-printf 'codex:x:%s:\n' "$runtime_gid" >> "$group_file"
-
-nss_wrapper="$({
-    find /usr/lib \( -type f -o -type l \) \
-        -name libnss_wrapper.so -print -quit
-} 2>/dev/null)"
-readonly nss_wrapper
-[[ -n "$nss_wrapper" ]] || {
-    echo "libnss_wrapper.so is missing from the image" >&2
-    exit 1
-}
-
-export NSS_WRAPPER_PASSWD="$passwd_file"
-export NSS_WRAPPER_GROUP="$group_file"
-export LD_PRELOAD="$nss_wrapper${LD_PRELOAD:+:$LD_PRELOAD}"
-export USER=codex
-export LOGNAME=codex
 
 exec "$@"

@@ -52,7 +52,6 @@ RUN apt-get update \
         libgssapi-krb5-2 \
         liblzma-dev \
         libncurses-dev \
-        libnss-wrapper \
         libnss3-dev \
         libpq-dev \
         libpsl-dev \
@@ -74,6 +73,7 @@ RUN apt-get update \
         procps \
         protobuf-compiler \
         ripgrep \
+        rlwrap \
         rsync \
         software-properties-common \
         socat \
@@ -93,6 +93,24 @@ RUN apt-get update \
         zlib1g-dev \
         zstd \
     && rm -rf /var/lib/apt/lists/*
+
+# Resolve any non-root runtime UID/GID as the stable codex identity through
+# glibc NSS. Unlike an LD_PRELOAD shim, this does not alter native-library
+# loading in JVM, CUDA, or other child processes.
+COPY --chmod=0644 container/libnss_codex.c /usr/local/src/libnss_codex.c
+RUN multiarch="$(gcc -print-multiarch)" \
+    && gcc -std=c11 -O2 -fPIC -fstack-protector-strong \
+        -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror \
+        -shared -Wl,-soname,libnss_codex.so.2,-z,relro,-z,now \
+        -o /tmp/libnss_codex.so.2 /usr/local/src/libnss_codex.c \
+    && install -o root -g root -m 0644 /tmp/libnss_codex.so.2 \
+        "/usr/lib/${multiarch}/libnss_codex.so.2" \
+    && sed -ri \
+        -e 's/^passwd:[[:space:]]*/passwd: codex /' \
+        -e 's/^group:[[:space:]]*/group: codex /' \
+        /etc/nsswitch.conf \
+    && rm -f /tmp/libnss_codex.so.2 /usr/local/src/libnss_codex.c \
+    && ldconfig
 
 # Give the image a fixed non-root default identity. run-codex replaces this
 # with the invoking host user's numeric identity and supplies a writable tmpfs
@@ -175,6 +193,7 @@ COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
 COPY --chmod=0755 container/codex-entrypoint /usr/local/bin/codex-entrypoint
 COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint
 COPY --chmod=0755 container/codex-clojure-lsp-mcp /usr/local/bin/codex-clojure-lsp-mcp
+COPY --chmod=0755 container/codex-bwrap-cuda /usr/local/bin/bwrap
 
 ENV HOME=/home/codex
 
@@ -183,7 +202,6 @@ RUN install -d -o root -g root -m 0555 \
         /home/codex \
         /home/codex/.codex \
         /home/codex/.m2 \
-        /run/codex-runtime \
         /run/codex-idea-mcp
 
 WORKDIR /workspace

@@ -40,12 +40,13 @@ editor-aware navigation is useful.
 This is the shortest supported setup. Follow the linked detailed sections if a
 step fails or needs customization.
 
-1. Install Docker Engine, Bash, Git, AppArmor, `jq`, and `socat`. See
+1. Install Docker Engine, Bash, Git, AppArmor, `jq`, `socat`, and
+   `util-linux`. See
    [host requirements](#host-requirements); CUDA users must also complete
    [CUDA host setup](#cuda-host-setup).
 
    ```bash
-   sudo apt install apparmor apparmor-utils jq socat
+   sudo apt install apparmor apparmor-utils jq socat util-linux
    ```
 
 2. Clone the repository and build one image. Substitute `cuda` for `generic`
@@ -228,6 +229,7 @@ Both contain the same development environment, including:
 - Node.js 24
 - Eclipse Temurin JDK 25
 - Clojure CLI
+- rlwrap for interactive Clojure REPL sessions
 - Leiningen
 - deps.clj
 - Git / Git LFS
@@ -244,7 +246,7 @@ Building and running the containers requires:
 - Git
 - GNU `grep`
 - GNU `coreutils`, including `realpath`
-- `util-linux`, including `flock`
+- `util-linux`, including `flock` and `setpriv`
 - `jq`
 - `socat` for the optional IntelliJ MCP relay
 - AppArmor and `apparmor_parser`
@@ -332,7 +334,7 @@ CODEX_IMAGE_TAG=1.0.0 \
 Images use a fixed non-root default identity (`65532:65532`) and do not capture
 the builder's UID or GID. `run-codex` replaces that identity with the invoking
 host user's numeric UID/GID, supplies the stable `codex` name through a private
-NSS database, and starts the container with a read-only root filesystem.
+root-owned NSS module, and starts the container with a read-only root filesystem.
 Consequently, the same immutable pre-built image can be used on machines whose
 users have different numeric identities. Installed image content remains
 root-owned; writable state is provided only through explicit bind mounts and
@@ -346,6 +348,9 @@ Both image profiles install the latest stable native releases of:
 - `cljfmt`
 - `clj-kondo`
 - `clojure-lsp`
+
+They also install `rlwrap`, so the Clojure CLI's interactive `clj` wrapper has
+line editing and command history available out of the box.
 
 The build uses each project's supported installer, which selects the native
 binary for the image architecture. `cljfmt` is the standalone GraalVM native
@@ -438,7 +443,7 @@ default seccomp and AppArmor policies intentionally block. Install this
 project's host policy once from the checkout:
 
 ```bash
-sudo apt install apparmor apparmor-utils jq socat
+sudo apt install apparmor apparmor-utils jq socat util-linux
 bin/setup-codex-host-security
 ```
 
@@ -585,11 +590,13 @@ env \
 
 This is a lightweight container/runtime check: it runs the image under a
 numeric UID/GID different from its built-in identity, verifies the read-only
-root and writable tmpfs boundaries, confirms that NVIDIA's upstream entrypoint
-hands off the requested command, and checks the CUDA compiler, headers, and
-GPU visibility through `nvidia-smi`. In IDEA mode the NVIDIA initialization
-banner is routed to stderr so ACP stdout remains protocol-only. Project-level
-CUDA workloads remain the responsibility of the project using the image.
+root and writable tmpfs boundaries, verifies identity lookup without inherited
+NSS loader variables, confirms that NVIDIA's upstream entrypoint hands off the
+requested command with that clean environment, and checks the CUDA compiler,
+headers, and GPU visibility through `nvidia-smi`. In IDEA mode the NVIDIA
+initialization banner is routed to stderr so ACP stdout remains protocol-only.
+Project-level CUDA workloads remain the responsibility of the project using
+the image.
 
 Set `CODEX_TEST_SKIP_CUDA=1` to omit the CUDA image check on a host without an
 NVIDIA runtime. Set `CODEX_TEST_SKIP_IMAGE=1` to omit all real-image checks.
@@ -630,6 +637,9 @@ docker run --rm --gpus all \
 ```
 
 `run-codex` adds `--gpus all` only for projects configured with the `cuda` profile.
+The CUDA image also wraps Bubblewrap to re-expose only Docker-authorized NVIDIA
+device nodes inside Codex's nested sandbox, so GPU workloads work under the
+normal `workspace-write` policy.
 
 ## Installing commands
 
@@ -1012,7 +1022,7 @@ project's container launcher.
 
 Setup:
 
-1. Install `jq`, `socat`, and the current `run-codex` and
+1. Install `jq`, `socat`, `util-linux`, and the current `run-codex` and
    `setup-codex-idea` commands as described in
    [Install](#install). Images built from the
    current Dockerfiles already contain `codex-acp` and the container side of
@@ -1091,8 +1101,10 @@ Codex -> container loopback -> private Unix socket -> host loopback -> IDEA
 The container gets a read-only mount of only the per-chat relay directory. It
 does not get host networking, a published port, or the IDEA or Snap
 installation. The relay is stopped and its socket removed with the ACP
-container. Separate IDEA chats use separate sockets and isolated container
-loopback listeners.
+container. A parent-death guard also removes the exact container and relay if
+IDEA kills the launcher without allowing its normal exit trap to run. Relay
+processes do not inherit the project or snapshot locks. Separate IDEA chats
+use separate sockets and isolated container loopback listeners.
 
 IDEA mode mounts the checkout at the same absolute host path inside the
 container, so `projectPath` values and file paths returned by IDE tools
@@ -1255,7 +1267,7 @@ A project such as `my-project` is launched approximately as:
 host project       -> /workspace/my-project
 ~/.codex           -> container user's ~/.codex
 ~/.m2              -> container user's ~/.m2
-per-container tmpfs -> container user's home, /tmp, and private runtime metadata
+per-container tmpfs -> container user's home and /tmp
 ```
 
 Sharing `~/.m2` avoids repeatedly downloading large Maven/Clojure dependencies, particularly CUDA libraries.
@@ -1263,10 +1275,13 @@ Sharing `~/.m2` avoids repeatedly downloading large Maven/Clojure dependencies, 
 The container runs using the host numeric UID/GID, regardless of the fixed
 identity stored in the image. Its root filesystem is read-only. The project,
 `~/.codex`, and `~/.m2` bind mounts remain writable, while ephemeral home/cache
-files and `/tmp` live in tmpfs. A private NSS database maps the host numeric
-identity to the stable in-container name `codex`; it resides in a dedicated
-runtime tmpfs that remains visible but read-only inside nested sandboxes. This
-does not modify `/etc` or require starting as root.
+files and `/tmp` live in tmpfs. Both tmpfs mounts permit execution because JVM
+native loaders extract shared libraries into locations such as
+`~/.javacpp/cache` and `/tmp`; both remain `nosuid` and `nodev`. A root-owned
+glibc NSS module maps the process's non-root numeric identity to the stable
+in-container name `codex`. It requires neither a writable passwd file nor an
+`LD_PRELOAD` setting, so native JVM and CUDA libraries retain their normal
+loader environment. The container never needs to start as root.
 
 ## Codex state synchronization
 
