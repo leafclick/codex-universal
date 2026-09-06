@@ -1264,6 +1264,34 @@ encrypted Seafile library
 live ~/.codex on another machine
 ```
 
+### Register an existing checkout on another machine
+
+Project registration is machine-local, so an existing Git checkout can be
+registered on machine B while Codex is still running on machine A:
+
+```bash
+run-codex --init --profile cuda same-project /another/path
+```
+
+This command only registers the checkout; it does not start Codex or hand off
+its state. There is no need to finish the current task on machine A, but before
+starting Codex on machine B, exit every Codex session and container on machine
+A, run `codex-push`, and wait for the snapshot directory to finish
+synchronizing. On a machine with no local synchronization baseline, inspect the
+available generations and explicitly adopt the newest one before launching the
+project:
+
+```bash
+codex-pull --list
+codex-pull --force GENERATION
+run-codex same-project
+```
+
+After initial adoption, use ordinary `codex-pull` for later handoffs. Only one
+machine should actively modify the shared Codex state at a time. The snapshots
+contain `~/.codex`, not the project checkout, so transfer commits and any
+uncommitted working-tree changes separately.
+
 Protect the Seafile library with a strong, unique password. Snapshots can contain Codex authentication material and session history; keep the password separate from the repository and synchronized data.
 
 See [Codex state synchronization](docs/codex-sync.md) for required host software, Debian/Ubuntu installation commands, initial setup, daily handoff, recovery, locking, and configuration.
