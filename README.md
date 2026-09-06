@@ -287,10 +287,13 @@ repositories and several upstream installer channels are resolved at build
 time. Do not overwrite a published version tag, and use the registry digest
 when an exact image artifact must be selected.
 
-Git-derived OCI labels are applied after the toolchain layers, so a new source
-revision alone does not invalidate the expensive package-installation cache.
-Dockerfile changes, copied installer changes, dependency-version arguments,
-and an updated base image still invalidate the layers they affect.
+Stable system, Java, and core Clojure layers precede the native Clojure tools,
+versioned Codex/ACP/LSP packages, and copied integration files. Updating an
+agent package version or an integration script therefore preserves the costly
+Java and core Clojure cache. Git-derived OCI labels are applied after every
+filesystem layer, so a new source revision alone updates only image metadata.
+Dockerfile changes, copied installers, and updated base images still invalidate
+the layers they affect.
 
 A different repository slug can be selected:
 
@@ -338,11 +341,13 @@ text search.
 Use the copyable [terminal Clojure LSP prompt](#terminal-clojure-lsp-prompt)
 after installation to verify the local server and its container paths.
 
-The terminal bridge runs in a nested networkless Bubblewrap sandbox. It can
-update the working tree and its caches, but `.git` and `.codex` remain
-read-only; Codex prompts before invoking MCP tools declared as write-capable.
-This preserves the same outer boundary as ordinary Codex commands. Disable the
-terminal integration for a session if needed:
+The terminal bridge runs in a nested networkless Bubblewrap sandbox with a
+private PID namespace and an empty `/proc`. It can update the working tree and
+its caches, but `.git` and `.codex` remain read-only; Codex prompts before
+invoking MCP tools declared as write-capable. This preserves the same outer
+boundary as ordinary Codex commands without exposing other container
+processes through procfs. Disable the terminal integration for a session if
+needed:
 
 ```bash
 CODEX_CLOJURE_LSP_MCP=0 run-codex my-project

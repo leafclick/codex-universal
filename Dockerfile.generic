@@ -3,9 +3,6 @@ FROM ubuntu:24.04
 ARG UNAME=codex
 ARG UID=1000
 ARG GID=1000
-ARG CODEX_VERSION=latest
-ARG CODEX_ACP_VERSION=latest
-ARG AGENT_LSP_VERSION=latest
 ARG DEBIAN_FRONTEND=noninteractive
 
 ENV LANG=C.UTF-8
@@ -126,18 +123,6 @@ RUN mkdir -p /usr/local/share/npm-global \
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=${PATH}:/usr/local/share/npm-global/bin
 
-RUN npm install -g \
-        "@openai/codex@${CODEX_VERSION}" \
-        "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
-        "@blackwell-systems/agent-lsp@${AGENT_LSP_VERSION}" \
-    && npm cache clean --force
-
-# requirements.toml is an enforced Codex policy layer. In particular, an IDE
-# cannot switch the ACP session to automatic review or full access.
-COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
-COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint
-COPY --chmod=0755 container/codex-clojure-lsp-mcp /usr/local/bin/codex-clojure-lsp-mcp
-
 # Eclipse Temurin 25 JDK.
 RUN install -d -m 0755 /etc/apt/keyrings \
     && wget -qO- https://packages.adoptium.net/artifactory/api/gpg/key/public \
@@ -178,6 +163,23 @@ RUN cd /tmp \
 COPY --chmod=0755 container/install-clojure-tools /usr/local/src/install-clojure-tools
 RUN /usr/local/src/install-clojure-tools \
     && rm -f /usr/local/src/install-clojure-tools
+
+# Keep frequently changing agent packages and integration files after the
+# stable Java and Clojure runtime layers so their updates preserve that cache.
+ARG CODEX_VERSION=latest
+ARG CODEX_ACP_VERSION=latest
+ARG AGENT_LSP_VERSION=latest
+RUN npm install -g \
+        "@openai/codex@${CODEX_VERSION}" \
+        "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
+        "@blackwell-systems/agent-lsp@${AGENT_LSP_VERSION}" \
+    && npm cache clean --force
+
+# requirements.toml is an enforced Codex policy layer. In particular, an IDE
+# cannot switch the ACP session to automatic review or full access.
+COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
+COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint
+COPY --chmod=0755 container/codex-clojure-lsp-mcp /usr/local/bin/codex-clojure-lsp-mcp
 
 ENV HOME=/home/${UNAME}
 

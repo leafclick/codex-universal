@@ -108,8 +108,19 @@ grep -Fq -- '--entrypoint /bin/sh' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not start under the outer AppArmor profile"
 grep -Fq -- "-c 'exec /usr/bin/bwrap \"\$@\"'" "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not exercise the AppArmor transition"
+grep -Fq -- '--unshare-pid \' "$ROOT/bin/run-codex" ||
+    fail "Bubblewrap preflight does not exercise the private PID namespace"
+grep -Fq -- '--tmpfs /proc \' "$ROOT/bin/run-codex" ||
+    fail "Bubblewrap preflight does not exercise the private procfs overlay"
 grep -Fq -- '--unshare-net' "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge is not network-isolated"
+grep -Fq -- '--unshare-pid' "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP MCP bridge is not PID-isolated"
+grep -Fq -- '--tmpfs /proc' "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP MCP bridge does not hide the outer procfs"
+if grep -Fq -- '--proc /proc' "$ROOT/container/codex-clojure-lsp-mcp"; then
+    fail "Clojure LSP MCP bridge mounts procfs inside its private PID namespace"
+fi
 grep -Fq -- '\( -name .git -o -name .codex \) -prune -print0' \
     "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge does not protect nested Git/Codex metadata"
@@ -134,6 +145,30 @@ grep -qE '^[[:space:]]+zstd([[:space:]\\]|$)' "$ROOT/Dockerfile.generic" ||
 grep -qE '^[[:space:]]+zstd([[:space:]\\]|$)' "$ROOT/Dockerfile.cuda" ||
     fail "CUDA image does not install zstd"
 for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
+    java_line="$(grep -n '^# Eclipse Temurin ' "$dockerfile" | cut -d: -f1)"
+    clojure_line="$(grep -n '^# Clojure CLI\.' "$dockerfile" | cut -d: -f1)"
+    native_tools_line="$(
+        grep -n '^RUN /usr/local/src/install-clojure-tools' "$dockerfile" |
+            cut -d: -f1
+    )"
+    npm_install_line="$(grep -n '^RUN npm install -g' "$dockerfile" | cut -d: -f1)"
+    mcp_wrapper_line="$(
+        grep -n '^COPY .*container/codex-clojure-lsp-mcp ' "$dockerfile" |
+            cut -d: -f1
+    )"
+    (( java_line < clojure_line &&
+       clojure_line < native_tools_line &&
+       native_tools_line < npm_install_line &&
+       npm_install_line < mcp_wrapper_line )) ||
+        fail "$(basename "$dockerfile") does not preserve stable toolchain cache ordering"
+    for package_arg in CODEX_VERSION CODEX_ACP_VERSION AGENT_LSP_VERSION; do
+        package_arg_line="$(
+            grep -n "^ARG ${package_arg}=" "$dockerfile" | cut -d: -f1
+        )"
+        (( native_tools_line < package_arg_line &&
+           package_arg_line < npm_install_line )) ||
+            fail "$(basename "$dockerfile") declares $package_arg before the stable toolchain"
+    done
     metadata_arg_line="$(
         grep -n '^ARG IMAGE_VERSION=' "$dockerfile" | cut -d: -f1 || true
     )"
@@ -566,9 +601,33 @@ smoke_image() {
         test -r /etc/codex/requirements.toml
         bwrap \
             --unshare-user \
+            --unshare-pid \
             --unshare-net \
             --ro-bind / / \
+            --tmpfs /proc \
             /bin/true
+        coproc MCP_BRIDGE {
+            exec codex-clojure-lsp-mcp clojure:clojure-lsp
+        }
+        mcp_pid="$MCP_BRIDGE_PID"
+        mcp_input_fd="${MCP_BRIDGE[1]}"
+        mcp_output_fd="${MCP_BRIDGE[0]}"
+        mcp_ready=0
+        printf '\''%s\n'\'' \
+            '\''{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"host-smoke","version":"1"}}}'\'' \
+            >&"$mcp_input_fd"
+        for _ in {1..10}; do
+            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
+               jq -e \
+                   '\''.id == 1 and .result.serverInfo.name == "agent-lsp"'\'' \
+                   <<<"$mcp_line" >/dev/null 2>&1; then
+                mcp_ready=1
+                break
+            fi
+        done
+        kill "$mcp_pid" 2>/dev/null || true
+        wait "$mcp_pid" 2>/dev/null || true
+        (( mcp_ready == 1 ))
         codex --version
         bb --version
         cljfmt --version

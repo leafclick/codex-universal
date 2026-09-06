@@ -639,8 +639,17 @@ if ! sandbox_probe_output="$(
         -c 'exec /usr/bin/bwrap "$@"' \
         codex-sandbox-probe \
         --unshare-user \
+        --unshare-ipc \
+        --unshare-pid \
         --unshare-net \
+        --unshare-uts \
+        --unshare-cgroup-try \
+        --die-with-parent \
+        --new-session \
         --ro-bind / / \
+        --dev /dev \
+        --tmpfs /proc \
+        --tmpfs /tmp \
         /bin/true 2>&1
 )"; then
     [[ -z "$sandbox_probe_output" ]] || printf '%s\n' "$sandbox_probe_output" >&2

@@ -27,7 +27,11 @@ bwrap_args=(
     --new-session
     --ro-bind / /
     --dev /dev
-    --proc /proc
+    # Mounting a fresh procfs after unsharing both user and PID namespaces is
+    # rejected by some hardened Docker hosts. An empty overlay keeps the
+    # private PID namespace from exposing the container's outer /proc while
+    # avoiding that host-dependent mount operation.
+    --tmpfs /proc
     --tmpfs /tmp
     --bind "$container_home" "$container_home"
     --bind "$project_root" "$project_root"
