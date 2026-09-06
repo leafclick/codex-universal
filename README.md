@@ -279,6 +279,12 @@ The integration follows the persistent MCP/LSP design described in the
 through a private loopback relay, avoiding a second language-server index and
 exposing the IDE's project-aware tools to Codex.
 
+For Clojure repositories using these images, copy and adapt the
+[suggested `AGENTS.md` interactive-development section](docs/clojure-agents.md).
+Its baseline workflow is editor-independent: Babashka tasks, native LSP and
+lint/format tools, a persistent nREPL, watchers, and a fresh JVM for final
+verification. IDEA MCP is documented as an optional semantic provider.
+
 ## Codex sandboxing inside Docker
 
 `run-codex` starts Codex with the low-friction `Auto` policy:
