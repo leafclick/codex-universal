@@ -6,16 +6,7 @@ ARG GID=1000
 ARG CODEX_VERSION=latest
 ARG CODEX_ACP_VERSION=latest
 ARG AGENT_LSP_VERSION=latest
-ARG IMAGE_VERSION=dev
-ARG VCS_REF=unknown
-ARG IMAGE_SOURCE=https://github.com/leafclick/codex-universal
 ARG DEBIAN_FRONTEND=noninteractive
-
-LABEL org.opencontainers.image.title="codex-universal-generic" \
-      org.opencontainers.image.description="Non-root generic development environment for OpenAI Codex" \
-      org.opencontainers.image.version="${IMAGE_VERSION}" \
-      org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.source="${IMAGE_SOURCE}"
 
 ENV LANG=C.UTF-8
 
@@ -199,3 +190,15 @@ USER ${UID}:${GID}
 # Make the image an executable Codex image. Arguments passed after the image
 # name become Codex arguments, e.g. `docker run ... IMAGE resume --last`.
 ENTRYPOINT ["codex"]
+
+# Keep Git-derived metadata after every expensive filesystem layer. A new
+# source revision should update the image identity without invalidating the
+# cached toolchain installed above.
+ARG IMAGE_VERSION=dev
+ARG VCS_REF=unknown
+ARG IMAGE_SOURCE=https://github.com/leafclick/codex-universal
+LABEL org.opencontainers.image.title="codex-universal-generic" \
+      org.opencontainers.image.description="Non-root generic development environment for OpenAI Codex" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.source="${IMAGE_SOURCE}"

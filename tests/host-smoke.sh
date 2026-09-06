@@ -134,6 +134,17 @@ grep -qE '^[[:space:]]+zstd([[:space:]\\]|$)' "$ROOT/Dockerfile.generic" ||
 grep -qE '^[[:space:]]+zstd([[:space:]\\]|$)' "$ROOT/Dockerfile.cuda" ||
     fail "CUDA image does not install zstd"
 for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
+    metadata_arg_line="$(
+        grep -n '^ARG IMAGE_VERSION=' "$dockerfile" | cut -d: -f1 || true
+    )"
+    last_filesystem_line="$(
+        grep -nE '^(ADD|COPY|RUN) ' "$dockerfile" |
+            tail -n 1 | cut -d: -f1 || true
+    )"
+    [[ -n "$metadata_arg_line" && -n "$last_filesystem_line" ]] ||
+        fail "$(basename "$dockerfile") cannot verify OCI metadata placement"
+    (( metadata_arg_line > last_filesystem_line )) ||
+        fail "$(basename "$dockerfile") puts changing OCI metadata before cached filesystem layers"
     grep -q 'org.opencontainers.image.version=' "$dockerfile" ||
         fail "$(basename "$dockerfile") has no OCI version label"
     grep -q 'org.opencontainers.image.revision=' "$dockerfile" ||

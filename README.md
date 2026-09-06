@@ -287,6 +287,11 @@ repositories and several upstream installer channels are resolved at build
 time. Do not overwrite a published version tag, and use the registry digest
 when an exact image artifact must be selected.
 
+Git-derived OCI labels are applied after the toolchain layers, so a new source
+revision alone does not invalidate the expensive package-installation cache.
+Dockerfile changes, copied installer changes, dependency-version arguments,
+and an updated base image still invalidate the layers they affect.
+
 A different repository slug can be selected:
 
 ```bash
