@@ -1,63 +1,56 @@
 # codex-universal
 
-`codex-universal` runs OpenAI Codex against local Git projects in a Docker development environment that limits access to the host.
+## Overview
 
-It packages Codex and common development tools in non-root generic Ubuntu and
-NVIDIA CUDA images. The host launcher registers Git projects, mounts one
-project into a container, and leaves the working tree available to host
-editors.
+`codex-universal` runs OpenAI Codex against one local Git project in a
+non-root Docker development environment. The checkout remains in its normal
+host location for editors, while Docker restricts the host files visible to
+Codex. Codex runs with `workspace-write`, human approval for escalation, and
+no full-access mode.
 
-Docker limits host filesystem access to the configured mounts. Inside the
-container, Codex uses `workspace-write` with `on-request` approval. Ordinary
-working-tree edits, builds, and tests run directly; command network access and
-Git metadata writes require human approval. Codex sessions and selected
-dependency caches persist on the host.
+Both the generic Ubuntu and NVIDIA CUDA images include Codex, Java, Node.js,
+Clojure CLI, Leiningen, Git, and common build tools. Clojure projects also get
+native `bb`, `cljfmt`, `clj-kondo`, and `clojure-lsp`, plus a persistent local
+LSP-to-MCP bridge in terminal mode. Optional IntelliJ IDEA integration runs the
+same containerized Codex in JetBrains AI Chat and exposes a read-only view of
+the IDE's semantic tools.
 
-> **Name and relationship:** OpenAI maintains a separate
-> [`openai/codex-universal`](https://github.com/openai/codex-universal)
-> reference base image for Codex environments. Its
-> [Dockerfile defaults to the root user](https://github.com/openai/codex-universal/blob/main/Dockerfile),
-> leaving runtime isolation and policy to its caller. This project
-> was developed independently and is not a fork; it focuses on a non-root
-> runtime, restricted host mounts, and enforced approval boundaries.
+## One command, one project, full toolchain
 
-## Example terminal session
-
-This is a simplified example; the exact Codex TUI varies by release:
+One launcher gives Codex a ready-to-use toolchain, persistent sessions and
+caches, semantic Clojure navigation, and only the project you selected—without
+moving the checkout away from your editor.
 
 ```text
 $ cd ~/src/my-project
 $ run-codex
-Resuming last Codex session for 'my-project'
-  profile: cuda
-  image:   leafclick/codex-universal-cuda:latest
   project: /home/alice/src/my-project -> /workspace/my-project
   policy:  workspace-write; Git metadata and network writes need your approval
 
-> Find the failing test, fix it, and run the focused test suite.
-
-Inspected the test and implementation
-Updated src/example.clj
-Ran the focused tests: 12 passed
-
-› Approval required: git commit -m "Fix example validation"
-  [allow once]  [deny]
+> Use the Clojure LSP tools to find this symbol's callers, fix the bug,
+  and run the focused test.
 ```
 
-The [optional IntelliJ IDEA integration](#intellij-idea-integration) runs this
-containerized Codex through JetBrains AI Chat instead of the IDE's separately
-managed Codex runtime.
+Use the generic image for everyday development or the CUDA image when Codex
+needs the host GPU. Use it in a terminal, or add the optional IDEA agent when
+editor-aware navigation is useful.
 
-Codex state in `~/.codex` can be [pushed to another machine and resumed there](docs/codex-sync.md).
+## Install
 
-## Installation overview
+This is the shortest supported setup. Follow the linked detailed sections if a
+step fails or needs customization.
 
-1. Install the [host requirements](#host-requirements). The full smoke test and
-   state synchronization also need the
-   [synchronization tools](docs/codex-sync.md#install-required-software).
+1. Install Docker Engine, Bash, Git, AppArmor, `jq`, and `socat`. See
+   [host requirements](#host-requirements); CUDA users must also complete
+   [CUDA host setup](#cuda-host-setup).
 
-2. Clone the repository and build an image. Use `cuda` instead of `generic`
-   when the project needs the [CUDA profile](#cuda-host-setup).
+   ```bash
+   sudo apt install apparmor apparmor-utils jq socat
+   ```
+
+2. Clone the repository and build one image. Substitute `cuda` for `generic`
+   when GPU access is required. See [building](#building) for tags and other
+   options.
 
    ```bash
    git clone https://github.com/leafclick/codex-universal.git
@@ -65,46 +58,19 @@ Codex state in `~/.codex` can be [pushed to another machine and resumed there](d
    ./docker-build.sh generic
    ```
 
-3. Install the host sandbox policy. This is idempotent; it copies the seccomp
-   policy into the current user's configuration and uses `sudo` only to load
-   the system AppArmor profile.
+3. Install the host sandbox policy and launcher commands. Ensure
+   `~/.local/bin` is in `PATH`. See [installing commands](#installing-commands)
+   for alternatives.
 
    ```bash
    bin/setup-codex-host-security
-   ```
-
-4. [Install the commands](#installing-commands) from `bin/` into the user's
-   executable path.
-
-   ```bash
    mkdir -p ~/.local/bin
-   install -m 755 bin/run-codex ~/.local/bin/run-codex
-   install -m 755 bin/setup-codex-idea ~/.local/bin/setup-codex-idea
+   install -m 755 bin/run-codex bin/setup-codex-idea ~/.local/bin/
    install -m 700 bin/codex-push bin/codex-pull ~/.local/bin/
    ```
 
-5. Create or review `~/.codex/config.toml`. These are the recommended local
-   defaults; the launcher and image-level requirements enforce the same
-   security boundary even if the file is absent or contains weaker values.
-
-   ```toml
-   sandbox_mode = "workspace-write"
-   approval_policy = "on-request"
-   approvals_reviewer = "user"
-
-   [sandbox_workspace_write]
-   network_access = false
-   writable_roots = ["/home/codex"]
-   ```
-
-   Model, reasoning, and other personal settings also belong in this file; see
-   the official [Codex configuration guide](https://learn.chatgpt.com/docs/config-file/config-basic).
-
-6. Register a Git project and start Codex. On the first run, sign in with
-   ChatGPT or an API key. For device-code login, first enable it in the
-   ChatGPT account security settings or ask the workspace administrator to
-   allow it, then select device-code login in Codex. See
-   [Codex authentication and tokens](#codex-authentication-and-tokens).
+4. Register a Git checkout and start Codex. Complete the login prompt on the
+   first run; see [authentication](#codex-authentication-and-tokens) if needed.
 
    ```bash
    cd ~/src/my-project
@@ -112,14 +78,116 @@ Codex state in `~/.codex` can be [pushed to another machine and resumed there](d
    run-codex
    ```
 
-7. Exit Codex, return to the `codex-universal` checkout, and run the
-   [host smoke test](#testing-on-the-host).
+5. Optional: after terminal mode works, follow
+   [IntelliJ IDEA integration](#intellij-idea-integration) to add the same
+   registered project as a Dockerized Codex agent in JetBrains AI Chat.
 
-   ```bash
-   ./tests/host-smoke.sh
-   ```
+Continue directly with verification before relying on the installation.
+
+## Verify the installation
+
+First exit Codex and run the host smoke suite from the `codex-universal`
+checkout. This short form skips optional state-synchronization tests but still
+checks the launcher, policy, Bubblewrap, installed tools, and any locally
+available generic or CUDA image:
+
+```bash
+cd /path/to/codex-universal
+CODEX_TEST_SKIP_SYNC=1 ./tests/host-smoke.sh
+```
+
+A successful run ends with `All host smoke tests passed.` See
+[testing on the host](#testing-on-the-host) for the complete suite, image
+selection, CUDA-only checks, and troubleshooting.
+
+Next start a new Codex chat and paste the prompt for that client mode. Terminal
+and IDEA sessions use intentionally different MCP servers and paths:
+
+| Client mode | MCP server | Expected project path |
+| --- | --- | --- |
+| `run-codex` | Container-local `clojure_lsp` | Container path, normally `/workspace/<project>` |
+| `run-codex --idea` | Host IDEA `idea` through a private relay | Exact absolute host checkout path |
+
+Test the modes in separate chats. In either mode, `pwd` is authoritative; do
+not translate paths or move a conversation between the two path forms. The
+official [Codex MCP documentation](https://developers.openai.com/codex/mcp/)
+documents `/mcp` for viewing active servers in the terminal UI, but a
+successful tool call is the definitive connection check.
+
+### Terminal Clojure LSP prompt
+
+Paste this into a terminal-mode Dockerized Codex chat opened on a Clojure
+repository:
+
+```text
+Perform a read-only connection and path test of the container-local Clojure
+LSP MCP server. Do not modify files, use the network, request escalation, or
+invoke formatting, rename, refactoring, edit, build, or test tools.
+
+1. Run `pwd -P` and `git status --short` through the container shell. Record
+   both exact outputs as the baseline. Use this container path, normally below
+   `/workspace`, as the only project root; do not substitute a host path.
+2. Use `rg --files -g '*.clj' -g '*.cljc' -g '*.cljs'` only to select one
+   existing source file and resolve its absolute path below `pwd`. If none
+   exists, report SKIP for the semantic portion.
+3. Use only read-only `mcp__clojure_lsp__*` tools to detect the Clojure server,
+   list symbols in that file with `language_id="clojure"`, request diagnostics,
+   and perform one definition, documentation, or reference query for a symbol
+   the server returned. If initialization is required, call `start_lsp` once
+   with `root_dir` exactly equal to `pwd`; never initialize another root.
+4. Confirm every returned absolute path or `file://` URI remains below the
+   exact container `pwd`. These tools do not take IDEA's `projectPath` and must
+   not introduce a second path.
+5. Run `git status --short` again and compare it byte-for-byte with the
+   baseline.
+
+Report every MCP tool called, its root or file path, what it established, and
+PASS, FAIL, or SKIP. Pass only if `clojure_lsp` returned semantic project data,
+all paths used the container root, no write-capable tool was invoked, and Git
+status was unchanged.
+```
+
+### IntelliJ IDEA MCP prompt
+
+After completing the optional IDEA setup, paste this into a new Dockerized
+Codex ACP chat:
+
+```text
+Perform a read-only connection and path test of the IntelliJ MCP server. Do
+not modify files, use the network, request escalation, or invoke any
+write-capable tool.
+
+1. Run `pwd -P` and `git status --short` through the container shell. Record
+   the exact host-style project path and Git-status output as the baseline.
+2. For all project inspection, use `mcp__idea__` tools instead of `rg`, `grep`,
+   `sed`, `find`, or `cat`: list the project root, read `AGENTS.md` or
+   `README.md`, and search for text observed in that file.
+3. If the project contains a supported source file, resolve one symbol,
+   request its symbol information, and request diagnostics for its file.
+4. Pass the exact path returned by `pwd` as `projectPath` in every IDEA call.
+   Do not translate it to `/workspace/...` or follow a second-path alias.
+5. Run `git status --short` again and compare it byte-for-byte with the
+   baseline.
+
+Report every IDEA MCP tool called, the `projectPath` used, what it established,
+and PASS, FAIL, or SKIP. Pass only if IDEA tools returned project data, every
+path exactly matched `pwd`, no write-capable tool was invoked, and Git status
+was unchanged.
+```
+
+Once the applicable prompt passes, installation is complete. You can then run
+the optional [manual approval-boundary check](#manual-approval-boundary-check),
+configure [Clojure interactive development](docs/clojure-agents.md), enable
+[state synchronization](docs/codex-sync.md), or continue with the detailed
+reference below.
 
 ## Docker images
+
+> **Name and relationship:** OpenAI maintains a separate
+> [`openai/codex-universal`](https://github.com/openai/codex-universal)
+> reference base image for Codex environments. This project was developed
+> independently and is not a fork; it focuses on a non-root runtime,
+> restricted host mounts, and enforced approval boundaries.
 
 The image repository slug defaults to the owner/repository path derived from the GitHub `origin`, currently `leafclick/codex-universal`. The profile name is appended to form two image repositories:
 
@@ -256,10 +324,14 @@ In terminal mode, `run-codex` also enables a container-local `clojure_lsp` MCP
 server by default. It uses `agent-lsp` to keep `clojure-lsp` indexed and expose
 symbol-aware navigation, references, diagnostics, formatting, and refactoring
 tools to Codex. The first semantic tool call starts analysis for the current
-project; in the Codex TUI, use `/mcp` to inspect the connection. For example,
-ask Codex to “use the Clojure LSP tools to find every reference to
-`my.app/foo` and check diagnostics before editing” rather than asking for a
+project; in the Codex TUI, use `/mcp` to inspect the connection, as described
+in the official [Codex MCP documentation](https://developers.openai.com/codex/mcp/).
+For example, ask Codex to “use the Clojure LSP tools to find every reference
+to `my.app/foo` and check diagnostics before editing” rather than asking for a
 text search.
+
+Use the copyable [terminal Clojure LSP prompt](#terminal-clojure-lsp-prompt)
+after installation to verify the local server and its container paths.
 
 The terminal bridge runs in a nested networkless Bubblewrap sandbox. It can
 update the working tree and its caches, but `.git` and `.codex` remain
@@ -764,7 +836,7 @@ Setup:
 
 1. Install `jq`, `socat`, and the current `run-codex` and
    `setup-codex-idea` commands as described in
-   [Installation overview](#installation-overview). Images built from the
+   [Install](#install). Images built from the
    current Dockerfiles already contain `codex-acp` and the container side of
    the relay. Rebuild if the local image predates this integration.
 
@@ -802,53 +874,13 @@ Setup:
    rejects `never` and full-access modes.
 
 7. In the new IDEA chat, use the
-   [Codex-side MCP smoke test](#codex-side-idea-mcp-smoke-test). If the client
+   [IntelliJ IDEA MCP prompt](#intellij-idea-mcp-prompt). If the client
    exposes MCP connection status, confirm that `idea` is connected first, but
    treat successful tool calls as the authoritative check. Neither the test's
    shell reads nor its IDEA calls should request approval. Perform the
    [manual approval-boundary check](#manual-approval-boundary-check) as a
    separate test if you also want to verify `.git` and network behavior through
    ACP.
-
-### Codex-side IDEA MCP smoke test
-
-Paste this prompt into the **Dockerized Codex** chat. It is deliberately
-read-only and verifies both path identity and actual MCP tool use rather than
-merely checking a client status display. Start a new chat after changing the
-target project's `AGENTS.md`, because project instructions are loaded when the
-Codex session starts.
-
-```text
-Perform a read-only IntelliJ MCP smoke test. Do not modify files, use the
-network, request escalation, or invoke any write-capable tool.
-
-1. State the active repository instruction that governs semantic navigation
-   versus text search. If no such instruction was loaded, report that but
-   continue the connection test.
-2. Through the container shell, run `pwd` and `git status --short`. Record the
-   exact project path and the exact Git-status output as the baseline.
-3. For the rest of the inspection, use `mcp__idea__` tools instead of `rg`,
-   `grep`, `sed`, `find`, or `cat`:
-   - list the project root;
-   - read `AGENTS.md`, or `README.md` if `AGENTS.md` is absent;
-   - search for a filename and for text observed in that file;
-   - when the project contains a supported source file, resolve one symbol,
-     request its symbol information, and request diagnostics for its file.
-4. Pass the exact path returned by `pwd` as `projectPath` in every IDEA call.
-   Do not translate it to `/workspace/...` or follow a second-path alias.
-5. If IDEA exposes shell execution, file mutation, run-configuration,
-   debugger, database, or settings-management tools, do not invoke them;
-   report `SECURITY FAILURE` and list their names. An unsupported semantic
-   operation is not a connection failure and must not be reported as proof
-   that a symbol has no references or callers.
-6. Run `git status --short` again through the container shell and compare it
-   byte-for-byte with the baseline.
-
-Report each MCP tool called, the `projectPath` used, what it established, and
-PASS or FAIL. The test passes only if IDEA calls returned project data, every
-path exactly matched `pwd`, no unsafe IDEA capability was exposed, and Git
-status was unchanged.
-```
 
 The command preserves other agents and settings in the file, and records the
 absolute path of the installed `run-codex`. The resulting entry is equivalent
