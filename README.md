@@ -86,7 +86,20 @@ Continue directly with verification before relying on the installation.
 
 ## Verify the installation
 
-First exit Codex and run the host smoke suite from the `codex-universal`
+First run the environment doctor for the registered project:
+
+```bash
+run-codex --doctor my-project
+```
+
+The doctor is local-only and does not pull or build images, access the network,
+invoke `sudo`, mount the project into its diagnostic container, or modify
+persistent Codex state. It reports the registered project and profile, local
+image identity, host UID/GID match, sandbox operation, installed tool versions,
+and the Clojure LSP MCP initialize handshake. A CUDA project additionally
+checks GPU access. Optional integrations are reported as warnings or skips.
+
+Then exit Codex and run the host smoke suite from the `codex-universal`
 checkout. This short form skips optional state-synchronization tests but still
 checks the launcher, policy, Bubblewrap, installed tools, and any locally
 available generic or CUDA image:
@@ -711,6 +724,28 @@ my-project            cuda       OK         /home/leafclick/src/my-project
 website              generic    OK         /home/leafclick/src/website
 ```
 
+## Diagnose a project environment
+
+From inside a registered project:
+
+```bash
+run-codex --doctor
+```
+
+Or name it explicitly:
+
+```bash
+run-codex --doctor my-project
+```
+
+The command exits successfully only when the required host commands, Docker
+daemon, registered project, selected image, image UID/GID, managed policy,
+AppArmor/seccomp/Bubblewrap sandbox, and image runtime checks pass. When the
+terminal Clojure MCP integration is enabled, the runtime check performs a real
+MCP initialize handshake. It uses a disposable networkless container with no
+host mounts; it never pulls, builds, installs, or changes the registered
+checkout or live `~/.codex` state.
+
 ## Change a project's profile
 
 Enable CUDA:
@@ -945,9 +980,9 @@ my-project` again to replace an older entry, then start a new chat. JetBrains
 documents both flags in its
 [ACP configuration reference](https://www.jetbrains.com/help/ai-assistant/acp.html).
 
-The defaults match IDEA 2026.2.2's Streamable HTTP endpoint. If IDEA displays
-a different loopback port or Streamable HTTP path, ensure those environment
-variables are visible to the IDEA process that launches the custom agent:
+The defaults use IDEA's Streamable HTTP endpoint. If IDEA displays a different
+loopback port or Streamable HTTP path, ensure those environment variables are
+visible to the IDEA process that launches the custom agent:
 
 ```bash
 CODEX_IDEA_MCP_PORT=64342

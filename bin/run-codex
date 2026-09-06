@@ -43,6 +43,7 @@ Usage:
   run-codex --init [--profile generic|cuda] [PROJECT [PATH]]
   run-codex --rebind PROJECT [PATH]
   run-codex --set-profile PROJECT generic|cuda
+  run-codex --doctor [PROJECT]
   run-codex --list
 
 Examples:
@@ -53,6 +54,7 @@ Examples:
   run-codex cortex
   run-codex cortex --new
   run-codex --idea cortex
+  run-codex --doctor cortex
   run-codex --set-profile cortex generic
 
 Environment:
@@ -425,8 +427,6 @@ resolve_project() {
     local requested_name="${1:-}"
     local file root current_root name
 
-    mkdir -p "$PROJECTS_DIR"
-
     if [[ -n "$requested_name" ]]; then
         validate_project_name "$requested_name"
         file="$PROJECTS_DIR/$requested_name"
@@ -494,8 +494,307 @@ resolve_project() {
     RESOLVED_PROFILE="$CONFIG_PROFILE"
 }
 
+run_sandbox_probe() {
+    local image="$1"
+
+    # Exercise the actual host kernel, Docker seccomp policy, AppArmor
+    # transition, image Bubblewrap binary, and non-root identity together. The
+    # probe has no network, writable root filesystem, or host mounts.
+    docker run --rm --pull=never \
+        --network none \
+        --read-only \
+        --cap-drop=ALL \
+        --security-opt=no-new-privileges \
+        --security-opt "apparmor=$APPARMOR_PROFILE" \
+        --security-opt "seccomp=$SECCOMP_PROFILE" \
+        --user "$(id -u):$(id -g)" \
+        --entrypoint /bin/sh \
+        "$image" \
+        -c 'exec /usr/bin/bwrap "$@"' \
+        codex-sandbox-probe \
+        --unshare-user \
+        --unshare-ipc \
+        --unshare-pid \
+        --unshare-net \
+        --unshare-uts \
+        --unshare-cgroup-try \
+        --die-with-parent \
+        --new-session \
+        --ro-bind / / \
+        --dev /dev \
+        --tmpfs /proc \
+        --tmpfs /tmp \
+        /bin/true
+}
+
+DOCTOR_FAILURES=0
+DOCTOR_WARNINGS=0
+
+doctor_pass() {
+    printf 'PASS  %s\n' "$*"
+}
+
+doctor_warn() {
+    printf 'WARN  %s\n' "$*"
+    ((DOCTOR_WARNINGS += 1))
+}
+
+doctor_fail() {
+    printf 'FAIL  %s\n' "$*"
+    ((DOCTOR_FAILURES += 1))
+}
+
+doctor_skip() {
+    printf 'SKIP  %s\n' "$*"
+}
+
+doctor_note() {
+    printf '      %s\n' "$*"
+}
+
+doctor_runtime_probe() {
+    local image="$1"
+    local profile="$2"
+    local docker_args=(
+        run
+        --rm
+        --pull=never
+        --network none
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+        --security-opt "apparmor=$APPARMOR_PROFILE"
+        --security-opt "seccomp=$SECCOMP_PROFILE"
+        --user "$(id -u):$(id -g)"
+        --entrypoint /bin/bash
+    )
+
+    if [[ "$profile" == cuda ]]; then
+        docker_args+=(--gpus all)
+    fi
+
+    docker_args+=("$image")
+
+    # This container gets an ephemeral writable layer because agent-lsp may
+    # initialize caches during its MCP handshake. It has no host mounts and is
+    # removed on exit, so the project and persistent Codex state stay untouched.
+    docker "${docker_args[@]}" -c '
+        set -Eeuo pipefail
+
+        (( $(id -u) > 0 ))
+        (( $(id -g) > 0 ))
+        test -r /etc/codex/requirements.toml
+        grep -Fxq '\''allowed_approval_policies = ["on-request"]'\'' \
+            /etc/codex/requirements.toml
+        grep -Fxq '\''allowed_approvals_reviewers = ["user"]'\'' \
+            /etc/codex/requirements.toml
+        grep -Fxq '\''allowed_sandbox_modes = ["read-only", "workspace-write"]'\'' \
+            /etc/codex/requirements.toml
+        command -v codex-acp >/dev/null
+        command -v codex-acp-entrypoint >/dev/null
+
+        printf '\''codex: '\''
+        codex --version
+        printf '\''agent-lsp: '\''
+        agent-lsp --version
+        printf '\''bb: '\''
+        bb --version
+        printf '\''cljfmt: '\''
+        cljfmt --version
+        printf '\''clj-kondo: '\''
+        clj-kondo --version
+        printf '\''clojure-lsp: '\''
+        clojure-lsp --version
+
+        if [[ "$1" == cuda ]]; then
+            command -v nvcc >/dev/null
+            command -v nvidia-smi >/dev/null
+            nvidia-smi >/dev/null
+        fi
+    ' run-codex-doctor "$profile"
+}
+
+doctor_mcp_probe() {
+    local image="$1"
+
+    # Keep this separate from the tool/policy probe so a failed MCP handshake
+    # has a precise diagnosis. Like the runtime probe, it has no host mounts.
+    docker run --rm --pull=never \
+        --network none \
+        --cap-drop=ALL \
+        --security-opt=no-new-privileges \
+        --security-opt "apparmor=$APPARMOR_PROFILE" \
+        --security-opt "seccomp=$SECCOMP_PROFILE" \
+        --user "$(id -u):$(id -g)" \
+        --entrypoint /bin/bash \
+        "$image" -c '
+            set -Eeuo pipefail
+
+            coproc MCP_BRIDGE {
+                exec codex-clojure-lsp-mcp clojure:clojure-lsp
+            }
+            mcp_pid="$MCP_BRIDGE_PID"
+            mcp_input_fd="${MCP_BRIDGE[1]}"
+            mcp_output_fd="${MCP_BRIDGE[0]}"
+            mcp_ready=0
+
+            printf '\''%s\n'\'' \
+                '\''{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"run-codex-doctor","version":"1"}}}'\'' \
+                >&"$mcp_input_fd"
+
+            for _ in {1..10}; do
+                if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
+                   jq -e \
+                       '\''.id == 1 and .result.serverInfo.name == "agent-lsp"'\'' \
+                       <<<"$mcp_line" >/dev/null 2>&1; then
+                    mcp_ready=1
+                    break
+                fi
+            done
+
+            kill "$mcp_pid" 2>/dev/null || true
+            wait "$mcp_pid" 2>/dev/null || true
+            ((mcp_ready == 1))
+        '
+}
+
+run_doctor() {
+    local requested_project="${1:-}"
+    local missing=()
+    local command
+
+    echo "Codex environment doctor"
+    echo
+
+    for command in git realpath docker flock; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            missing+=("$command")
+        fi
+    done
+
+    if ((${#missing[@]})); then
+        doctor_fail "Missing required host commands: ${missing[*]}"
+        doctor_note "Install the listed commands, then rerun the doctor."
+        echo
+        printf 'Diagnostics failed: %d failure(s), %d warning(s).\n' \
+            "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
+        return 1
+    fi
+    doctor_pass "Required host commands are available"
+
+    if ! docker info >/dev/null 2>&1; then
+        doctor_fail "Docker daemon is not available"
+        doctor_note "Start Docker Engine and confirm this user can run 'docker info'."
+        echo
+        printf 'Diagnostics failed: %d failure(s), %d warning(s).\n' \
+            "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
+        return 1
+    fi
+    doctor_pass "Docker daemon is available"
+
+    resolve_project "$requested_project"
+    PROJECT="$RESOLVED_NAME"
+    PROJECT_PATH="$RESOLVED_PATH"
+    PROFILE="$RESOLVED_PROFILE"
+    IMAGE="$(profile_image "$PROFILE")"
+    doctor_pass "Project '$PROJECT' resolves to $PROJECT_PATH ($PROFILE)"
+
+    if [[ ! "$APPARMOR_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        doctor_fail "Invalid CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE"
+    elif [[ ! -f "$SECCOMP_PROFILE" || ! -r "$SECCOMP_PROFILE" ]]; then
+        doctor_fail "Host sandbox policy is not readable: $SECCOMP_PROFILE"
+        doctor_note "Run bin/setup-codex-host-security from the codex-universal checkout."
+    else
+        SECCOMP_PROFILE="$(realpath -e -- "$SECCOMP_PROFILE")"
+        doctor_pass "Host sandbox policy is readable"
+    fi
+
+    if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+        doctor_fail "Required local image is unavailable: $IMAGE"
+        doctor_note "Build it with './docker-build.sh $PROFILE' or select an existing CODEX_IMAGE_TAG."
+    else
+        local image_id image_user image_version image_revision
+        image_id="$(docker image inspect --format '{{.Id}}' "$IMAGE")"
+        image_user="$(docker image inspect --format '{{.Config.User}}' "$IMAGE")"
+        image_version="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE")"
+        image_revision="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")"
+
+        doctor_pass "Local image is available: $IMAGE"
+        printf '      image id: %s\n' "${image_id:-unknown}"
+        printf '      version:  %s\n' "${image_version:-unknown}"
+        printf '      revision: %s\n' "${image_revision:-unknown}"
+
+        if [[ "$image_user" == "$(id -u):$(id -g)" ]]; then
+            doctor_pass "Image user matches host UID/GID ($image_user)"
+        else
+            doctor_fail "Image user '$image_user' does not match host UID/GID $(id -u):$(id -g)"
+            doctor_note "Rebuild the image as the non-root user who runs Codex."
+        fi
+
+        if ((DOCTOR_FAILURES == 0)); then
+            local probe_output=""
+            if probe_output="$(run_sandbox_probe "$IMAGE" 2>&1)"; then
+                doctor_pass "AppArmor, seccomp, and Bubblewrap sandbox probe"
+            else
+                doctor_fail "AppArmor, seccomp, or Bubblewrap sandbox probe failed"
+                [[ -z "$probe_output" ]] || printf '      %s\n' "$probe_output"
+                doctor_note "Reinstall the host policy, then rerun the doctor."
+            fi
+
+            local runtime_output=""
+            if runtime_output="$(doctor_runtime_probe "$IMAGE" "$PROFILE" 2>&1)"; then
+                doctor_pass "Image tools and managed Codex policy"
+                while IFS= read -r line; do
+                    [[ -z "$line" ]] || printf '      %s\n' "$line"
+                done <<<"$runtime_output"
+            else
+                doctor_fail "Image tools, managed Codex policy, or CUDA runtime probe failed"
+                [[ -z "$runtime_output" ]] || printf '      %s\n' "$runtime_output"
+                doctor_note "Rebuild or replace the selected image, then rerun the doctor."
+            fi
+
+            if [[ "$CLOJURE_LSP_MCP" == 1 ]]; then
+                local mcp_output=""
+                if mcp_output="$(doctor_mcp_probe "$IMAGE" 2>&1)"; then
+                    doctor_pass "Clojure LSP MCP initialize handshake"
+                else
+                    doctor_fail "Clojure LSP MCP initialize handshake failed"
+                    [[ -z "$mcp_output" ]] || printf '      %s\n' "$mcp_output"
+                    doctor_note "Rebuild or replace the selected image, then rerun the doctor."
+                fi
+            else
+                doctor_skip "Clojure LSP MCP handshake (disabled by CODEX_CLOJURE_LSP_MCP=0)"
+            fi
+        else
+            doctor_skip "Runtime probes because an earlier required check failed"
+        fi
+    fi
+
+    local optional_missing=()
+    for command in jq socat; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            optional_missing+=("$command")
+        fi
+    done
+    if ((${#optional_missing[@]})); then
+        doctor_warn "Optional IntelliJ host commands missing: ${optional_missing[*]}"
+        doctor_note "Install both jq and socat before using IDEA integration."
+    else
+        doctor_pass "Optional IntelliJ host commands are available"
+    fi
+
+    echo
+    if ((DOCTOR_FAILURES)); then
+        printf 'Diagnostics failed: %d failure(s), %d warning(s).\n' \
+            "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
+        return 1
+    fi
+
+    printf 'Diagnostics passed with %d warning(s).\n' "$DOCTOR_WARNINGS"
+}
+
 NEW_SESSION=false
 IDEA_MODE=false
+DOCTOR_MODE=false
 PROJECT=""
 
 case "${1:-}" in
@@ -527,6 +826,12 @@ case "${1:-}" in
         set_profile "$1" "$2"
         exit 0
         ;;
+    --doctor)
+        DOCTOR_MODE=true
+        shift
+        (($# <= 1)) || die "Usage: run-codex --doctor [PROJECT]"
+        PROJECT="${1:-}"
+        ;;
     --new)
         NEW_SESSION=true
         shift
@@ -553,6 +858,11 @@ case "${1:-}" in
         fi
         ;;
 esac
+
+if $DOCTOR_MODE; then
+    run_doctor "$PROJECT"
+    exit $?
+fi
 
 if $IDEA_MODE; then
     need jq
@@ -621,37 +931,7 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
     exit 1
 }
 
-# Verify the actual host kernel, Docker seccomp policy, AppArmor transition,
-# image Bubblewrap binary, and non-root identity together. Without this probe,
-# Codex would fall back to asking for every command outside its unavailable
-# sandbox. The probe has no network, writable root filesystem, or host mounts.
-if ! sandbox_probe_output="$(
-    docker run --rm --pull=never \
-        --network none \
-        --read-only \
-        --cap-drop=ALL \
-        --security-opt=no-new-privileges \
-        --security-opt "apparmor=$APPARMOR_PROFILE" \
-        --security-opt "seccomp=$SECCOMP_PROFILE" \
-        --user "$(id -u):$(id -g)" \
-        --entrypoint /bin/sh \
-        "$IMAGE" \
-        -c 'exec /usr/bin/bwrap "$@"' \
-        codex-sandbox-probe \
-        --unshare-user \
-        --unshare-ipc \
-        --unshare-pid \
-        --unshare-net \
-        --unshare-uts \
-        --unshare-cgroup-try \
-        --die-with-parent \
-        --new-session \
-        --ro-bind / / \
-        --dev /dev \
-        --tmpfs /proc \
-        --tmpfs /tmp \
-        /bin/true 2>&1
-)"; then
+if ! sandbox_probe_output="$(run_sandbox_probe "$IMAGE" 2>&1)"; then
     [[ -z "$sandbox_probe_output" ]] || printf '%s\n' "$sandbox_probe_output" >&2
     echo "ERROR: Bubblewrap cannot start with the installed host sandbox policy." >&2
     echo "Re-run bin/setup-codex-host-security from the codex-universal checkout." >&2

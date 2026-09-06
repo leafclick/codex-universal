@@ -225,7 +225,17 @@ printf '%s\n' \
     'set -Eeuo pipefail' \
     'case "${1:-}" in' \
     '    info|ps) exit 0 ;;' \
-    '    image) exit 0 ;;' \
+    '    image)' \
+    '        if [[ "${2:-}" == inspect && "${3:-}" == --format ]]; then' \
+    '            case "${4:-}" in' \
+    '                "{{.Id}}") printf "%s\\n" sha256:doctor-image ;;' \
+    '                "{{.Config.User}}") printf "%s:%s\\n" "$(id -u)" "$(id -g)" ;;' \
+    '                *org.opencontainers.image.version*) printf "%s\\n" test-version ;;' \
+    '                *org.opencontainers.image.revision*) printf "%s\\n" 0123456789abcdef ;;' \
+    '            esac' \
+    '        fi' \
+    '        exit 0' \
+    '        ;;' \
     '    run|build) printf "%s\\n" "$*" ;;' \
     '    *) exit 0 ;;' \
     'esac' \
@@ -268,6 +278,60 @@ list_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --list)"
 assert_contains "$list_output" "smoke-project"
 assert_contains "$list_output" "generic"
 assert_contains "$list_output" "OK"
+
+mkdir -p "$TEST_ROOT/doctor-missing-bin"
+ln -s "$(type -P bash)" "$TEST_ROOT/doctor-missing-bin/bash"
+if env \
+    "HOME=$TEST_ROOT/doctor-missing-home" \
+    "XDG_CONFIG_HOME=$TEST_ROOT/doctor-missing-config" \
+    "PATH=$TEST_ROOT/doctor-missing-bin" \
+    "$ROOT/bin/run-codex" --doctor smoke-project \
+    >"$TEST_ROOT/doctor-missing.out" 2>&1; then
+    fail "doctor accepted missing required host commands"
+fi
+doctor_missing_output="$(<"$TEST_ROOT/doctor-missing.out")"
+assert_contains "$doctor_missing_output" \
+    "FAIL  Missing required host commands: git realpath docker flock"
+[[ ! -e "$TEST_ROOT/doctor-missing-config/run-codex" ]] ||
+    fail "doctor created project configuration while reporting missing commands"
+
+doctor_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --doctor smoke-project)"
+assert_contains "$doctor_output" "PASS  Required host commands are available"
+assert_contains "$doctor_output" "PASS  Docker daemon is available"
+assert_contains "$doctor_output" "PASS  Project 'smoke-project' resolves to $TEST_ROOT/repo (generic)"
+assert_contains "$doctor_output" "PASS  Host sandbox policy is readable"
+assert_contains "$doctor_output" "PASS  Local image is available: example/codex-universal-generic:test-version"
+assert_contains "$doctor_output" "image id: sha256:doctor-image"
+assert_contains "$doctor_output" "version:  test-version"
+assert_contains "$doctor_output" "revision: 0123456789abcdef"
+assert_contains "$doctor_output" "PASS  Image user matches host UID/GID ($(id -u):$(id -g))"
+assert_contains "$doctor_output" "PASS  AppArmor, seccomp, and Bubblewrap sandbox probe"
+assert_contains "$doctor_output" "PASS  Image tools and managed Codex policy"
+assert_contains "$doctor_output" "PASS  Clojure LSP MCP initialize handshake"
+assert_contains "$doctor_output" "Diagnostics passed with 0 warning(s)."
+assert_contains "$doctor_output" "--network none"
+assert_contains "$doctor_output" "--cap-drop=ALL"
+assert_not_contains "$doctor_output" "$TEST_ROOT/repo:"
+
+doctor_no_mcp_output="$(
+    "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=0 \
+        "$ROOT/bin/run-codex" --doctor smoke-project
+)"
+assert_contains "$doctor_no_mcp_output" \
+    "SKIP  Clojure LSP MCP handshake (disabled by CODEX_CLOJURE_LSP_MCP=0)"
+
+if "${launcher_env[@]}" \
+    CODEX_SECCOMP_PROFILE="$TEST_ROOT/missing-seccomp.json" \
+    "$ROOT/bin/run-codex" --doctor smoke-project \
+    >"$TEST_ROOT/doctor-failure.out" 2>&1; then
+    fail "doctor accepted a missing host sandbox policy"
+fi
+doctor_failure_output="$(<"$TEST_ROOT/doctor-failure.out")"
+assert_contains "$doctor_failure_output" \
+    "FAIL  Host sandbox policy is not readable: $TEST_ROOT/missing-seccomp.json"
+assert_contains "$doctor_failure_output" \
+    "SKIP  Runtime probes because an earlier required check failed"
+assert_contains "$doctor_failure_output" "Diagnostics failed: 1 failure(s)"
 
 new_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new)"
 resume_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project)"

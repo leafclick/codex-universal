@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes target the current `master` branch and the latest `0.1.x`
+Security fixes target the current `master` branch and the latest tagged
 release. Older pre-1.0 releases are not supported.
 
 ## Reporting a vulnerability
