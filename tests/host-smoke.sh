@@ -236,7 +236,12 @@ printf '%s\n' \
     '        fi' \
     '        exit 0' \
     '        ;;' \
-    '    run|build) printf "%s\\n" "$*" ;;' \
+    '    run|build)' \
+    '        printf "%s\\n" "$*"' \
+    '        if [[ -n "${CODEX_TEST_DOCKER_ARGV_LOG:-}" ]]; then' \
+    '            printf "%q\\n" "$@" > "$CODEX_TEST_DOCKER_ARGV_LOG"' \
+    '        fi' \
+    '        ;;' \
     '    *) exit 0 ;;' \
     'esac' \
     > "$TEST_ROOT/fake-bin/docker"
@@ -248,6 +253,7 @@ printf '%s\n' \
 chmod 755 "$TEST_ROOT/fake-bin/socat"
 git -C "$TEST_ROOT/repo" init -q
 printf '%s\n' '{:paths ["src"]}' > "$TEST_ROOT/repo/deps.edn"
+printf '%s\n' 'not-a-real-png' > "$TEST_ROOT/repo/prompt-image.png"
 
 launcher_env=(
     env
@@ -261,6 +267,12 @@ launcher_env=(
     "CODEX_SECCOMP_PROFILE=$ROOT/security/seccomp/codex-bwrap.json"
     "PATH=$TEST_ROOT/fake-bin:$PATH"
 )
+
+launcher_help="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --help)"
+assert_contains "$launcher_help" \
+    "Codex options (terminal mode, repeat --codex-option as needed):"
+assert_contains "$launcher_help" "reasoning=minimal|low|medium|high|xhigh"
+assert_contains "$launcher_help" "image=PROJECT_PATH"
 
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     --init --profile generic smoke-project "$TEST_ROOT/repo" >/dev/null
@@ -366,6 +378,90 @@ for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "example/codex-universal-generic:test-version"
 done
 assert_contains "$resume_output" "resume --last"
+
+forwarded_argv_log="$TEST_ROOT/forwarded-docker-argv.log"
+forwarded_new_output="$(
+    "${launcher_env[@]}" \
+        "CODEX_TEST_DOCKER_ARGV_LOG=$forwarded_argv_log" \
+        "$ROOT/bin/run-codex" smoke-project --new \
+        --codex-option model=gpt-5.6-sol \
+        --codex-option reasoning=high \
+        --codex-option search \
+        --codex-option no-alt-screen \
+        --codex-option strict-config \
+        --codex-option image=prompt-image.png \
+        --codex-option 'prompt=review this project'
+)"
+assert_contains "$forwarded_new_output" "--model gpt-5.6-sol"
+assert_contains "$forwarded_new_output" 'model_reasoning_effort="high"'
+assert_contains "$forwarded_new_output" "--search"
+assert_contains "$forwarded_new_output" "--no-alt-screen"
+assert_contains "$forwarded_new_output" "--strict-config"
+assert_contains "$forwarded_new_output" "--image /workspace/smoke-project/prompt-image.png"
+assert_contains "$forwarded_new_output" "-- review this project"
+assert_not_contains "$forwarded_new_output" "resume --last"
+grep -Fxq -- '--model' "$forwarded_argv_log" ||
+    fail "forwarded model flag is not a distinct Docker argument"
+grep -Fxq -- 'gpt-5.6-sol' "$forwarded_argv_log" ||
+    fail "forwarded model value is not a distinct Docker argument"
+grep -Fxq -- 'model_reasoning_effort=\"high\"' "$forwarded_argv_log" ||
+    fail "forwarded reasoning setting changed argument boundaries"
+grep -Fxq -- '/workspace/smoke-project/prompt-image.png' "$forwarded_argv_log" ||
+    fail "forwarded image path is not container-relative"
+grep -Fxq -- '--' "$forwarded_argv_log" ||
+    fail "forwarded prompt is not separated from Codex options"
+grep -Fxq -- 'review\ this\ project' "$forwarded_argv_log" ||
+    fail "forwarded prompt was split into multiple arguments"
+if grep -Fxq -- 'review' "$forwarded_argv_log" ||
+   grep -Fxq -- 'this' "$forwarded_argv_log" ||
+   grep -Fxq -- 'project' "$forwarded_argv_log"; then
+    fail "forwarded prompt words leaked into separate arguments"
+fi
+
+forwarded_resume_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+        --codex-option model=gpt-5.6-sol smoke-project
+)"
+assert_contains "$forwarded_resume_output" "resume --last --model gpt-5.6-sol"
+
+for unsafe_codex_option in \
+    '' \
+    'sandbox=danger-full-access' \
+    'config=approval_policy="never"' \
+    'profile=unsafe' \
+    'add-dir=/tmp' \
+    'approve-for-me' \
+    'dangerously-bypass-approvals-and-sandbox' \
+    'remote=ws://example.invalid' \
+    'enable=unknown' \
+    'oss' \
+    'local-provider=ollama'; do
+    if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --codex-option "$unsafe_codex_option" \
+        >"$TEST_ROOT/unsafe-codex-option.out" 2>&1; then
+        fail "launcher accepted unsafe Codex option '$unsafe_codex_option'"
+    fi
+done
+assert_contains "$(<"$TEST_ROOT/unsafe-codex-option.out")" \
+    "Unsupported Codex option 'local-provider=ollama'"
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --codex-option model=gpt-5.6-sol \
+    --codex-option model=gpt-5.6-sol \
+    >"$TEST_ROOT/duplicate-codex-option.out" 2>&1; then
+    fail "launcher accepted a duplicate scalar Codex option"
+fi
+assert_contains "$(<"$TEST_ROOT/duplicate-codex-option.out")" \
+    "Codex option 'model' may be specified only once"
+
+printf '%s\n' 'outside' > "$TEST_ROOT/outside-image.png"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --codex-option "image=$TEST_ROOT/outside-image.png" \
+    >"$TEST_ROOT/outside-image.out" 2>&1; then
+    fail "launcher accepted an image outside the registered project"
+fi
+assert_contains "$(<"$TEST_ROOT/outside-image.out")" \
+    "Codex image must resolve inside the registered project"
 
 idea_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --idea smoke-project)"
 assert_contains "$idea_output" "--entrypoint codex-acp-entrypoint"

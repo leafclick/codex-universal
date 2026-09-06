@@ -69,13 +69,14 @@ step fails or needs customization.
    install -m 700 bin/codex-push bin/codex-pull ~/.local/bin/
    ```
 
-4. Register a Git checkout and start Codex. Complete the login prompt on the
-   first run; see [authentication](#codex-authentication-and-tokens) if needed.
+4. Register a Git checkout and start Codex. On a machine without existing Codex
+   state, follow [First login on a new installation](#first-login-on-a-new-installation)
+   to enable device authorization and persist the resulting credentials.
 
    ```bash
    cd ~/src/my-project
    run-codex --init
-   run-codex
+   run-codex --new
    ```
 
 5. Optional: after terminal mode works, follow
@@ -854,28 +855,88 @@ or:
 run-codex my-project --new
 ```
 
-## Codex authentication and tokens
+### Per-session Codex options
 
-The images contain Codex but no OpenAI credentials. On the first terminal run,
-follow the Codex login prompt:
+Terminal mode accepts a deliberately small set of Codex options through a
+repeatable launcher option:
 
 ```bash
-run-codex my-project
+run-codex my-project --new \
+  --codex-option model=gpt-5.6-sol \
+  --codex-option reasoning=high \
+  --codex-option no-alt-screen
 ```
 
-Codex supports signing in with a ChatGPT account for subscription access or
-with an OpenAI API key for usage-based API billing. Device-code login and
-enterprise Codex access tokens are also documented in the official
-[Codex authentication guide](https://learn.chatgpt.com/docs/auth). Use that
-guide for the current login commands, account requirements, and token-rotation
-advice.
+Zero `--codex-option` occurrences keeps the normal defaults. Supported values
+are:
 
-Device-code login must be enabled in the ChatGPT account's security settings
-for a personal account, or in the ChatGPT workspace permissions by an
-administrator. Once enabled, select **Sign in with device code** in Codex's
-interactive login and complete the one-time code in a browser. API keys and
-enterprise access tokens should likewise be passed through the documented
-Codex login flow; they do not belong in `config.toml`.
+| Value | Effect |
+| --- | --- |
+| `model=MODEL` | Select a model for this session. |
+| `reasoning=minimal\|low\|medium\|high\|xhigh` | Select a supported reasoning effort. |
+| `search` | Enable Codex live web search for this session. |
+| `no-alt-screen` | Keep terminal output in the normal scrollback buffer. |
+| `strict-config` | Fail if Codex encounters an unknown configuration key. |
+| `image=PATH` | Attach a readable file that resolves inside the registered project; repeat for multiple images. |
+| `prompt=TEXT` | Send one initial prompt, including when resuming the last session. |
+
+For example:
+
+```bash
+run-codex my-project \
+  --codex-option image=design/screenshot.png \
+  --codex-option 'prompt=compare the implementation with this screenshot'
+```
+
+The launcher translates these values directly into individual Codex arguments;
+it never evaluates or shell-splits their contents. Empty, duplicate scalar, and
+unknown values are rejected. In particular, this interface does not expose raw
+configuration, provider, profile, feature, remote-server, working-directory,
+writable-root, sandbox, or approval arguments. Project image paths are resolved
+before launch and cannot escape the mounted checkout. `search` is an explicit
+per-session opt-in to Codex's hosted live-search tool; it does not enable network
+access for commands inside the container sandbox.
+
+## Codex authentication and tokens
+
+### First login on a new installation
+
+The images contain Codex but no OpenAI credentials, and no pre-existing
+`~/.codex` directory is required. For a new installation, register a checkout
+and explicitly start a new terminal session:
+
+```bash
+cd /path/to/my-project
+run-codex --init my-project
+run-codex my-project --new
+```
+
+Use `--new` for this first launch because there is no earlier session to resume.
+The launcher creates host `~/.codex` with restrictive permissions, mounts it at
+the container user's home with the invoking user's numeric UID/GID, and then
+starts Codex's interactive login.
+
+For a headless or container installation, the recommended ChatGPT login path is:
+
+1. Enable device-code login in the personal ChatGPT account's security settings,
+   or have a workspace administrator enable it in ChatGPT workspace permissions.
+2. Select **Sign in with Device Code** in the first-run Codex login screen.
+3. Open the displayed link in a host browser, sign in, and enter the one-time
+   code.
+4. After Codex starts successfully, exit it if desired and configure or start
+   the IDEA integration. Terminal and IDEA modes use the same persisted login.
+
+The one-time device code is only used to authorize the login; it is not the
+credential stored on disk. Codex caches and refreshes the resulting credentials
+under its normal credential-storage rules. In the container's usual file-backed
+case, the cache is the host file `~/.codex/auth.json` through the existing bind
+mount, so later containers do not require another login.
+
+Codex also supports an OpenAI API key for usage-based API billing and enterprise
+Codex access tokens for eligible workspaces. Follow the official
+[Codex authentication guide](https://learn.chatgpt.com/docs/auth) for those
+login commands, account requirements, fallback methods, and token-rotation
+advice.
 
 The login is stored in the host's `~/.codex` state and is therefore available
 to both terminal and IDEA modes. Do not put an API key or access token in
@@ -883,6 +944,14 @@ to both terminal and IDEA modes. Do not put an API key or access token in
 file-backed credential store, treat `~/.codex/auth.json` as a password. The
 state synchronization guide's encryption and access-control requirements also
 apply to that credential file.
+
+JetBrains AI credentials and AI Credits cannot be forwarded to or consumed by
+the Dockerized Codex agent. JetBrains documents ACP agents as independently
+authenticated agents that can run without a JetBrains AI subscription; Codex
+authenticates separately with ChatGPT or an OpenAI API key. Consequently,
+`--codex-option` accepts no credential, provider, or endpoint settings. See the
+JetBrains [ACP subscription and authentication notes](https://www.jetbrains.com/help/ai-assistant/acp.html#subscription-requirements)
+and the official [Codex authentication guide](https://learn.chatgpt.com/docs/auth).
 
 ## IntelliJ IDEA integration
 

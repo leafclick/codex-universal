@@ -67,8 +67,8 @@ CLOJURE_LSP_MCP_ALLOWED_TOOLS='[
 usage() {
     cat <<'USAGE'
 Usage:
-  run-codex [PROJECT] [--new]
-  run-codex --new [PROJECT]
+  run-codex [PROJECT] [--new] [--codex-option OPTION]...
+  run-codex --new [PROJECT] [--codex-option OPTION]...
   run-codex --idea PROJECT
 
   run-codex --init [--profile generic|cuda] [--clojure-mcp auto|on|off] [PROJECT [PATH]]
@@ -78,6 +78,15 @@ Usage:
   run-codex --doctor [PROJECT]
   run-codex --list
 
+Codex options (terminal mode, repeat --codex-option as needed):
+  model=MODEL
+  reasoning=minimal|low|medium|high|xhigh
+  search
+  no-alt-screen
+  strict-config
+  image=PROJECT_PATH
+  prompt=TEXT
+
 Examples:
   cd ~/src/cortex
   run-codex --init --profile cuda
@@ -85,6 +94,8 @@ Examples:
 
   run-codex cortex
   run-codex cortex --new
+  run-codex cortex --new --codex-option model=gpt-5.6-sol --codex-option reasoning=high
+  run-codex cortex --codex-option no-alt-screen
   run-codex --idea cortex
   run-codex --doctor cortex
   run-codex --set-profile cortex generic
@@ -148,6 +159,129 @@ normalize_clojure_mcp_setting() {
         auto|on|off) printf '%s\n' "$1" ;;
         *) return 1 ;;
     esac
+}
+
+CODEX_FORWARD_ARGS=()
+CODEX_IMAGE_REQUESTS=()
+CODEX_INITIAL_PROMPT=""
+CODEX_MODEL_SET=false
+CODEX_REASONING_SET=false
+CODEX_SEARCH_SET=false
+CODEX_NO_ALT_SCREEN_SET=false
+CODEX_STRICT_CONFIG_SET=false
+CODEX_PROMPT_SET=false
+
+add_codex_option() {
+    local option="$1"
+    local value=""
+
+    [[ -n "$option" ]] || die "--codex-option cannot be empty"
+
+    case "$option" in
+        model=*)
+            value="${option#model=}"
+            [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*$ ]] ||
+                die "Invalid Codex model '$value'"
+            ! $CODEX_MODEL_SET || die "Codex option 'model' may be specified only once"
+            CODEX_MODEL_SET=true
+            CODEX_FORWARD_ARGS+=(--model "$value")
+            ;;
+        reasoning=*)
+            value="${option#reasoning=}"
+            case "$value" in
+                minimal|low|medium|high|xhigh) ;;
+                *) die "Invalid Codex reasoning effort '$value'. Supported values: minimal, low, medium, high, xhigh" ;;
+            esac
+            ! $CODEX_REASONING_SET ||
+                die "Codex option 'reasoning' may be specified only once"
+            CODEX_REASONING_SET=true
+            CODEX_FORWARD_ARGS+=(-c "model_reasoning_effort=\"$value\"")
+            ;;
+        search)
+            ! $CODEX_SEARCH_SET || die "Codex option 'search' may be specified only once"
+            CODEX_SEARCH_SET=true
+            CODEX_FORWARD_ARGS+=(--search)
+            ;;
+        no-alt-screen)
+            ! $CODEX_NO_ALT_SCREEN_SET ||
+                die "Codex option 'no-alt-screen' may be specified only once"
+            CODEX_NO_ALT_SCREEN_SET=true
+            CODEX_FORWARD_ARGS+=(--no-alt-screen)
+            ;;
+        strict-config)
+            ! $CODEX_STRICT_CONFIG_SET ||
+                die "Codex option 'strict-config' may be specified only once"
+            CODEX_STRICT_CONFIG_SET=true
+            CODEX_FORWARD_ARGS+=(--strict-config)
+            ;;
+        image=*)
+            value="${option#image=}"
+            [[ -n "$value" ]] || die "Codex option 'image' requires a project file path"
+            CODEX_IMAGE_REQUESTS+=("$value")
+            ;;
+        prompt=*)
+            value="${option#prompt=}"
+            [[ -n "$value" ]] || die "Codex option 'prompt' cannot be empty"
+            ! $CODEX_PROMPT_SET || die "Codex option 'prompt' may be specified only once"
+            CODEX_PROMPT_SET=true
+            CODEX_INITIAL_PROMPT="$value"
+            ;;
+        *)
+            die "Unsupported Codex option '$option'. Supported options: model=MODEL, reasoning=EFFORT, search, no-alt-screen, strict-config, image=PATH, prompt=TEXT"
+            ;;
+    esac
+}
+
+resolve_codex_image_options() {
+    local container_project="$1"
+    local requested candidate host_image relative
+
+    for requested in "${CODEX_IMAGE_REQUESTS[@]}"; do
+        if [[ "$requested" == /* ]]; then
+            candidate="$requested"
+        else
+            candidate="$PROJECT_PATH/$requested"
+        fi
+
+        host_image="$(realpath -e -- "$candidate")" ||
+            die "Codex image file does not exist: $requested"
+        [[ -f "$host_image" && -r "$host_image" ]] ||
+            die "Codex image is not a readable file: $requested"
+        [[ "$host_image" == "$PROJECT_PATH/"* ]] ||
+            die "Codex image must resolve inside the registered project: $requested"
+
+        relative="${host_image#"$PROJECT_PATH/"}"
+        CODEX_FORWARD_ARGS+=(--image "$container_project/$relative")
+    done
+}
+
+parse_launch_args() {
+    while (($#)); do
+        case "$1" in
+            --new)
+                ! $NEW_SESSION || die "--new may be specified only once"
+                NEW_SESSION=true
+                shift
+                ;;
+            --codex-option)
+                (($# >= 2)) || die "--codex-option requires a value"
+                add_codex_option "$2"
+                shift 2
+                ;;
+            --codex-option=*)
+                add_codex_option "${1#--codex-option=}"
+                shift
+                ;;
+            --*)
+                die "Unknown launch option '$1'. Use --codex-option for supported Codex options."
+                ;;
+            *)
+                [[ -z "$PROJECT" ]] || die "Only one project may be specified"
+                PROJECT="$1"
+                shift
+                ;;
+        esac
+    done
 }
 
 profile_image() {
@@ -1031,30 +1165,14 @@ case "${1:-}" in
         (($# <= 1)) || die "Usage: run-codex --doctor [PROJECT]"
         PROJECT="${1:-}"
         ;;
-    --new)
-        NEW_SESSION=true
-        shift
-        (($# <= 1)) || die "Usage: run-codex --new [PROJECT]"
-        PROJECT="${1:-}"
-        ;;
     --idea)
         IDEA_MODE=true
         shift
         (($# == 1)) || die "Usage: run-codex --idea PROJECT"
         PROJECT="$1"
         ;;
-    '')
-        ;;
     *)
-        PROJECT="$1"
-        shift
-        if (($#)); then
-            if [[ "$1" == --new && $# == 1 ]]; then
-                NEW_SESSION=true
-            else
-                die "Usage: run-codex [PROJECT] [--new]"
-            fi
-        fi
+        parse_launch_args "$@"
         ;;
 esac
 
@@ -1087,6 +1205,7 @@ PROJECT_PATH="$RESOLVED_PATH"
 PROFILE="$RESOLVED_PROFILE"
 IMAGE="$(profile_image "$PROFILE")"
 resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
+resolve_codex_image_options "$WORKSPACE_ROOT/$PROJECT"
 
 # Git identity is resolved on the host and exposed as container-local Git
 # configuration. This preserves normal per-repository/global Git identity
@@ -1477,8 +1596,14 @@ fi
 # "codex" to it, so both profiles have the same command-line contract.
 if $IDEA_MODE; then
     docker "${docker_args[@]}"
-elif $NEW_SESSION; then
-    exec docker "${docker_args[@]}" "${codex_args[@]}"
 else
-    exec docker "${docker_args[@]}" "${codex_args[@]}" resume --last
+    session_args=("${codex_args[@]}")
+    if ! $NEW_SESSION; then
+        session_args+=(resume --last)
+    fi
+    session_args+=("${CODEX_FORWARD_ARGS[@]}")
+    if $CODEX_PROMPT_SET; then
+        session_args+=(-- "$CODEX_INITIAL_PROMPT")
+    fi
+    exec docker "${docker_args[@]}" "${session_args[@]}"
 fi
