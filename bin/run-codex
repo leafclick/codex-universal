@@ -13,7 +13,7 @@ IMAGE_TAG="${CODEX_IMAGE_TAG:-latest}"
 DEFAULT_PROFILE="${CODEX_DEFAULT_PROFILE:-generic}"
 APPARMOR_PROFILE="${CODEX_APPARMOR_PROFILE:-codex-universal}"
 SECCOMP_PROFILE="${CODEX_SECCOMP_PROFILE:-$CONFIG_ROOT/security/codex-bwrap.json}"
-CLOJURE_LSP_MCP="${CODEX_CLOJURE_LSP_MCP:-1}"
+CLOJURE_LSP_MCP_OVERRIDE="${CODEX_CLOJURE_LSP_MCP:-}"
 IDEA_MCP="${CODEX_IDEA_MCP:-1}"
 IDEA_MCP_PORT="${CODEX_IDEA_MCP_PORT:-64342}"
 IDEA_MCP_PATH="${CODEX_IDEA_MCP_PATH:-/stream}"
@@ -32,6 +32,37 @@ IDEA_MCP_ALLOWED_TOOLS='[
     "search_symbol",
     "search_text"
 ]'
+CLOJURE_LSP_MCP_ALLOWED_TOOLS='[
+    "start_lsp",
+    "restart_lsp_server",
+    "get_server_capabilities",
+    "open_document",
+    "close_document",
+    "did_change_watched_files",
+    "list_symbols",
+    "find_symbol",
+    "inspect_symbol",
+    "get_symbol_source",
+    "explore_symbol",
+    "go_to_definition",
+    "go_to_implementation",
+    "find_references",
+    "find_callers",
+    "blast_radius",
+    "get_diagnostics",
+    "get_completions",
+    "get_signature_help",
+    "suggest_fixes",
+    "execute_command",
+    "format_document",
+    "prepare_rename",
+    "rename_symbol",
+    "preview_edit",
+    "apply_edit",
+    "safe_apply_edit",
+    "safe_delete_symbol",
+    "replace_symbol_body"
+]'
 
 usage() {
     cat <<'USAGE'
@@ -40,9 +71,10 @@ Usage:
   run-codex --new [PROJECT]
   run-codex --idea PROJECT
 
-  run-codex --init [--profile generic|cuda] [PROJECT [PATH]]
+  run-codex --init [--profile generic|cuda] [--clojure-mcp auto|on|off] [PROJECT [PATH]]
   run-codex --rebind PROJECT [PATH]
   run-codex --set-profile PROJECT generic|cuda
+  run-codex --set-clojure-mcp PROJECT auto|on|off
   run-codex --doctor [PROJECT]
   run-codex --list
 
@@ -56,13 +88,14 @@ Examples:
   run-codex --idea cortex
   run-codex --doctor cortex
   run-codex --set-profile cortex generic
+  run-codex --set-clojure-mcp cortex auto
 
 Environment:
   CODEX_IMAGE_SLUG=leafclick/codex-universal
   CODEX_IMAGE_TAG=latest
   CODEX_APPARMOR_PROFILE=codex-universal
   CODEX_SECCOMP_PROFILE=~/.config/run-codex/security/codex-bwrap.json
-  CODEX_CLOJURE_LSP_MCP=1  Enable the local bridge in terminal mode
+  CODEX_CLOJURE_LSP_MCP=VALUE  Override project setting: auto, on/off, or 1/0
   CODEX_IDEA_MCP=1         Enable the private IntelliJ HTTP relay in IDEA mode
   CODEX_IDEA_MCP_PORT=64342
   CODEX_IDEA_MCP_PATH=/stream
@@ -78,9 +111,9 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
-case "$CLOJURE_LSP_MCP" in
-    0|1) ;;
-    *) die "CODEX_CLOJURE_LSP_MCP must be 0 or 1" ;;
+case "$CLOJURE_LSP_MCP_OVERRIDE" in
+    ''|auto|on|off|0|1) ;;
+    *) die "CODEX_CLOJURE_LSP_MCP must be auto, on, off, 1, or 0" ;;
 esac
 
 case "$IDEA_MCP" in
@@ -98,6 +131,22 @@ validate_profile() {
     case "$1" in
         generic|cuda) ;;
         *) die "Invalid profile '$1'. Supported profiles: generic, cuda" ;;
+    esac
+}
+
+validate_clojure_mcp_setting() {
+    case "$1" in
+        auto|on|off) ;;
+        *) die "Invalid Clojure MCP setting '$1'. Supported values: auto, on, off" ;;
+    esac
+}
+
+normalize_clojure_mcp_setting() {
+    case "$1" in
+        1) printf '%s\n' on ;;
+        0) printf '%s\n' off ;;
+        auto|on|off) printf '%s\n' "$1" ;;
+        *) return 1 ;;
     esac
 }
 
@@ -133,12 +182,14 @@ check_supported_repo() {
 
 CONFIG_PATH=""
 CONFIG_PROFILE=""
+CONFIG_CLOJURE_MCP=""
 
 read_project_config() {
     local file="$1"
     local first=""
     local path=""
     local profile=""
+    local clojure_mcp=""
 
     [[ -f "$file" ]] || return 1
     IFS= read -r first < "$file" || true
@@ -148,6 +199,7 @@ read_project_config() {
     if [[ "$first" != *=* ]]; then
         path="$first"
         profile="generic"
+        clojure_mcp="auto"
     else
         while IFS= read -r line || [[ -n "$line" ]]; do
             case "$line" in
@@ -156,6 +208,9 @@ read_project_config() {
                     ;;
                 profile=*)
                     profile="${line#profile=}"
+                    ;;
+                clojure_mcp=*)
+                    clojure_mcp="${line#clojure_mcp=}"
                     ;;
                 ''|'#'*)
                     ;;
@@ -168,25 +223,31 @@ read_project_config() {
 
     [[ -n "$path" ]] || die "Project config has no path: $file"
     profile="${profile:-generic}"
+    clojure_mcp="${clojure_mcp:-auto}"
     validate_profile "$profile"
+    validate_clojure_mcp_setting "$clojure_mcp"
 
     CONFIG_PATH="$path"
     CONFIG_PROFILE="$profile"
+    CONFIG_CLOJURE_MCP="$clojure_mcp"
 }
 
 write_project_config() {
     local name="$1"
     local path="$2"
     local profile="$3"
+    local clojure_mcp="$4"
     local file="$PROJECTS_DIR/$name"
     local tmp="$file.tmp.$$"
 
     validate_project_name "$name"
     validate_profile "$profile"
+    validate_clojure_mcp_setting "$clojure_mcp"
 
     {
         printf 'path=%s\n' "$path"
         printf 'profile=%s\n' "$profile"
+        printf 'clojure_mcp=%s\n' "$clojure_mcp"
     } > "$tmp"
 
     mv -- "$tmp" "$file"
@@ -212,9 +273,67 @@ find_name_for_path() {
     printf '%s\n' "$matched"
 }
 
+project_uses_clojure() {
+    local root="$1"
+    local marker source_file
+
+    for marker in deps.edn project.clj bb.edn shadow-cljs.edn build.boot; do
+        [[ -f "$root/$marker" ]] && return 0
+    done
+
+    # Include untracked, non-ignored source so a newly created Clojure project
+    # is detected before its first commit without crawling ignored build trees.
+    while IFS= read -r -d '' source_file; do
+        [[ -n "$source_file" ]] && return 0
+    done < <(
+        git -C "$root" ls-files -z --cached --others --exclude-standard -- \
+            '*.clj' '*.cljc' '*.cljs'
+    )
+
+    return 1
+}
+
+EFFECTIVE_CLOJURE_LSP_MCP=0
+EFFECTIVE_CLOJURE_LSP_MCP_REASON=""
+
+resolve_clojure_mcp() {
+    local root="$1"
+    local project_setting="$2"
+    local setting="$project_setting"
+    local source="project setting"
+
+    if [[ -n "$CLOJURE_LSP_MCP_OVERRIDE" ]]; then
+        setting="$(normalize_clojure_mcp_setting "$CLOJURE_LSP_MCP_OVERRIDE")" ||
+            die "Invalid CODEX_CLOJURE_LSP_MCP: $CLOJURE_LSP_MCP_OVERRIDE"
+        source="environment override"
+    fi
+
+    case "$setting" in
+        on)
+            EFFECTIVE_CLOJURE_LSP_MCP=1
+            EFFECTIVE_CLOJURE_LSP_MCP_REASON="$source: on"
+            ;;
+        off)
+            EFFECTIVE_CLOJURE_LSP_MCP=0
+            EFFECTIVE_CLOJURE_LSP_MCP_REASON="$source: off"
+            ;;
+        auto)
+            if project_uses_clojure "$root"; then
+                EFFECTIVE_CLOJURE_LSP_MCP=1
+                EFFECTIVE_CLOJURE_LSP_MCP_REASON="auto-detected Clojure project"
+            else
+                EFFECTIVE_CLOJURE_LSP_MCP=0
+                EFFECTIVE_CLOJURE_LSP_MCP_REASON="no Clojure project signals detected"
+            fi
+            ;;
+    esac
+}
+
 init_project() {
     local profile="$DEFAULT_PROFILE"
     local profile_explicit=false
+    local clojure_mcp="auto"
+    local clojure_mcp_explicit=false
     local positional=()
 
     while (($#)); do
@@ -228,6 +347,17 @@ init_project() {
             --profile=*)
                 profile="${1#--profile=}"
                 profile_explicit=true
+                shift
+                ;;
+            --clojure-mcp)
+                (($# >= 2)) || die "--clojure-mcp requires auto, on, or off"
+                clojure_mcp="$2"
+                clojure_mcp_explicit=true
+                shift 2
+                ;;
+            --clojure-mcp=*)
+                clojure_mcp="${1#--clojure-mcp=}"
+                clojure_mcp_explicit=true
                 shift
                 ;;
             --)
@@ -246,8 +376,9 @@ init_project() {
     done
 
     validate_profile "$profile"
+    validate_clojure_mcp_setting "$clojure_mcp"
     ((${#positional[@]} <= 2)) ||
-        die "Usage: run-codex --init [--profile generic|cuda] [PROJECT [PATH]]"
+        die "Usage: run-codex --init [--profile generic|cuda] [--clojure-mcp auto|on|off] [PROJECT [PATH]]"
 
     local requested_name="${positional[0]:-}"
     local requested_path="${positional[1]:-$PWD}"
@@ -273,16 +404,26 @@ init_project() {
         read_project_config "$file"
 
         if [[ "$CONFIG_PATH" == "$root" ]]; then
-            if ! $profile_explicit || [[ "$CONFIG_PROFILE" == "$profile" ]]; then
+            if { ! $profile_explicit || [[ "$CONFIG_PROFILE" == "$profile" ]]; } &&
+               { ! $clojure_mcp_explicit || [[ "$CONFIG_CLOJURE_MCP" == "$clojure_mcp" ]]; }; then
                 echo "Project '$name' is already initialized:"
                 echo "  path:    $root"
                 echo "  profile: $CONFIG_PROFILE"
+                echo "  Clojure MCP: $CONFIG_CLOJURE_MCP"
                 return 0
             fi
 
-            echo "Project '$name' already exists with profile '$CONFIG_PROFILE'." >&2
-            echo "To change it:" >&2
-            echo "  run-codex --set-profile '$name' '$profile'" >&2
+            echo "Project '$name' already exists with:" >&2
+            echo "  profile:     $CONFIG_PROFILE" >&2
+            echo "  Clojure MCP: $CONFIG_CLOJURE_MCP" >&2
+            if $profile_explicit && [[ "$CONFIG_PROFILE" != "$profile" ]]; then
+                echo "Change its profile with:" >&2
+                echo "  run-codex --set-profile '$name' '$profile'" >&2
+            fi
+            if $clojure_mcp_explicit && [[ "$CONFIG_CLOJURE_MCP" != "$clojure_mcp" ]]; then
+                echo "Change its Clojure MCP setting with:" >&2
+                echo "  run-codex --set-clojure-mcp '$name' '$clojure_mcp'" >&2
+            fi
             exit 1
         fi
 
@@ -298,20 +439,21 @@ init_project() {
     other="$(find_name_for_path "$root")"
     [[ -z "$other" ]] || die "$root is already registered as project '$other'"
 
-    write_project_config "$name" "$root" "$profile"
+    write_project_config "$name" "$root" "$profile" "$clojure_mcp"
 
     echo "Initialized project '$name':"
-    echo "  path:      $root"
-    echo "  profile:   $profile"
-    echo "  image:     $(profile_image "$profile")"
-    echo "  container: $WORKSPACE_ROOT/$name"
+    echo "  path:        $root"
+    echo "  profile:     $profile"
+    echo "  Clojure MCP: $clojure_mcp"
+    echo "  image:       $(profile_image "$profile")"
+    echo "  container:   $WORKSPACE_ROOT/$name"
 }
 
 rebind_project() {
     local name="$1"
     local requested_path="${2:-$PWD}"
     local file="$PROJECTS_DIR/$name"
-    local path root other profile
+    local path root other profile clojure_mcp
 
     validate_project_name "$name"
     [[ -f "$file" ]] || die "Project '$name' is not registered. Use --init instead."
@@ -321,6 +463,7 @@ rebind_project() {
 
     read_project_config "$file"
     profile="$CONFIG_PROFILE"
+    clojure_mcp="$CONFIG_CLOJURE_MCP"
 
     path="$(canonical_dir "$requested_path")" ||
         die "Directory does not exist: $requested_path"
@@ -335,11 +478,12 @@ rebind_project() {
         die "$root is already registered as project '$other'"
     fi
 
-    write_project_config "$name" "$root" "$profile"
+    write_project_config "$name" "$root" "$profile" "$clojure_mcp"
 
     echo "Rebound project '$name':"
-    echo "  path:    $root"
-    echo "  profile: $profile"
+    echo "  path:        $root"
+    echo "  profile:     $profile"
+    echo "  Clojure MCP: $clojure_mcp"
 }
 
 set_profile() {
@@ -352,16 +496,32 @@ set_profile() {
     [[ -f "$file" ]] || die "Project '$name' is not registered"
 
     read_project_config "$file"
-    write_project_config "$name" "$CONFIG_PATH" "$profile"
+    write_project_config "$name" "$CONFIG_PATH" "$profile" "$CONFIG_CLOJURE_MCP"
 
     echo "Project '$name' now uses profile '$profile':"
     echo "  $(profile_image "$profile")"
 }
 
+set_clojure_mcp() {
+    local name="$1"
+    local clojure_mcp="$2"
+    local file="$PROJECTS_DIR/$name"
+
+    validate_project_name "$name"
+    validate_clojure_mcp_setting "$clojure_mcp"
+    [[ -f "$file" ]] || die "Project '$name' is not registered"
+
+    read_project_config "$file"
+    write_project_config "$name" "$CONFIG_PATH" "$CONFIG_PROFILE" "$clojure_mcp"
+
+    echo "Project '$name' now uses Clojure MCP setting '$clojure_mcp'."
+}
+
 list_projects() {
     mkdir -p "$PROJECTS_DIR"
 
-    printf '%-20s %-10s %-10s %s\n' "PROJECT" "PROFILE" "STATUS" "PATH"
+    printf '%-20s %-10s %-12s %-10s %s\n' \
+        "PROJECT" "PROFILE" "CLOJURE-MCP" "STATUS" "PATH"
 
     shopt -s nullglob
     local files=("$PROJECTS_DIR"/*)
@@ -371,7 +531,7 @@ list_projects() {
         return 0
     fi
 
-    local file name path profile status actual_root
+    local file name path profile clojure_mcp status actual_root
 
     for file in "${files[@]}"; do
         [[ -f "$file" ]] || continue
@@ -379,6 +539,7 @@ list_projects() {
         read_project_config "$file"
         path="$CONFIG_PATH"
         profile="$CONFIG_PROFILE"
+        clojure_mcp="$CONFIG_CLOJURE_MCP"
 
         if [[ ! -d "$path" ]]; then
             status="MISSING"
@@ -388,7 +549,8 @@ list_projects() {
             status="NOT-GIT"
         fi
 
-        printf '%-20s %-10s %-10s %s\n' "$name" "$profile" "$status" "$path"
+        printf '%-20s %-10s %-12s %-10s %s\n' \
+            "$name" "$profile" "$clojure_mcp" "$status" "$path"
     done
 }
 
@@ -422,6 +584,7 @@ print_missing_project_help() {
 RESOLVED_NAME=""
 RESOLVED_PATH=""
 RESOLVED_PROFILE=""
+RESOLVED_CLOJURE_MCP=""
 
 resolve_project() {
     local requested_name="${1:-}"
@@ -454,6 +617,7 @@ resolve_project() {
         RESOLVED_NAME="$requested_name"
         RESOLVED_PATH="$root"
         RESOLVED_PROFILE="$CONFIG_PROFILE"
+        RESOLVED_CLOJURE_MCP="$CONFIG_CLOJURE_MCP"
         return 0
     fi
 
@@ -492,6 +656,7 @@ resolve_project() {
     RESOLVED_NAME="$name"
     RESOLVED_PATH="$current_root"
     RESOLVED_PROFILE="$CONFIG_PROFILE"
+    RESOLVED_CLOJURE_MCP="$CONFIG_CLOJURE_MCP"
 }
 
 run_sandbox_probe() {
@@ -615,6 +780,7 @@ doctor_runtime_probe() {
 
 doctor_mcp_probe() {
     local image="$1"
+    local required_tools="$2"
 
     # Keep this separate from the tool/policy probe so a failed MCP handshake
     # has a precise diagnosis. Like the runtime probe, it has no host mounts.
@@ -651,10 +817,31 @@ doctor_mcp_probe() {
                 fi
             done
 
+            ((mcp_ready == 1))
+
+            printf '\''%s\n'\'' \
+                '\''{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'\'' \
+                >&"$mcp_input_fd"
+            printf '\''%s\n'\'' \
+                '\''{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'\'' \
+                >&"$mcp_input_fd"
+
+            tools_response=""
+            for _ in {1..10}; do
+                if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
+                   jq -e '\''.id == 2'\'' <<<"$mcp_line" >/dev/null 2>&1; then
+                    tools_response="$mcp_line"
+                    break
+                fi
+            done
+
             kill "$mcp_pid" 2>/dev/null || true
             wait "$mcp_pid" 2>/dev/null || true
-            ((mcp_ready == 1))
-        '
+            [[ -n "$tools_response" ]]
+            jq -e --argjson required "$1" \
+                '\''($required - [.result.tools[].name]) | length == 0'\'' \
+                <<<"$tools_response" >/dev/null
+        ' run-codex-doctor "$required_tools"
 }
 
 run_doctor() {
@@ -697,6 +884,12 @@ run_doctor() {
     PROFILE="$RESOLVED_PROFILE"
     IMAGE="$(profile_image "$PROFILE")"
     doctor_pass "Project '$PROJECT' resolves to $PROJECT_PATH ($PROFILE)"
+    resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
+    if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
+        doctor_pass "Clojure LSP MCP selected ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
+    else
+        doctor_skip "Clojure LSP MCP not selected ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
+    fi
 
     if [[ ! "$APPARMOR_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
         doctor_fail "Invalid CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE"
@@ -752,17 +945,17 @@ run_doctor() {
                 doctor_note "Rebuild or replace the selected image, then rerun the doctor."
             fi
 
-            if [[ "$CLOJURE_LSP_MCP" == 1 ]]; then
+            if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
                 local mcp_output=""
-                if mcp_output="$(doctor_mcp_probe "$IMAGE" 2>&1)"; then
-                    doctor_pass "Clojure LSP MCP initialize handshake"
+                if mcp_output="$(doctor_mcp_probe "$IMAGE" "$CLOJURE_LSP_MCP_ALLOWED_TOOLS" 2>&1)"; then
+                    doctor_pass "Clojure LSP MCP handshake and tool allowlist"
                 else
-                    doctor_fail "Clojure LSP MCP initialize handshake failed"
+                    doctor_fail "Clojure LSP MCP handshake or tool allowlist failed"
                     [[ -z "$mcp_output" ]] || printf '      %s\n' "$mcp_output"
                     doctor_note "Rebuild or replace the selected image, then rerun the doctor."
                 fi
             else
-                doctor_skip "Clojure LSP MCP handshake (disabled by CODEX_CLOJURE_LSP_MCP=0)"
+                doctor_skip "Clojure LSP MCP handshake ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
             fi
         else
             doctor_skip "Runtime probes because an earlier required check failed"
@@ -826,6 +1019,12 @@ case "${1:-}" in
         set_profile "$1" "$2"
         exit 0
         ;;
+    --set-clojure-mcp)
+        shift
+        (($# == 2)) || die "Usage: run-codex --set-clojure-mcp PROJECT auto|on|off"
+        set_clojure_mcp "$1" "$2"
+        exit 0
+        ;;
     --doctor)
         DOCTOR_MODE=true
         shift
@@ -887,6 +1086,7 @@ PROJECT="$RESOLVED_NAME"
 PROJECT_PATH="$RESOLVED_PATH"
 PROFILE="$RESOLVED_PROFILE"
 IMAGE="$(profile_image "$PROFILE")"
+resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
 
 # Git identity is resolved on the host and exposed as container-local Git
 # configuration. This preserves normal per-repository/global Git identity
@@ -1234,12 +1434,13 @@ codex_args=(
     -c "sandbox_workspace_write.writable_roots=[\"$CONTAINER_HOME\"]"
 )
 
-if ! $IDEA_MODE && [[ "$CLOJURE_LSP_MCP" == 1 ]]; then
+if ! $IDEA_MODE && [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
     codex_args+=(
         -c 'mcp_servers.clojure_lsp.command="/usr/local/bin/codex-clojure-lsp-mcp"'
         -c 'mcp_servers.clojure_lsp.args=["clojure:clojure-lsp"]'
         -c 'mcp_servers.clojure_lsp.enabled=true'
         -c 'mcp_servers.clojure_lsp.required=false'
+        -c "mcp_servers.clojure_lsp.enabled_tools=$CLOJURE_LSP_MCP_ALLOWED_TOOLS"
         -c 'mcp_servers.clojure_lsp.default_tools_approval_mode="writes"'
         -c 'mcp_servers.clojure_lsp.startup_timeout_sec=30'
         -c 'mcp_servers.clojure_lsp.tool_timeout_sec=120'
@@ -1263,6 +1464,11 @@ else
     echo "  profile: $PROFILE"
     echo "  image:   $IMAGE"
     echo "  project: $PROJECT_PATH -> $CONTAINER_PROJECT"
+    if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
+        echo "  Clojure MCP: enabled ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
+    else
+        echo "  Clojure MCP: disabled ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
+    fi
     echo "  policy:  workspace-write; Git metadata and network writes need your approval"
 fi
 

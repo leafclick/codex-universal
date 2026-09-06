@@ -247,6 +247,7 @@ printf '%s\n' \
     > "$TEST_ROOT/fake-bin/socat"
 chmod 755 "$TEST_ROOT/fake-bin/socat"
 git -C "$TEST_ROOT/repo" init -q
+printf '%s\n' '{:paths ["src"]}' > "$TEST_ROOT/repo/deps.edn"
 
 launcher_env=(
     env
@@ -265,6 +266,8 @@ launcher_env=(
     --init --profile generic smoke-project "$TEST_ROOT/repo" >/dev/null
 
 project_config="$TEST_ROOT/launcher-config/run-codex/projects/smoke-project"
+grep -Fxq 'clojure_mcp=auto' "$project_config" ||
+    fail "new project config does not default Clojure MCP to auto"
 config_before="$(<"$project_config")"
 init_again_output="$(
     "${launcher_env[@]}" "$ROOT/bin/run-codex" \
@@ -277,6 +280,8 @@ assert_contains "$init_again_output" "already initialized"
 list_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --list)"
 assert_contains "$list_output" "smoke-project"
 assert_contains "$list_output" "generic"
+assert_contains "$list_output" "CLOJURE-MCP"
+assert_contains "$list_output" "auto"
 assert_contains "$list_output" "OK"
 
 mkdir -p "$TEST_ROOT/doctor-missing-bin"
@@ -299,6 +304,8 @@ doctor_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --doctor smoke-proje
 assert_contains "$doctor_output" "PASS  Required host commands are available"
 assert_contains "$doctor_output" "PASS  Docker daemon is available"
 assert_contains "$doctor_output" "PASS  Project 'smoke-project' resolves to $TEST_ROOT/repo (generic)"
+assert_contains "$doctor_output" \
+    "PASS  Clojure LSP MCP selected (auto-detected Clojure project)"
 assert_contains "$doctor_output" "PASS  Host sandbox policy is readable"
 assert_contains "$doctor_output" "PASS  Local image is available: example/codex-universal-generic:test-version"
 assert_contains "$doctor_output" "image id: sha256:doctor-image"
@@ -307,7 +314,7 @@ assert_contains "$doctor_output" "revision: 0123456789abcdef"
 assert_contains "$doctor_output" "PASS  Image user matches host UID/GID ($(id -u):$(id -g))"
 assert_contains "$doctor_output" "PASS  AppArmor, seccomp, and Bubblewrap sandbox probe"
 assert_contains "$doctor_output" "PASS  Image tools and managed Codex policy"
-assert_contains "$doctor_output" "PASS  Clojure LSP MCP initialize handshake"
+assert_contains "$doctor_output" "PASS  Clojure LSP MCP handshake and tool allowlist"
 assert_contains "$doctor_output" "Diagnostics passed with 0 warning(s)."
 assert_contains "$doctor_output" "--network none"
 assert_contains "$doctor_output" "--cap-drop=ALL"
@@ -318,7 +325,7 @@ doctor_no_mcp_output="$(
         "$ROOT/bin/run-codex" --doctor smoke-project
 )"
 assert_contains "$doctor_no_mcp_output" \
-    "SKIP  Clojure LSP MCP handshake (disabled by CODEX_CLOJURE_LSP_MCP=0)"
+    "SKIP  Clojure LSP MCP handshake (environment override: off)"
 
 if "${launcher_env[@]}" \
     CODEX_SECCOMP_PROFILE="$TEST_ROOT/missing-seccomp.json" \
@@ -348,7 +355,13 @@ for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "sandbox_workspace_write.network_access=false"
     assert_contains "$output" 'mcp_servers.clojure_lsp.command="/usr/local/bin/codex-clojure-lsp-mcp"'
     assert_contains "$output" 'mcp_servers.clojure_lsp.args=["clojure:clojure-lsp"]'
+    assert_contains "$output" 'mcp_servers.clojure_lsp.enabled_tools=['
+    assert_contains "$output" '"start_lsp"'
+    assert_contains "$output" '"find_references"'
+    assert_contains "$output" '"safe_apply_edit"'
+    assert_not_contains "$output" '"run_tests"'
     assert_contains "$output" 'mcp_servers.clojure_lsp.default_tools_approval_mode="writes"'
+    assert_contains "$output" "Clojure MCP: enabled (auto-detected Clojure project)"
     assert_contains "$output" "$TEST_ROOT/repo:/workspace/smoke-project"
     assert_contains "$output" "example/codex-universal-generic:test-version"
 done
@@ -381,6 +394,60 @@ lsp_disabled_output="$(
         "$ROOT/bin/run-codex" smoke-project --new
 )"
 assert_not_contains "$lsp_disabled_output" "mcp_servers.clojure_lsp"
+assert_contains "$lsp_disabled_output" "Clojure MCP: disabled (environment override: off)"
+
+# Non-Clojure repositories should not pay the MCP startup or tool-catalog cost
+# unless their project configuration or a one-shot environment override opts in.
+mkdir -p "$TEST_ROOT/non-clojure-repo"
+git -C "$TEST_ROOT/non-clojure-repo" init -q
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    --init plain-project "$TEST_ROOT/non-clojure-repo" >/dev/null
+plain_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" plain-project --new)"
+assert_not_contains "$plain_output" "mcp_servers.clojure_lsp"
+assert_contains "$plain_output" \
+    "Clojure MCP: disabled (no Clojure project signals detected)"
+
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    --set-clojure-mcp plain-project on >/dev/null
+plain_forced_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" plain-project --new)"
+assert_contains "$plain_forced_output" "mcp_servers.clojure_lsp.enabled=true"
+assert_contains "$plain_forced_output" "Clojure MCP: enabled (project setting: on)"
+
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    --set-profile plain-project cuda >/dev/null
+plain_config="$TEST_ROOT/launcher-config/run-codex/projects/plain-project"
+grep -Fxq 'profile=cuda' "$plain_config" &&
+    grep -Fxq 'clojure_mcp=on' "$plain_config" ||
+    fail "--set-profile did not preserve the Clojure MCP setting"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    --set-profile plain-project generic >/dev/null
+
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    --set-clojure-mcp plain-project auto >/dev/null
+grep -Fxq 'clojure_mcp=auto' \
+    "$TEST_ROOT/launcher-config/run-codex/projects/plain-project" ||
+    fail "--set-clojure-mcp did not update the project configuration"
+
+plain_env_output="$(
+    "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=1 \
+        "$ROOT/bin/run-codex" plain-project --new
+)"
+assert_contains "$plain_env_output" "mcp_servers.clojure_lsp.enabled=true"
+assert_contains "$plain_env_output" "Clojure MCP: enabled (environment override: on)"
+
+# Registrations written by older launchers have no clojure_mcp field and must
+# acquire the new auto behavior without being rewritten merely by launching.
+mkdir -p "$TEST_ROOT/legacy-repo"
+git -C "$TEST_ROOT/legacy-repo" init -q
+legacy_config="$TEST_ROOT/launcher-config/run-codex/projects/legacy-project"
+printf 'path=%s\nprofile=generic\n' "$TEST_ROOT/legacy-repo" > "$legacy_config"
+legacy_before="$(<"$legacy_config")"
+legacy_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" legacy-project --new)"
+assert_not_contains "$legacy_output" "mcp_servers.clojure_lsp"
+assert_contains "$legacy_output" \
+    "Clojure MCP: disabled (no Clojure project signals detected)"
+[[ "$(<"$legacy_config")" == "$legacy_before" ]] ||
+    fail "launching rewrote a legacy project registration"
 
 # IDEA may terminate the attached ACP launcher abruptly. Verify that the host
 # launcher retains ownership of the container and removes its exact ID when

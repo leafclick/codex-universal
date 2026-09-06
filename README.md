@@ -341,12 +341,19 @@ executable, so `cljfmt check` and `cljfmt fix` do not launch `clj`. Each tool
 uses its upstream defaults and still discovers project-local configuration such
 as `bb.edn`, `.cljfmt.edn`, `.clj-kondo/config.edn`, and `.lsp/config.edn`.
 
-In terminal mode, `run-codex` also enables a container-local `clojure_lsp` MCP
-server by default. It uses `agent-lsp` to keep `clojure-lsp` indexed and expose
-symbol-aware navigation, references, diagnostics, formatting, and refactoring
-tools to Codex. The first semantic tool call starts analysis for the current
-project; in the Codex TUI, use `/mcp` to inspect the connection, as described
-in the official [Codex MCP documentation](https://developers.openai.com/codex/mcp/).
+In terminal mode, `run-codex` enables a container-local `clojure_lsp` MCP
+server automatically for Clojure projects. Auto-detection looks for a root
+`deps.edn`, `project.clj`, `bb.edn`, `shadow-cljs.edn`, or `build.boot`, then
+for tracked or unignored `.clj`, `.cljc`, or `.cljs` source anywhere in the
+repository. Other projects start without the MCP server or its tool catalog.
+
+The bridge uses `agent-lsp` to keep `clojure-lsp` indexed and expose a curated
+set of symbol navigation, references, diagnostics, formatting, and guarded
+refactoring tools to Codex. Unrelated agent-lsp workflow, simulation, cache,
+cross-repository, build, and test tools are not exposed. The first semantic
+tool call starts analysis for the current project; in the Codex TUI, use `/mcp`
+to inspect the connection, as described in the official
+[Codex MCP documentation](https://developers.openai.com/codex/mcp/).
 For example, ask Codex to “use the Clojure LSP tools to find every reference
 to `my.app/foo` and check diagnostics before editing” rather than asking for a
 text search.
@@ -359,8 +366,18 @@ private PID namespace and an empty `/proc`. It can update the working tree and
 its caches, but `.git` and `.codex` remain read-only; Codex prompts before
 invoking MCP tools declared as write-capable. This preserves the same outer
 boundary as ordinary Codex commands without exposing other container
-processes through procfs. Disable the terminal integration for a session if
-needed:
+processes through procfs. Set a persistent per-project override with:
+
+```bash
+run-codex --set-clojure-mcp my-project on
+run-codex --set-clojure-mcp my-project off
+run-codex --set-clojure-mcp my-project auto
+```
+
+The `auto` setting is the default. It is useful for mixed repositories and
+also restores detection after an explicit override. For a one-session override,
+use `CODEX_CLOJURE_LSP_MCP=on` or `off`; the older `1` and `0` forms remain
+supported:
 
 ```bash
 CODEX_CLOJURE_LSP_MCP=0 run-codex my-project
@@ -642,6 +659,7 @@ may contain:
 ```text
 path=/home/leafclick/src/my-project
 profile=cuda
+clojure_mcp=auto
 ```
 
 Another project might contain:
@@ -649,9 +667,12 @@ Another project might contain:
 ```text
 path=/home/leafclick/src/website
 profile=generic
+clojure_mcp=off
 ```
 
 The host path may differ between machines.
+Registrations created by older launcher versions without a `clojure_mcp` field
+are read as `auto`; merely launching them does not rewrite the file.
 
 The project name is the stable identity. Inside the container, the project is always mounted at:
 
@@ -691,9 +712,17 @@ run-codex --init foo ~/src/foo
 ```
 
 Initialization is idempotent. Repeating `--init` for the same project and Git
-root leaves its registration unchanged. If `--profile` is omitted on a repeat,
-the existing profile is preserved. Changing the registered path or profile
-requires the explicit `--rebind` or `--set-profile` commands below.
+root leaves its registration unchanged. If `--profile` or `--clojure-mcp` is
+omitted on a repeat, the existing setting is preserved. Changing the registered
+path, profile, or Clojure MCP behavior requires the corresponding explicit
+command below.
+
+The default Clojure MCP setting is `auto`. It can be selected explicitly during
+initialization:
+
+```bash
+run-codex --init --clojure-mcp on foo ~/src/foo
+```
 
 ### CUDA project
 
@@ -719,9 +748,9 @@ run-codex --list
 Example:
 
 ```text
-PROJECT              PROFILE    STATUS     PATH
-my-project            cuda       OK         /home/leafclick/src/my-project
-website              generic    OK         /home/leafclick/src/website
+PROJECT              PROFILE    CLOJURE-MCP  STATUS     PATH
+my-project            cuda       auto         OK         /home/leafclick/src/my-project
+website              generic    off          OK         /home/leafclick/src/website
 ```
 
 ## Diagnose a project environment
@@ -742,9 +771,10 @@ The command exits successfully only when the required host commands, Docker
 daemon, registered project, selected image, image UID/GID, managed policy,
 AppArmor/seccomp/Bubblewrap sandbox, and image runtime checks pass. When the
 terminal Clojure MCP integration is enabled, the runtime check performs a real
-MCP initialize handshake. It uses a disposable networkless container with no
-host mounts; it never pulls, builds, installs, or changes the registered
-checkout or live `~/.codex` state.
+MCP initialize handshake and verifies that the selected image advertises every
+allowlisted tool. It uses a disposable networkless container with no host
+mounts; it never pulls, builds, installs, or changes the registered checkout or
+live `~/.codex` state.
 
 ## Change a project's profile
 
@@ -763,6 +793,24 @@ run-codex --set-profile my-project generic
 The project configuration stores a logical profile rather than a concrete Docker image name.
 
 This keeps project configuration independent of image naming, tags, architectures, and future runtime variants.
+
+## Change a project's Clojure MCP setting
+
+Use automatic project detection, which is the default:
+
+```bash
+run-codex --set-clojure-mcp my-project auto
+```
+
+Or force the terminal bridge on or off:
+
+```bash
+run-codex --set-clojure-mcp my-project on
+run-codex --set-clojure-mcp my-project off
+```
+
+The setting affects terminal mode. IDEA mode continues to use IntelliJ's
+separate semantic MCP integration.
 
 ## Move a checkout
 
