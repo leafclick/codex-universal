@@ -69,6 +69,7 @@ for script in \
     "$ROOT/bin/codex-pull" \
     "$ROOT/container/codex-entrypoint" \
     "$ROOT/container/codex-acp-entrypoint" \
+    "$ROOT/container/codex-bwrap-cuda" \
     "$ROOT/container/codex-clojure-lsp-mcp" \
     "$ROOT/container/install-clojure-tools"; do
     bash -n "$script"
@@ -113,6 +114,8 @@ grep -Fq -- '--unshare-pid \' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not exercise the private PID namespace"
 grep -Fq -- '--tmpfs /proc \' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not exercise the private procfs overlay"
+grep -Fq -- '--tmpfs "$TMP_TMPFS_SPEC" \' "$ROOT/bin/run-codex" ||
+    fail "Bubblewrap preflight does not provide writable temporary storage"
 grep -Fq -- '--unshare-net' "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge is not network-isolated"
 grep -Fq -- '--unshare-pid' "$ROOT/container/codex-clojure-lsp-mcp" ||
@@ -227,12 +230,69 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") still bakes the host UID/GID into the image"
     fi
 done
-grep -q 'container/codex-bwrap-cuda /usr/local/bin/bwrap' "$ROOT/Dockerfile.cuda" ||
+grep -q 'container/codex-bwrap-cuda /usr/bin/bwrap' "$ROOT/Dockerfile.cuda" ||
     fail "CUDA image does not preserve NVIDIA devices inside Codex Bubblewrap"
+grep -q 'mv /usr/bin/bwrap /usr/bin/bwrap.real' "$ROOT/Dockerfile.cuda" ||
+    fail "CUDA image does not preserve the real Bubblewrap binary"
+grep -q 'container/codex-cuda-failure-signatures /usr/local/share/codex/cuda-failure-signatures' \
+    "$ROOT/Dockerfile.cuda" ||
+    fail "CUDA image does not install failure signatures"
 grep -Fq -- '--dev-bind' "$ROOT/container/codex-bwrap-cuda" ||
     fail "CUDA Bubblewrap shim does not bind GPU devices"
-grep -Fq '/dev/nvidiactl' "$ROOT/container/codex-bwrap-cuda" ||
-    fail "CUDA Bubblewrap shim omits the NVIDIA control device"
+grep -Fq 'CODEX_CUDA_FAILURE_HINT' "$ROOT/container/codex-bwrap-cuda" ||
+    fail "CUDA Bubblewrap shim has no failure hint control"
+grep -Fq 'tail -c 65536' "$ROOT/container/codex-bwrap-cuda" ||
+    fail "CUDA Bubblewrap shim does not bound failure scanning"
+
+fake_bwrap="$TEST_ROOT/fake-bwrap"
+signature_file="$TEST_ROOT/cuda-failure-signatures"
+printf '%s\n' \
+    '# Test signatures are data, not wrapper code.' \
+    'CUDA_ERROR_OPERATING_SYSTEM' \
+    'CUDA[[:space:]]+error:[[:space:]]*:?(operating-system|operating[[:space:]]+system)' \
+    > "$signature_file"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\\n" "$@" >&2' \
+    'printf "CUDA error: :operating-system.\\n" >&2' \
+    'exit 17' \
+    > "$fake_bwrap"
+chmod 755 "$fake_bwrap"
+if hint_output="$(
+    CODEX_BWRAP_REAL="$fake_bwrap" \
+        CODEX_CUDA_FAILURE_SIGNATURES="$signature_file" \
+        "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/false 2>&1
+)"; then
+    fail "CUDA Bubblewrap shim masked the wrapped command failure"
+fi
+[[ "$hint_output" == *"--dev-bind"*"/dev"*"/dev"* ]] ||
+    fail "CUDA Bubblewrap shim did not rewrite --dev /dev"
+[[ "$hint_output" == *"Retry the same GPU workload"* ]] ||
+    fail "CUDA Bubblewrap shim did not append the CUDA failure hint"
+if CODEX_CUDA_FAILURE_HINT=off CODEX_BWRAP_REAL="$fake_bwrap" \
+    "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/false >/dev/null 2>&1; then
+    fail "CUDA Bubblewrap shim masked the disabled-hint command failure"
+fi
+no_mktemp_bin="$TEST_ROOT/no-mktemp-bin"
+mkdir -p "$no_mktemp_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'exit 1' \
+    > "$no_mktemp_bin/mktemp"
+chmod 755 "$no_mktemp_bin/mktemp"
+set +e
+no_mktemp_output="$(
+    PATH="$no_mktemp_bin:$PATH" CODEX_BWRAP_REAL="$fake_bwrap" \
+        "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/false 2>&1
+)"
+no_mktemp_status=$?
+set -e
+(( no_mktemp_status != 0 )) ||
+    fail "CUDA Bubblewrap shim masked the failure when temp capture was unavailable"
+[[ "$no_mktemp_output" == *"CUDA error: :operating-system"* ]] ||
+    fail "CUDA Bubblewrap shim did not delegate when temp capture was unavailable"
+[[ "$no_mktemp_output" != *"Retry the same GPU workload"* ]] ||
+    fail "CUDA Bubblewrap shim emitted a hint without temp capture"
 grep -Fq 'exec /opt/nvidia/nvidia_entrypoint.sh "$0" "$@"' \
     "$ROOT/container/codex-entrypoint" ||
     fail "portable-user entrypoint does not preserve NVIDIA initialization"
@@ -1031,6 +1091,7 @@ smoke_image() {
         command -v zstd >/dev/null
         rlwrap --version
         test -r /etc/codex/requirements.toml
+        [[ "$(stat -c %a /etc/codex)" == 755 ]]
         [[ "$(stat -c %u /usr/local/bin/codex-entrypoint)" == 0 ]]
         [[ "$(stat -c %u /usr/local/share/npm-global/bin/codex)" == 0 ]]
         [[ "$(stat -c %u /etc/codex/requirements.toml)" == 0 ]]
@@ -1087,6 +1148,25 @@ smoke_image() {
             -c '\''approvals_reviewer="user"'\'' \
             --help >/dev/null
         if [[ "$1" == cuda ]]; then
+            # The CUDA wrapper (installed as /usr/bin/bwrap) must re-expose the
+            # NVIDIA device nodes AFTER Codex'\''s own `--dev /dev`. bwrap applies
+            # options in order, so an earlier `--dev /dev` mounts a fresh devtmpfs
+            # that would discard binds emitted before it. nvidia-smi uses NVML and
+            # would pass even with the nodes missing, so assert the nodes directly.
+            if [[ -e /dev/nvidiactl ]]; then
+                bwrap \
+                    --unshare-user \
+                    --ro-bind / / \
+                    --dev /dev \
+                    --proc /proc \
+                    --tmpfs /tmp \
+                    -- \
+                    /bin/bash -c '\''
+                        set -Eeuo pipefail
+                        test -e /dev/nvidiactl
+                        test -e /dev/nvidia0 || ls /dev/nvidia[0-9]* >/dev/null
+                    '\''
+            fi
             bwrap \
                 --unshare-user \
                 --ro-bind / / \

@@ -1,0 +1,15 @@
+# One extended regular expression per line. Blank lines and # comments are ignored.
+CUDA_ERROR_OPERATING_SYSTEM
+cudaErrorOperatingSystem
+CUDA[[:space:]]+error:[[:space:]]*:?(operating-system|operating[[:space:]]+system)
+cuInit[^[:alnum:]_]*.*304
+cuda(GetDeviceCount|Free|SetDevice|HostAlloc|HostRegister)[^[:alnum:]_]*.*304
+CUDA[^[:alnum:]_]*.*304
+304[^[:alnum:]_]*.*CUDA
+CUDA driver initialization failed
+Failed to initialize CUDA
+CUDA driver error
+CUDA initialization[^[:alnum:]_]*(failed|error)
+RuntimeError: CUDA error
+CudaSupportError
+CUDARuntimeError

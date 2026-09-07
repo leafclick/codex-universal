@@ -188,12 +188,18 @@ RUN npm install -g \
     && npm cache clean --force
 
 # requirements.toml is an enforced Codex policy layer. In particular, an IDE
-# cannot switch the ACP session to automatic review or full access.
+# cannot switch the ACP session to automatic review or full access. The
+# directory must be world-traversable (0755) so the arbitrary non-root runtime
+# UID can reach the file; the file itself is world-readable (0644).
+RUN install -d -o root -g root -m 0755 /etc/codex
 COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
+RUN install -d -o root -g root -m 0755 /usr/local/share/codex
+COPY --chmod=0644 container/codex-cuda-failure-signatures /usr/local/share/codex/cuda-failure-signatures
 COPY --chmod=0755 container/codex-entrypoint /usr/local/bin/codex-entrypoint
 COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint
 COPY --chmod=0755 container/codex-clojure-lsp-mcp /usr/local/bin/codex-clojure-lsp-mcp
-COPY --chmod=0755 container/codex-bwrap-cuda /usr/local/bin/bwrap
+RUN mv /usr/bin/bwrap /usr/bin/bwrap.real
+COPY --chmod=0755 container/codex-bwrap-cuda /usr/bin/bwrap
 
 ENV HOME=/home/codex
 

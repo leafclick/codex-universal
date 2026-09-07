@@ -637,9 +637,17 @@ docker run --rm --gpus all \
 ```
 
 `run-codex` adds `--gpus all` only for projects configured with the `cuda` profile.
-The CUDA image also wraps Bubblewrap to re-expose only Docker-authorized NVIDIA
-device nodes inside Codex's nested sandbox, so GPU workloads work under the
-normal `workspace-write` policy.
+The CUDA image wraps Bubblewrap to preserve Docker-authorized NVIDIA device
+nodes inside Codex's nested sandbox, so visibility/NVML-style tools such as
+`nvidia-smi` may work. Full CUDA driver/runtime initialization can still fail
+in the inner sandbox, commonly with CUDA error 304, because of PID/procfs
+isolation. GPU workloads that require CUDA runtime initialization should be
+rerun with explicit user-approved elevation.
+
+When a sandboxed command exits non-zero and its output matches a known CUDA
+driver/runtime initialization failure, the CUDA wrapper appends a best-effort
+note suggesting retry with user-approved elevation. This detection does not
+replace the documented requirement to elevate real CUDA runtime workloads.
 
 ## Installing commands
 

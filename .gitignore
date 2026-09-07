@@ -1,6 +1,7 @@
 # Editor / IDE
 .idea/
 .vscode/
+*.iml
 *.swp
 *.swo
 *~

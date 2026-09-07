@@ -1,49 +1,156 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Codex's Linux sandbox deliberately replaces /dev with a minimal device tree.
-# CUDA needs only these Docker-authorized NVIDIA nodes; expose no other host
-# devices. The NVIDIA Container Toolkit decides which nodes exist and Docker's
-# device cgroup remains the outer enforcement boundary.
-real_bwrap=/usr/bin/bwrap
+real_bwrap="${CODEX_BWRAP_REAL:-/usr/bin/bwrap.real}"
 [[ -x "$real_bwrap" ]] || {
     echo "Missing system Bubblewrap: $real_bwrap" >&2
     exit 127
 }
 
-bind_args=()
-if [[ -d /proc/driver/nvidia ]]; then
-    bind_args+=(--ro-bind /proc/driver/nvidia /proc/driver/nvidia)
-fi
-for device in /dev/nvidia[0-9]*; do
-    [[ -e "$device" ]] || continue
-    bind_args+=(--dev-bind "$device" "$device")
-done
-for device in \
-    /dev/nvidiactl \
-    /dev/nvidia-modeset \
-    /dev/nvidia-uvm \
-    /dev/nvidia-uvm-tools \
-    /dev/nvidia-caps \
-    /dev/dxg; do
-    if [[ -e "$device" ]]; then
-        bind_args+=(--dev-bind "$device" "$device")
+rewrite_tokens() {
+    local -n in_tokens="$1"
+    local -n out_tokens="$2"
+    local index=0
+    local count="${#in_tokens[@]}"
+    local current=""
+    local dest=""
+
+    while ((index < count)); do
+        current="${in_tokens[index]}"
+
+        # Replace Codex's fresh /dev with a bind of Docker's already-filtered
+        # /dev, preserving NVIDIA nodes without adding host devices.
+        if [[ "$current" == "--dev" && $((index + 1)) -lt "$count" ]]; then
+            dest="${in_tokens[index + 1]}"
+            out_tokens+=(--dev-bind "$dest" "$dest")
+            index=$((index + 2))
+            continue
+        fi
+
+        out_tokens+=("$current")
+        index=$((index + 1))
+    done
+}
+
+argv=("$@")
+rewritten=()
+index=0
+count="${#argv[@]}"
+
+while ((index < count)); do
+    current="${argv[index]}"
+
+    if [[ "$current" == "--args" && $((index + 1)) -lt "$count" ]]; then
+        fd="${argv[index + 1]}"
+
+        fd_tokens=()
+        while IFS= read -r -d '' token <&"$fd"; do
+            fd_tokens+=("$token")
+        done
+
+        rewritten_fd_tokens=()
+        rewrite_tokens fd_tokens rewritten_fd_tokens
+
+        exec {new_fd}< <(
+            for token in "${rewritten_fd_tokens[@]}"; do
+                printf '%s\0' "$token"
+            done
+        )
+
+        rewritten+=(--args "$new_fd")
+        index=$((index + 2))
+        continue
     fi
+
+    rewritten+=("$current")
+    index=$((index + 1))
 done
 
-command_args=()
-inserted=false
-for argument in "$@"; do
-    if [[ "$argument" == -- && "$inserted" == false ]]; then
-        command_args+=("${bind_args[@]}" --)
-        inserted=true
-    else
-        command_args+=("$argument")
+final=()
+rewrite_tokens rewritten final
+
+cuda_failure_hint_enabled() {
+    case "${CODEX_CUDA_FAILURE_HINT:-auto}" in
+        auto|'') return 0 ;;
+        off|0|false|no) return 1 ;;
+        *)
+            echo "Invalid CODEX_CUDA_FAILURE_HINT=${CODEX_CUDA_FAILURE_HINT}" >&2
+            exit 2
+            ;;
+    esac
+}
+
+cuda_failure_signature_present() {
+    local text="$1"
+    local signature_file="${CODEX_CUDA_FAILURE_SIGNATURES:-/usr/local/share/codex/cuda-failure-signatures}"
+    local pattern=""
+
+    [[ -r "$signature_file" ]] || return 1
+    while IFS= read -r pattern || [[ -n "$pattern" ]]; do
+        [[ -z "$pattern" || "${pattern:0:1}" == "#" ]] && continue
+        if grep -Eiq -- "$pattern" <<<"$text"; then
+            return 0
+        fi
+    done < "$signature_file"
+
+    return 1
+}
+
+print_cuda_failure_hint() {
+    cat >&2 <<'EOF'
+
+Codex CUDA note: this command failed with output that looks like CUDA
+driver/runtime initialization failure inside the Codex sandbox.
+
+NVIDIA device nodes may be visible, but CUDA driver/runtime initialization can
+fail in the inner Bubblewrap sandbox, commonly as CUDA error 304
+(CUDA_ERROR_OPERATING_SYSTEM), because of PID/procfs isolation.
+
+Retry the same GPU workload with explicit user-approved elevation.
+EOF
+}
+
+run_bwrap_with_cuda_failure_hint() {
+    local stdout_log=""
+    local stderr_log=""
+    local status=0
+    local combined=""
+
+    if ! stdout_log="$(mktemp -t codex-bwrap-stdout.XXXXXX 2>/dev/null)"; then
+        exec "$real_bwrap" "${final[@]}"
     fi
-done
+    if ! stderr_log="$(mktemp -t codex-bwrap-stderr.XXXXXX 2>/dev/null)"; then
+        rm -f -- "$stdout_log" || true
+        exec "$real_bwrap" "${final[@]}"
+    fi
+    set +e
+    "$real_bwrap" "${final[@]}" \
+        > >(tee >(tail -c 65536 > "$stdout_log")) \
+        2> >(tee >(tail -c 65536 > "$stderr_log") >&2)
+    status=$?
+    set -e
 
-if [[ "$inserted" == false ]]; then
-    command_args+=("${bind_args[@]}")
+    if ((status != 0)) && cuda_failure_hint_enabled; then
+        combined="$(
+            {
+                cat "$stdout_log" 2>/dev/null
+                printf '\n'
+                cat "$stderr_log" 2>/dev/null
+            } || true
+        )"
+
+        if cuda_failure_signature_present "$combined"; then
+            print_cuda_failure_hint
+        fi
+    fi
+
+    rm -f -- "$stdout_log" "$stderr_log" || true
+    return "$status"
+}
+
+if ! cuda_failure_hint_enabled; then
+    exec "$real_bwrap" "${final[@]}"
 fi
 
-exec "$real_bwrap" "${command_args[@]}"
+run_bwrap_with_cuda_failure_hint
+exit $?

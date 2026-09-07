@@ -932,10 +932,12 @@ run_sandbox_probe() {
 
     # Exercise the actual host kernel, Docker seccomp policy, AppArmor
     # transition, image Bubblewrap binary, and non-root identity together. The
-    # probe has no network, writable root filesystem, or host mounts.
+    # probe has no network, host mounts, or writable image root; only disposable
+    # tmpfs runtime storage is writable.
     docker run --rm --pull=never \
         --network none \
         --read-only \
+        --tmpfs "$TMP_TMPFS_SPEC" \
         --cap-drop=ALL \
         --security-opt=no-new-privileges \
         --security-opt "apparmor=$APPARMOR_PROFILE" \
@@ -1049,6 +1051,8 @@ doctor_runtime_probe() {
             exit 1
         fi
         test -r /etc/codex/requirements.toml
+        [[ "$(stat -c %a /etc/codex)" == 755 ]]
+        [[ "$(stat -c %u /usr/local/bin/codex-entrypoint)" == 0 ]]
         grep -Fxq '\''allowed_approval_policies = ["on-request"]'\'' \
             /etc/codex/requirements.toml
         grep -Fxq '\''allowed_approvals_reviewers = ["user"]'\'' \
