@@ -4,7 +4,30 @@ umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf -- "$TEST_ROOT"' EXIT
+namespace_service_pid=""
+namespace_service_pgid=""
+
+stop_namespace_service() {
+    local pgid="${namespace_service_pgid:-}"
+    [[ -n "$pgid" ]] || return 0
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for _ in {1..20}; do
+        kill -0 -- "-$pgid" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+    if [[ -n "${namespace_service_pid:-}" ]]; then
+        wait "$namespace_service_pid" 2>/dev/null || true
+    fi
+    namespace_service_pid=""
+    namespace_service_pgid=""
+}
+
+cleanup() {
+    stop_namespace_service
+    rm -rf -- "$TEST_ROOT"
+}
+trap cleanup EXIT
 
 pass() {
     printf 'ok - %s\n' "$1"
@@ -128,6 +151,75 @@ workflow_pid_one=$!
 workflow_pid_two=$!
 wait "$workflow_pid_one"
 wait "$workflow_pid_two"
+
+upgrade_source="$TEST_ROOT/workflow-upgrade-source"
+upgrade_home="$TEST_ROOT/workflow-upgrade-home"
+cp -a -- "$ROOT/container/codex-workflow" "$upgrade_source"
+mkdir -p -- "$upgrade_home"
+upgrade_install=(
+    env
+    "HOME=$upgrade_home"
+    "CODEX_HOME=$upgrade_home/codex-state"
+    "CODEX_UNIVERSAL_WORKFLOW_SOURCE=$upgrade_source"
+    "$ROOT/container/codex-universal-workflow-install"
+)
+"${upgrade_install[@]}"
+upgrade_marker="$upgrade_home/codex-state/codex-universal-workflow/agents__clojure_probe.toml.sha256"
+upgrade_before_marker="$(cat -- "$upgrade_marker")"
+printf '%s\n' '# managed upgrade' >> "$upgrade_source/agents/clojure_probe.toml"
+printf '%s\n' '# user override' >> "$upgrade_home/codex-state/agents/mechanical_worker.toml"
+"${upgrade_install[@]}"
+upgrade_after_marker="$(cat -- "$upgrade_marker")"
+test "$upgrade_before_marker" != "$upgrade_after_marker" ||
+    fail "workflow installer did not update a changed managed asset marker"
+test "$(sha256sum -- "$upgrade_source/agents/clojure_probe.toml" | awk '{print $1}')" = \
+    "$upgrade_after_marker" || \
+    fail "workflow installer marker does not match upgraded asset"
+grep -Fq '# managed upgrade' "$upgrade_home/codex-state/agents/clojure_probe.toml" ||
+    fail "workflow installer did not apply a managed asset upgrade"
+grep -Fq '# user override' "$upgrade_home/codex-state/agents/mechanical_worker.toml" ||
+    fail "workflow installer overwrote a user-modified asset"
+
+global_home="$TEST_ROOT/workflow-global-home"
+global_codex_home="$global_home/codex-state"
+global_agents='user-owned global guidance'
+mkdir -p -- "$global_home" "$global_codex_home"
+printf '%s\n' "$global_agents" > "$global_codex_home/AGENTS.md"
+env HOME="$global_home" CODEX_HOME="$global_codex_home" \
+    CODEX_UNIVERSAL_WORKFLOW_SOURCE="$workflow_source" \
+    "$ROOT/container/codex-universal-workflow-install"
+grep -Fxq "$global_agents" "$global_codex_home/AGENTS.md" ||
+    fail "workflow installer overwrote a pre-existing global AGENTS.md"
+test ! -f "$global_codex_home/codex-universal-workflow/AGENTS.md.sha256" ||
+    fail "workflow installer marked a pre-existing global AGENTS.md as managed"
+
+concurrent_home="$TEST_ROOT/workflow-concurrent-home"
+mkdir -p -- "$concurrent_home"
+concurrent_install=(
+    env
+    "HOME=$concurrent_home"
+    "CODEX_HOME=$concurrent_home/codex-state"
+    "CODEX_UNIVERSAL_WORKFLOW_SOURCE=$workflow_source"
+    "$ROOT/container/codex-universal-workflow-install"
+)
+"${concurrent_install[@]}" &
+concurrent_enabled_pid=$!
+CODEX_UNIVERSAL_WORKFLOW=0 "${concurrent_install[@]}" &
+concurrent_optout_pid=$!
+wait "$concurrent_enabled_pid"
+wait "$concurrent_optout_pid"
+test -f "$concurrent_home/codex-state/agents/code_reader.toml" ||
+    fail "session opt-out removed assets during a concurrent enabled install"
+test -f "$concurrent_home/codex-state/skills/clojure-development/SKILL.md" ||
+    fail "session opt-out removed skill assets during a concurrent enabled install"
+grep -Fq 'substantive executable, action, and scope' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not require substantive approval prompts"
+grep -Fq 'Approval of such a prelude never' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance lets a shell prelude imply later authorization"
+grep -Fq 'name the exact' "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not require destructive target specificity"
 pass "workflow installer lifecycle and update ownership"
 
 jq -e '
@@ -209,6 +301,10 @@ grep -qE '^[[:space:]]+zstd([[:space:]\\]|$)' "$ROOT/Dockerfile.generic" ||
     fail "generic image does not install zstd"
 grep -qE '^[[:space:]]+zstd([[:space:]\\]|$)' "$ROOT/Dockerfile.cuda" ||
     fail "CUDA image does not install zstd"
+grep -Fxq '.local-checks' "$ROOT/.dockerignore" ||
+    fail "local validation evidence is not excluded from the Docker build context"
+grep -Fxq '.local-fixtures' "$ROOT/.dockerignore" ||
+    fail "local integration fixtures are not excluded from the Docker build context"
 for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
     java_line="$(grep -n '^# Eclipse Temurin ' "$dockerfile" | cut -d: -f1)"
     clojure_line="$(grep -n '^# Clojure CLI\.' "$dockerfile" | cut -d: -f1)"
@@ -251,6 +347,10 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") has no OCI revision label"
     grep -q 'org.opencontainers.image.source=' "$dockerfile" ||
         fail "$(basename "$dockerfile") has no OCI source label"
+    grep -Fq 'ENV LEIN_JAR=/opt/clojure/leiningen-standalone.jar' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not expose a shared Leiningen runtime"
+    grep -Fq '&& lein self-install \' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not preinstall the Leiningen runtime"
 done
 if grep -R -q 'CODEX_UNSAFE_ALLOW_NO_SANDBOX' \
     "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda" "$ROOT/bin"; then
@@ -382,6 +482,9 @@ else
     printf 'skip - LSP message proxy behavior (python3 unavailable on host)\n'
 fi
 if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    python3 "$ROOT/tests/fixtures/check-clojure-network-context.py" \
+        "$workflow_skill/scripts/clojure-development" ||
+        fail "Clojure helper network preflight changed state or missed elevation"
     process_supervisor="$workflow_skill/scripts/clojure-process-supervisor"
     supervisor_fixture="$TEST_ROOT/clojure-supervisor-state"
     supervisor_project="$TEST_ROOT/clojure-supervisor-project"
@@ -425,7 +528,7 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
         namespace_fixture="$TEST_ROOT/clojure-namespace-state"
         namespace_project="$TEST_ROOT/clojure-namespace-project"
         mkdir -p -- "$namespace_fixture" "$namespace_project/.git"
-        bwrap \
+        setsid bwrap \
             --unshare-user \
             --unshare-ipc \
             --unshare-pid \
@@ -445,6 +548,7 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
             --state-root "$namespace_fixture" \
             --namespace-scoped &
         namespace_service_pid=$!
+        namespace_service_pgid="$namespace_service_pid"
         for _ in {1..100}; do
             [[ -p "$namespace_fixture/control.fifo" ]] && break
             kill -0 "$namespace_service_pid" 2>/dev/null || break
@@ -467,11 +571,9 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
                 "$namespace_fixture/control.fifo" namespace-token status \
                 | grep -Fxq stopped ||
                 fail "namespace-scoped supervisor released incomplete process state"
-            kill "$namespace_service_pid"
-            wait "$namespace_service_pid" || [[ $? == 143 ]] ||
-                fail "namespace-scoped supervisor failed during shutdown"
+            stop_namespace_service
         else
-            wait "$namespace_service_pid" 2>/dev/null || true
+            stop_namespace_service
             printf 'skip - namespace-scoped REPL supervisor (Bubblewrap unavailable to this user)\n'
         fi
     fi
@@ -591,6 +693,36 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     grep -Fq ':status :done' "$config_fixture/recovery-eval.out" &&
         grep -Fq ':text "recovered"' "$config_fixture/recovery-eval.out" ||
         fail "nREPL did not recover after the required timeout stop/restart"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-eval disconnect > "$config_fixture/disconnect.out"
+    grep -Fq ':status :connection-failure' "$config_fixture/disconnect.out" &&
+        grep -Fq ':execution-state :unknown' "$config_fixture/disconnect.out" &&
+        grep -Fq 'partial-before-disconnect' "$config_fixture/disconnect.out" ||
+        fail "nREPL disconnection did not retain partial evidence and uncertainty"
+    raw_record="$(
+        bb -e '(println (:raw-record (read-string (slurp *in*))))' \
+            < "$config_fixture/disconnect.out"
+    )"
+    [[ -s "$raw_record" ]] ||
+        fail "nREPL disconnection referenced a missing raw evidence record"
+    if CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-eval retry-after-disconnect \
+        > "$config_fixture/disconnect-retry.out" 2>&1; then
+        fail "nREPL helper retried after an unresolved disconnection"
+    fi
+    grep -Fq 'unknown server execution state' \
+        "$config_fixture/disconnect-retry.out" ||
+        fail "nREPL disconnection retry rejection did not explain the unresolved state"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-stop > "$config_fixture/disconnect-stop.out"
+    grep -Fq ':termination :confirmed' "$config_fixture/disconnect-stop.out" ||
+        fail "nREPL disconnection recovery stop did not confirm termination"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-start > "$config_fixture/decoder-start.out"
     CODEX_PROJECT_ROOT="$config_fixture" \
         CODEX_CLOJURE_STATE_DIR="$config_state" \
         bb "$helper" repl-eval oversized > "$config_fixture/oversized.out"
@@ -1572,15 +1704,20 @@ smoke_image() {
         command -v codex-clojure-lsp-mcp >/dev/null
         command -v codex-lsp-message-proxy >/dev/null
         command -v codex-no-nested-userns >/dev/null
+        command -v lsof >/dev/null
         command -v setsid >/dev/null
         command -v bb >/dev/null
         command -v clj >/dev/null
+        command -v lein >/dev/null
         command -v cljfmt >/dev/null
         command -v clj-kondo >/dev/null
         command -v clojure-lsp >/dev/null
         command -v rlwrap >/dev/null
         command -v socat >/dev/null
         command -v zstd >/dev/null
+        [[ "$LEIN_JAR" == /opt/clojure/leiningen-standalone.jar ]]
+        [[ -r "$LEIN_JAR" ]]
+        lein version
         rlwrap --version
         test -r /etc/codex/requirements.toml
         [[ "$(stat -c %a /etc/codex)" == 755 ]]
@@ -1752,4 +1889,4 @@ else
     fi
 fi
 
-printf 'All host smoke tests passed.\n'
+printf '\n=== ALL HOST SMOKE TESTS PASSED ===\n'

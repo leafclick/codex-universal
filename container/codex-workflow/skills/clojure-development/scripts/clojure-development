@@ -52,6 +52,68 @@
     (apply println xs))
   (System/exit 2))
 
+(declare fifo?)
+
+(defn namespace-identity [value]
+  (when (and (string? value) (re-matches #"net:\[[0-9]+\]" value))
+    value))
+
+(defn helper-network-namespace []
+  (try (namespace-identity (str (fs/read-link "/proc/self/ns/net")))
+       (catch Exception _ nil)))
+
+(defn network-context []
+  ;; Ask the live service, not an inherited value that may describe an old
+  ;; session. This read-only diagnostic does not establish runtime ownership.
+  (if-not (and (fs/executable? supervisor-command) (fifo? control-path))
+    {:status :service-unavailable}
+    (let [result (process/shell
+                  {:continue true :out :string :err :string}
+                  supervisor-command "control" control-path "-" "context")
+          expected (when (zero? (:exit result))
+                     (some-> (re-matches #"network-context (net:\[[0-9]+\])"
+                                         (str/trim (:out result)))
+                             second namespace-identity))
+          actual (helper-network-namespace)]
+      {:status (cond
+                 (not (zero? (:exit result))) :service-unavailable
+                 (nil? expected) :network-context-unavailable
+                 (nil? actual) :requires-elevation
+                 (not= expected actual) :requires-elevation
+                 :else :matching)
+       :reason (cond
+                 (not (zero? (:exit result))) :context-transport-failure
+                 (nil? expected) :service-identity-unavailable
+                 (nil? actual) :helper-identity-unreadable
+                 (not= expected actual) :different-network-namespaces
+                 :else :same-network-namespace)
+       :context-transport (cond
+                            (zero? (:exit result)) :responded
+                            (= "unavailable Timeout" (str/trim (:out result))) :timeout
+                            :else :unavailable)
+       :service-network-namespace expected
+       :helper-network-namespace actual})))
+
+(defn require-runtime-network! [operation]
+  (let [context (network-context)]
+    (when-not (= :matching (:status context))
+      (println
+       (pr-str
+        (merge context
+               {:operation operation
+                :request-state :not-submitted
+                :runtime-execution-state :not-inspected
+                :project-root (str project-root)
+                :state-root (str state-root)
+                :required-execution-context
+                (if (= :requires-elevation (:status context))
+                  :container-shell :fresh-session-service)
+                :message
+                (if (= :requires-elevation (:status context))
+                  "Repeat this exact helper command with container-shell elevation, preserving workdir and inherited session state. This request was not submitted; earlier runtime execution is unchanged. If identity remains unreadable after elevation, retain the failure for diagnosis."
+                  "Container REPL service is unavailable or cannot identify its network context. Use a fresh session with matching installed components; do not substitute an old namespace marker. This request was not submitted; earlier runtime execution is unchanged.")})))
+      (System/exit (if (= :requires-elevation (:status context)) 3 2)))))
+
 (defn environment-timeout [name default]
   (if-let [raw (System/getenv name)]
     (let [value (parse-long raw)]
@@ -300,6 +362,31 @@
       (die "Runtime workdir is not a directory:" (str path)))
     path))
 
+(defn require-runtime-project! [state operation]
+  (when-not (= (str project-root) (:project-root state))
+    (println
+     (pr-str {:status :runtime-project-mismatch
+              :operation operation
+              :request-state :not-submitted
+              :project-root (str project-root)
+              :runtime-project-root (:project-root state)
+              :message "The shared runtime belongs to another or unidentified project. Coordinate with its owning experiment; state retained."}))
+    (System/exit 2)))
+
+(defn require-runtime-recipe! [state]
+  (let [config (validate! (resolved-config))
+        spec (get-in config [:runtimes (:runtime state)])]
+    (when-not (and spec
+                   (= (:command state) (:repl spec))
+                   (= (:runtime-kind state) (:kind spec))
+                   (= (:directory state) (str (command-dir spec))))
+      (println
+       (pr-str {:status :runtime-recipe-mismatch
+                :request-state :not-submitted
+                :runtime (:runtime state)
+                :message "The active runtime does not match this project's configured recipe. Coordinate a confirmed stop/restart; no evaluation submitted."}))
+      (System/exit 2))))
+
 (defn port-from-log []
   (when (fs/exists? log-file)
     (let [text (:out
@@ -315,20 +402,23 @@
   (if-let [state (read-state)]
     (let [reported (supervisor-request state "status")
           owner-status (supervisor-output reported)]
-      (assoc
-       state
-       :status
-       (cond
-         (and (zero? (:exit reported))
-              (str/starts-with? owner-status "running "))
-         (cond
-           (= :starting (:phase state)) :starting
-           (and (:port state) (endpoint-open? (:port state))) :running
-           :else :unreachable)
-         (= "stopped" owner-status) :stale
-         (= "ownership-mismatch" owner-status) :ownership-mismatch
-         (= "termination-timeout" owner-status) :termination-timeout
-         :else :service-unavailable)))
+      (if (and (zero? (:exit reported))
+               (str/starts-with? owner-status "running "))
+        (let [context (network-context)]
+          (assoc state
+                 :status (if (= :starting (:phase state)) :starting :running)
+                 :endpoint-status
+                 (if (= :matching (:status context))
+                   (if (and (:port state) (endpoint-open? (:port state)))
+                     :reachable :unreachable)
+                   :not-checked)
+                 :network-context (:status context)))
+        (assoc state :status
+               (cond
+                 (= "stopped" owner-status) :stale
+                 (= "ownership-mismatch" owner-status) :ownership-mismatch
+                 (= "termination-timeout" owner-status) :termination-timeout
+                 :else :service-unavailable))))
     {:status :stopped}))
 
 (defn terminate-owned! [state]
@@ -353,21 +443,34 @@
       (write-state! (assoc state :phase :cleanup-failed))))
   (die message "; inspect" log-file))
 
+(defn configured-repl! [requested]
+  (let [config (validate! (resolved-config))
+        [runtime spec] (select-runtime! config requested "repl-start")]
+    (when-not (:repl spec)
+      (die "Runtime" runtime "has no persistent REPL recipe"))
+    (command-dir spec)
+    (environment-timeout "CODEX_CLOJURE_REPL_START_TIMEOUT_MS" 30000)
+    [runtime spec]))
+
 (defn start! [requested]
+  ;; Reject locally known errors without asking for network permission. These
+  ;; reads are advisory only; selection and ownership are rechecked under locks.
+  (configured-repl! requested)
+  (when-let [existing (read-state)]
+    (require-runtime-project! existing :repl-start))
+  (require-runtime-network! :repl-start)
   (with-runtime-locks
     (fn []
-      (let [config (validate! (resolved-config))
-            [runtime spec] (select-runtime! config requested "repl-start")
+      (let [[runtime spec] (configured-repl! requested)
             command (:repl spec)
             timeout (environment-timeout
                      "CODEX_CLOJURE_REPL_START_TIMEOUT_MS" 30000)]
-        (when-not command
-          (die "Runtime" runtime "has no persistent REPL recipe"))
         (when-not (fs/executable? supervisor-command)
           (die "Clojure process supervisor is unavailable:" supervisor-command))
         (when-not (fifo? control-path)
           (die "Container REPL service is unavailable; restart this Codex session"))
         (when-let [existing (read-state)]
+          (require-runtime-project! existing :repl-start)
           (let [reported (supervisor-request existing "status")
                 owner-status (supervisor-output reported)]
             (cond
@@ -385,6 +488,9 @@
               directory (str (command-dir spec))
               starting-state {:control-path control-path
                               :control-token token
+                              :project-root (str project-root)
+                              :directory directory
+                              :runtime-kind (:kind spec)
                               :runtime runtime
                               :command command
                               :phase :starting
@@ -450,7 +556,8 @@
   (with-runtime-locks
     (fn []
       (if-let [state (read-state)]
-        (let [reported (supervisor-request state "status")
+        (let [_ (require-runtime-project! state :repl-stop)
+              reported (supervisor-request state "status")
               supervisor-status (str/trim (:out reported))]
           (cond
             (= "ownership-mismatch" supervisor-status)
@@ -654,12 +761,28 @@
 (defn unresolved-evaluation? [state]
   (= :unknown (get-in state [:evaluation :status])))
 
+(defn evaluable-state! []
+  (let [state (or (read-state)
+                  (die "No running configured nREPL; start it first"))]
+    (require-runtime-project! state :repl-eval)
+    (require-runtime-recipe! state)
+    (when (unresolved-evaluation? state)
+      (die
+       "Previous evaluation has unknown server execution state; stop and restart the REPL before another evaluation"))
+    (environment-timeout "CODEX_CLOJURE_EVAL_TIMEOUT_MS" 30000)
+    state))
+
 (defn eval! [form]
+  (evaluable-state!)
+  (require-runtime-network! :repl-eval)
   (with-file-lock
     evaluation-lock-file
     (fn []
+      ;; Never submit using the unlocked preflight snapshot: a competing stop
+      ;; or start may have changed it while this invocation waited for the lock.
+      (evaluable-state!)
       (let [{:keys [status port] :as reported-state} (status)
-            state (dissoc reported-state :status)]
+            state (dissoc reported-state :status :endpoint-status :network-context)]
         (when-not (= :running status)
           (die "No running configured nREPL; start it first"))
         (when (unresolved-evaluation? state)

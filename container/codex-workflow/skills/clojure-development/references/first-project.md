@@ -19,6 +19,11 @@ before starting a persistent REPL.
    dependency, or competing documented test commands. Do not create or run a
    persistent recipe until those choices are resolved.
 
+Validate an authorized configuration with the helper's `config-validate`
+operation. This checks the recipe; it does not authorize or require running
+mapped tests, linters, or formatters. Invoke those commands only when the task
+needs their separate evidence.
+
 An explicit one-off Babashka recipe may be used for an isolated probe when its
 documented command is unambiguous. It does not verify a JVM runtime or a
 persistent REPL. Persistent REPL and probe-worker verification require a

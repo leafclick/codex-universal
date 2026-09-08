@@ -51,6 +51,16 @@ the EDN representation of an argv vector may not exceed 2048 UTF-8 bytes.
 Project examples must remain project-local; no bundled project
 configuration is assumed by this skill.
 
+The active-recipe guard compares only the selected argv, runtime kind and
+workdir. It does not establish freshness of dependency aliases, Lein profiles,
+environment, loaded source or classpath. Restart explicitly when those inputs
+change; matching recipe metadata is not proof that a live JVM has current code.
+
+Copy or hash only named regular raw-record, log and state files, never an
+unfiltered live session-directory glob: reading `service-control.fifo` consumes
+control requests, not a state snapshot. Preserve command exit/running-session
+metadata; yielding a running session is not command completion or a timeout.
+
 Persistent evaluations retain newline boundaries between separate nREPL
 values. Evaluation-error statuses are distinct from `:done`. A deadline or
 connection loss after sending `eval` records `:evaluation {:status :unknown}`,

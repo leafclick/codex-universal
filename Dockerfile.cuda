@@ -39,6 +39,7 @@ RUN apt-get update \
         iputils-ping \
         jq \
         less \
+        lsof \
         libbz2-dev \
         libc6-dev \
         libcurl4-openssl-dev \
@@ -166,13 +167,16 @@ RUN cd /tmp \
     && rm -f linux-install.sh
 
 # Leiningen.
+ENV LEIN_JAR=/opt/clojure/leiningen-standalone.jar
 RUN cd /tmp \
     && wget -q https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
     && chmod +x lein \
     && mv lein /usr/local/bin/lein \
     && mkdir -p /opt/clojure \
     && ln -s /usr/local/bin/lein /opt/clojure/lein \
-    && lein upgrade
+    && lein self-install \
+    && chmod 0644 "$LEIN_JAR" \
+    && lein version
 
 # deps.clj.
 RUN cd /tmp \

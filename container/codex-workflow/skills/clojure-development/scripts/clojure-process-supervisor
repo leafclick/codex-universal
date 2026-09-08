@@ -96,6 +96,7 @@ def request(control_path, token, operation, payload=None):
                 print(result)
                 if (result.startswith("running ")
                         or result.startswith("started ")
+                        or result.startswith("network-context ")
                         or result in ("stopped", "stopped confirmed")):
                     return 0
                 return 4
@@ -243,6 +244,14 @@ def inside(path, root):
 
 def serve(control_path, project_root, state_root, namespace_scoped):
     set_parent_death_signal()
+    try:
+        network_namespace = os.readlink("/proc/self/ns/net")
+    except OSError:
+        # The entrypoint intentionally hides /proc in the service sandbox.
+        # It measures the shared namespace before entering that boundary.
+        network_namespace = os.environ.get("CODEX_CLOJURE_SERVICE_NETNS", "")
+    if not re.fullmatch(r"net:\[[0-9]+\]", network_namespace):
+        network_namespace = "unavailable"
     project_root = canonical(project_root)
     state_root = canonical(state_root)
     control_path = canonical(control_path)
@@ -286,7 +295,12 @@ def serve(control_path, project_root, state_root, namespace_scoped):
             readable, _, _ = select.select([control_fd], [], [], 0.2)
             if not readable:
                 continue
-            chunk = os.read(control_fd, 65536)
+            try:
+                chunk = os.read(control_fd, 65536)
+            except BlockingIOError:
+                # Readiness is advisory for this nonblocking FIFO. A transient
+                # EAGAIN must not tear down the service or its owned runtime.
+                continue
             if not chunk:
                 continue
             buffer += chunk
@@ -303,7 +317,11 @@ def serve(control_path, project_root, state_root, namespace_scoped):
                     request_id = command.get("id", "")
                     supplied_token = command.get("token")
                     operation = command.get("operation")
-                    if operation == "start":
+                    if operation == "context":
+                        # No runtime token or process state is exposed. The
+                        # live FIFO response is diagnostic, not authorization.
+                        response = f"network-context {network_namespace}"
+                    elif operation == "start":
                         if process is not None:
                             response = "already-running"
                         else:
@@ -381,7 +399,7 @@ def main():
     control_parser = subparsers.add_parser("control")
     control_parser.add_argument("path")
     control_parser.add_argument("token")
-    control_parser.add_argument("operation", choices=("status", "stop"))
+    control_parser.add_argument("operation", choices=("status", "stop", "context"))
     start_parser = subparsers.add_parser("start")
     start_parser.add_argument("path")
     start_parser.add_argument("token")

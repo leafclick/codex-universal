@@ -112,7 +112,7 @@ cd /path/to/codex-universal
 CODEX_TEST_SKIP_SYNC=1 ./tests/host-smoke.sh
 ```
 
-A successful run ends with `All host smoke tests passed.` See
+A successful run ends with `=== ALL HOST SMOKE TESTS PASSED ===`. See
 [testing on the host](#testing-on-the-host) for the complete suite, image
 selection, CUDA-only checks, and troubleshooting.
 
@@ -233,6 +233,7 @@ Both contain the same development environment, including:
 - Leiningen
 - deps.clj
 - Git / Git LFS
+- `lsof` for process and endpoint inspection
 - common build and development tools
 
 The CUDA variant additionally contains the NVIDIA CUDA development environment.
@@ -350,7 +351,11 @@ Both image profiles install the latest stable native releases of:
 - `clojure-lsp`
 
 They also install `rlwrap`, so the Clojure CLI's interactive `clj` wrapper has
-line editing and command history available out of the box.
+line editing and command history available out of the box. Leiningen's
+standalone runtime is preinstalled in the immutable image and exposed through
+`LEIN_JAR`; non-root containers can therefore run a configured Leiningen
+project while the container network is disabled, without bootstrapping files
+into the mounted user home.
 
 The build uses each project's supported installer, which selects the native
 binary for the image architecture. `cljfmt` is the standalone GraalVM native
@@ -421,6 +426,21 @@ provider exposes both. If raw output is unavailable, report that limitation,
 preserve usable source locations, and label the result incomplete rather than
 inventing locations or silently filtering edges.
 
+Semantic MCP is optional best-effort tooling. If a connection returns
+`Transport closed`, retain successful results, stop retrying that connection in
+the current client, and report incomplete coverage to the primary. Never
+automatically replay the interrupted request, especially a state-changing one.
+Use IDEA MCP when available with its exact project path; otherwise use bounded
+`rg` and numbered source context, labeled as textual evidence. A fresh/resumed
+Codex process may establish a new connection. Known upstream stdio lifecycle
+reports ([#16899](https://github.com/openai/codex/issues/16899),
+[#35486](https://github.com/openai/codex/issues/35486)) do not by themselves prove
+which recovery is present in a particular installed Codex version. The server
+remains non-required: `required=true`, longer timeouts, and startup grace do not
+provide mid-session reconnection. This limitation alone does not invalidate
+working Clojure runtime/REPL evidence. An HTTP MCP experiment is deferred; no
+HTTP service, reconnect proxy, watchdog or Codex fork is installed here.
+
 The Clojure server runs through a small protocol proxy because the selected
 adapter does not consume `window/showMessage`. Error and warning messages are
 duplicated as `window/logMessage`, which the adapter forwards to Codex. If the
@@ -463,9 +483,19 @@ avoided context and specialization, even for a Luna primary. Architecture,
 probe design, ambiguous behavior, integration, and final review stay with the
 primary. The reader owns its delegated semantic query, bounded source reads,
 and corroborating searches; the parent consumes that evidence and repeats only
-targeted verification where necessary. Small targeted work remains local. No
+targeted verification where necessary. Once delegated, the parent consumes
+that result without repeating its investigation; independent work may continue
+meanwhile. Small targeted work remains local. No
 hook blocks a primary or a worker, so normal targeted `rg`, `sed`, Clojure LSP,
 and IDEA MCP operations remain available.
+
+The workflow guidance requires approval prompts to identify the substantive
+executable, action, and scope. A shell prelude such as `set -Eeuo pipefail`, an
+environment assignment, or a generic shell wrapper is not a meaningful
+approval target, and approving one never authorizes a later command. In
+particular, destructive operations must name their exact action and target in
+their own approval request. This is advisory guidance rather than a CLI policy
+enforcement hook.
 
 The assets require Codex CLI 0.153.4 or newer, which supports
 `~/.codex/agents`, `~/.codex/skills`, and a global `~/.codex/AGENTS.md`.
@@ -498,6 +528,34 @@ disabled. Run its helper as
 <runtime>`, `repl-status`, `repl-eval '(+ 1 2)'`, and `repl-stop`. Evaluations
 are serialized. A timeout means execution may continue and must not be
 blindly retried.
+
+Individual Codex tool sandboxes may have separate loopback namespaces. The
+entrypoint records the session service's network namespace; the helper queries
+the live service's read-only context instead of trusting a caller's possibly
+stale environment marker. It returns
+`:requires-elevation` before startup or evaluation when its current namespace
+differs. Request container-shell elevation for the same absolute helper command
+and project working directory, keeping the inherited `CODEX_CLOJURE_STATE_DIR`.
+This uses the existing sandboxed runtime owner and container-only loopback;
+it does not require another entrypoint, a custom Bubblewrap command, or a new
+service per call. Status and stop use the shared control channel and remain
+available in the inner sandbox. Status separates owned-process liveness from
+TCP reachability. An unavailable namespace identity is reported explicitly;
+no match is inferred from missing or unreadable data. Preflight rejection means
+this request was not submitted, not that earlier evaluation stopped. Babashka
+one-off execution does not use the TCP preflight. The namespace preflight is
+diagnostic and does not itself grant permission to run an elevated command.
+If a worker cannot surface approval, it returns the exact helper command,
+workdir and scope to the parent for approval and execution.
+
+One persistent runtime is supported per chat. Share it among agents working on
+the same parent-coordinated experiment; serialize independent runtime tasks.
+Project and eval-recipe guards prevent accidentally controlling a different
+project or evaluating against changed configuration, but do not provide
+same-project task isolation or security between agents sharing filesystem access.
+The recipe guard compares argv, kind and workdir only; changes to dependency
+aliases, Lein profiles, environment, loaded source or classpath still require
+deliberate reload/restart decisions. Matching metadata does not prove freshness.
 
 Add `.codex/clojure-development.edn` for a shared REPL, selected aliases or
 profiles, and one-off Babashka commands. Commands are argv vectors, not shell
@@ -539,6 +597,9 @@ options, and entry point, then ask only about genuine choices between documented
 profiles or an undocumented REPL dependency. Do not infer a recipe merely from
 `deps.edn`, `project.clj`, or `bb.edn`; those files remain useful evidence for a
 documented proposal. See the skill's [first-project setup](container/codex-workflow/skills/clojure-development/references/first-project.md).
+Validating that recipe means running the helper's `config-validate` operation;
+mapped tests, linters, and formatters remain separate, deliberately selected
+checks.
 
 Discovery of the bundled reader or successful Luna/low spawning does not verify
 the persistent REPL or `clojure_probe`. Verify them with a successful start,
@@ -693,6 +754,11 @@ CODEX_TEST_CUDA_IMAGE=myorg/codex-universal-cuda:latest \
   ./tests/host-smoke.sh
 ```
 
+Keep disposable integration fixtures and local validation records under
+`.local-fixtures/` and `.local-checks/`. Both directories are excluded from
+the Docker build context, so large caches and private probe evidence are not
+sent to the daemon during an image rebuild.
+
 `CODEX_TEST_IMAGE` remains a compatibility alias for
 `CODEX_TEST_GENERIC_IMAGE`.
 
@@ -707,7 +773,7 @@ docker image inspect leafclick/codex-universal-generic:latest >/dev/null
 A successful run ends with:
 
 ```text
-All host smoke tests passed.
+=== ALL HOST SMOKE TESTS PASSED ===
 ```
 
 To run the non-synchronization checks while a Codex container remains active:

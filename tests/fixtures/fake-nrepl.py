@@ -96,6 +96,11 @@ def handle(connection):
                                       "out": "partial-before-timeout\n"})
                         time.sleep(2)
                         send(stream, {"id": request_id, "status": ["done"]})
+                    elif code == "disconnect":
+                        send(stream, {"id": request_id,
+                                      "out": "partial-before-disconnect\n"})
+                        connection.shutdown(socket.SHUT_RDWR)
+                        return
                     elif code == "oversized":
                         send(stream, {"id": request_id, "out": "x" * 1048577})
                     else:
