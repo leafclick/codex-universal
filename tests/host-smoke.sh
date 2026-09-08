@@ -36,7 +36,7 @@ assert_not_contains() {
         fail "expected launcher output not to contain: $unexpected"
 }
 
-for command in bash git grep jq realpath setpriv; do
+for command in bash git grep jq realpath setpriv flock; do
     need "$command"
 done
 
@@ -71,9 +71,64 @@ for script in \
     "$ROOT/container/codex-acp-entrypoint" \
     "$ROOT/container/codex-bwrap-cuda" \
     "$ROOT/container/codex-clojure-lsp-mcp" \
+    "$ROOT/container/codex-universal-workflow-install" \
     "$ROOT/container/install-clojure-tools"; do
     bash -n "$script"
 done
+
+workflow_source="$TEST_ROOT/workflow-source"
+workflow_home="$TEST_ROOT/workflow-home"
+cp -a -- "$ROOT/container/codex-workflow" "$workflow_source"
+mkdir -p -- "$workflow_home"
+workflow_install=(
+    env
+    "HOME=$workflow_home"
+    "CODEX_HOME=$workflow_home/codex-state"
+    "CODEX_UNIVERSAL_WORKFLOW_SOURCE=$workflow_source"
+    "$ROOT/container/codex-universal-workflow-install"
+)
+CODEX_UNIVERSAL_WORKFLOW=0 "${workflow_install[@]}"
+CODEX_UNIVERSAL_WORKFLOW=0 "${workflow_install[@]}"
+test ! -e "$workflow_home/codex-state" ||
+    fail "fresh workflow opt-out modified the shared Codex home"
+"${workflow_install[@]}"
+test -f "$workflow_home/codex-state/agents/code_reader.toml" ||
+    fail "workflow installer did not install code_reader"
+test -f "$workflow_home/codex-state/skills/clojure-development/references/first-project.md" ||
+    fail "workflow installer did not install first-project guidance"
+test -x "$workflow_home/codex-state/skills/clojure-development/scripts/clojure-development" ||
+    fail "workflow installer did not make its helper executable"
+test -x "$workflow_home/codex-state/skills/clojure-development/scripts/clojure-process-supervisor" ||
+    fail "workflow installer did not make its process supervisor executable"
+"${workflow_install[@]}"
+printf '%s\n' '# user override' >> "$workflow_home/codex-state/agents/code_reader.toml"
+"${workflow_install[@]}"
+grep -Fq '# user override' "$workflow_home/codex-state/agents/code_reader.toml" ||
+    fail "workflow installer overwrote a user-modified agent"
+CODEX_UNIVERSAL_WORKFLOW=0 "${workflow_install[@]}"
+CODEX_UNIVERSAL_WORKFLOW=0 "${workflow_install[@]}"
+test -e "$workflow_home/codex-state/agents/clojure_probe.toml" ||
+    fail "workflow opt-out modified the shared Codex home"
+grep -Fq '# user override' "$workflow_home/codex-state/agents/code_reader.toml" ||
+    fail "workflow opt-out modified a user-owned agent"
+CODEX_UNIVERSAL_WORKFLOW=uninstall "${workflow_install[@]}"
+CODEX_UNIVERSAL_WORKFLOW=uninstall "${workflow_install[@]}"
+test ! -e "$workflow_home/codex-state/agents/clojure_probe.toml" ||
+    fail "explicit workflow uninstall retained an unmodified managed asset"
+grep -Fq '# user override' "$workflow_home/codex-state/agents/code_reader.toml" ||
+    fail "explicit workflow uninstall removed a user-modified agent"
+"${workflow_install[@]}"
+test -f "$workflow_home/codex-state/agents/clojure_probe.toml" ||
+    fail "workflow installer did not restore enabled assets"
+grep -Fq '# user override' "$workflow_home/codex-state/agents/code_reader.toml" ||
+    fail "workflow installer overwrote a preserved override after opt-out"
+"${workflow_install[@]}" &
+workflow_pid_one=$!
+"${workflow_install[@]}" &
+workflow_pid_two=$!
+wait "$workflow_pid_one"
+wait "$workflow_pid_two"
+pass "workflow installer lifecycle and update ownership"
 
 jq -e '
     .defaultAction == "SCMP_ACT_ERRNO" and
@@ -125,6 +180,12 @@ grep -Fq -- '--tmpfs /proc' "$ROOT/container/codex-clojure-lsp-mcp" ||
 if grep -Fq -- '--proc /proc' "$ROOT/container/codex-clojure-lsp-mcp"; then
     fail "Clojure LSP MCP bridge mounts procfs inside its private PID namespace"
 fi
+grep -Fq 'AGENT_LSP_OUTPUT_FORMAT json' "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP MCP bridge does not preserve navigation locations as JSON"
+grep -Fq 'LD_LIBRARY_PATH "$jvm_library_path"' "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP MCP bridge does not supply selected JDK libraries"
+grep -Fq -- '--check-java' "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP MCP bridge lacks its in-sandbox Java diagnostic"
 grep -Fq -- '\( -name .git -o -name .codex \) -prune -print0' \
     "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge does not protect nested Git/Codex metadata"
@@ -213,6 +274,12 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") does not install native Clojure tools"
     grep -q '@blackwell-systems/agent-lsp@' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install the LSP MCP bridge"
+    grep -q 'container/codex-lsp-message-proxy /usr/local/bin/codex-lsp-message-proxy' \
+        "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install the LSP message proxy"
+    grep -q 'container/codex-no-nested-userns.c /usr/local/src/codex-no-nested-userns.c' \
+        "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not build the nested-userns filter"
     grep -qE '^[[:space:]]+socat([[:space:]\\]|$)' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install the IntelliJ MCP relay"
     grep -q 'container/libnss_codex.c /usr/local/src/libnss_codex.c' "$dockerfile" ||
@@ -226,10 +293,430 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") does not declare the portable non-root user"
     grep -q 'container/codex-entrypoint /usr/local/bin/codex-entrypoint' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install the portable-user entrypoint"
+    grep -q 'container/codex-workflow/ /usr/local/share/codex-universal/workflow/' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install bundled workflow assets"
+    grep -q 'container/codex-universal-workflow-install /usr/local/bin/codex-universal-workflow-install' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install the workflow updater"
+    grep -q 'workflow -type d -exec chmod 0755' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not make workflow directories traversable"
+    grep -q 'workflow/skills/clojure-development/scripts/\*' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not make Clojure skill scripts executable"
     if grep -qE '^ARG (UID|GID)=' "$dockerfile"; then
         fail "$(basename "$dockerfile") still bakes the host UID/GID into the image"
     fi
 done
+for agent in code_reader clojure_probe mechanical_worker; do
+    agent_file="$ROOT/container/codex-workflow/agents/$agent.toml"
+    [[ -f "$agent_file" ]] || fail "missing bundled agent $agent"
+    grep -Fxq 'model = "gpt-5.6-luna"' "$agent_file" ||
+        fail "bundled agent $agent does not use Luna"
+done
+grep -Fxq 'model_reasoning_effort = "low"' \
+    "$ROOT/container/codex-workflow/agents/code_reader.toml" ||
+    fail "code_reader does not use low reasoning"
+for agent in clojure_probe mechanical_worker; do
+    grep -Fxq 'model_reasoning_effort = "medium"' \
+        "$ROOT/container/codex-workflow/agents/$agent.toml" ||
+        fail "$agent does not use medium reasoning"
+done
+workflow_skill="$ROOT/container/codex-workflow/skills/clojure-development"
+[[ -x "$workflow_skill/scripts/clojure-development" ]] ||
+    fail "Clojure development helper is not executable"
+[[ -x "$workflow_skill/scripts/clojure-process-supervisor" ]] ||
+    fail "Clojure process supervisor is not executable"
+[[ -f "$workflow_skill/references/first-project.md" ]] ||
+    fail "Clojure development first-project guidance is missing"
+grep -Fq 'raw language-server response' \
+    "$ROOT/container/codex-workflow/agents/code_reader.toml" ||
+    fail "code_reader does not preserve semantic-provider diagnostic evidence"
+grep -Fq 'CODEX_CLOJURE_STATE_DIR' "$ROOT/container/codex-entrypoint" ||
+    fail "entrypoint does not establish session-local Clojure state"
+grep -Fq 'clojure-process-supervisor' "$ROOT/container/codex-entrypoint" ||
+    fail "entrypoint does not own the persistent Clojure process service"
+grep -Fq '\( -name .git -o -name .codex \) -prune -print0' \
+    "$ROOT/container/codex-entrypoint" ||
+    fail "persistent Clojure service does not protect Git and Codex metadata"
+grep -Fq -- '--unshare-pid' "$ROOT/container/codex-entrypoint" &&
+    grep -Fq -- '--tmpfs /proc' "$ROOT/container/codex-entrypoint" &&
+    grep -Fq -- '--namespace-scoped' "$ROOT/container/codex-entrypoint" ||
+    fail "persistent Clojure service exposes the outer container procfs"
+if grep -Fq -- '--unshare-net' "$ROOT/container/codex-entrypoint"; then
+    fail "persistent Clojure service cannot share container loopback"
+fi
+grep -Fq '/usr/local/bin/codex-no-nested-userns' \
+    "$ROOT/container/codex-entrypoint" ||
+    fail "persistent Clojure service can create a nested user namespace"
+grep -Fq '/usr/local/bin/codex-no-nested-userns' \
+    "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP bridge can create a nested user namespace"
+if command -v gcc >/dev/null 2>&1; then
+    nested_userns_filter="$TEST_ROOT/codex-no-nested-userns"
+    gcc -std=c11 -O2 -Wall -Wextra -Werror \
+        -o "$nested_userns_filter" \
+        "$ROOT/container/codex-no-nested-userns.c"
+    "$nested_userns_filter" /bin/true ||
+        fail "nested-userns filter rejected an ordinary command"
+    if "$nested_userns_filter" unshare --user /bin/true \
+        >"$TEST_ROOT/nested-userns.out" 2>&1; then
+        fail "nested-userns filter allowed a child user namespace"
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        "$nested_userns_filter" python3 -c \
+            'import threading; t=threading.Thread(target=lambda: None); t.start(); t.join()' ||
+            fail "nested-userns filter blocked ordinary runtime threads"
+    fi
+fi
+grep -Fq '127.0.0.1' "$workflow_skill/scripts/clojure-development" ||
+    fail "Clojure development helper does not constrain nREPL to loopback"
+grep -Fq 'clojure:/usr/local/bin/codex-lsp-message-proxy' \
+    "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure MCP wrapper does not route the server through its message proxy"
+[[ -x "$ROOT/container/codex-lsp-message-proxy" ]] ||
+    fail "LSP message proxy is not executable"
+if command -v python3 >/dev/null 2>&1; then
+    python3 "$ROOT/tests/fixtures/check-lsp-message-proxy.py" \
+        "$ROOT/container/codex-lsp-message-proxy" \
+        "$ROOT/tests/fixtures/fake-lsp-init-error.py" ||
+        fail "LSP message proxy did not expose an initialization-time server error"
+else
+    printf 'skip - LSP message proxy behavior (python3 unavailable on host)\n'
+fi
+if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+    process_supervisor="$workflow_skill/scripts/clojure-process-supervisor"
+    supervisor_fixture="$TEST_ROOT/clojure-supervisor-state"
+    supervisor_project="$TEST_ROOT/clojure-supervisor-project"
+    mkdir -p -- "$supervisor_fixture" "$supervisor_project"
+    "$process_supervisor" service \
+        --control "$supervisor_fixture/control.fifo" \
+        --project-root "$supervisor_project" \
+        --state-root "$supervisor_fixture" &
+    supervisor_pid=$!
+    for _ in {1..100}; do
+        [[ -p "$supervisor_fixture/control.fifo" ]] && break
+        sleep 0.02
+    done
+    printf '[]\n\377\n' > "$supervisor_fixture/control.fifo"
+    "$process_supervisor" control \
+        "$supervisor_fixture/control.fifo" neutral-token status \
+        | grep -Fxq stopped ||
+        fail "malformed FIFO input terminated the Clojure process supervisor"
+    "$process_supervisor" start \
+        --log "$supervisor_fixture/repl.log" \
+        --dir "$supervisor_project" \
+        "$supervisor_fixture/control.fifo" neutral-token \
+        -- bash -c 'trap "" TERM; (trap "" TERM; sleep 30) & wait' \
+        | grep -Eq '^started [0-9]+$' ||
+        fail "Clojure process supervisor did not start an owned process tree"
+    "$process_supervisor" control \
+        "$supervisor_fixture/control.fifo" neutral-token status \
+        | grep -Eq '^running [0-9]+$' ||
+        fail "Clojure process supervisor did not prove cross-command ownership"
+    "$process_supervisor" control \
+        "$supervisor_fixture/control.fifo" neutral-token stop \
+        | grep -Fxq 'stopped confirmed' ||
+        fail "Clojure process supervisor did not confirm process-tree termination"
+    kill "$supervisor_pid"
+    wait "$supervisor_pid" ||
+        fail "Clojure process supervisor failed after confirmed stop"
+    [[ ! -e "$supervisor_fixture/control.fifo" ]] ||
+        fail "Clojure process supervisor left a stale control channel"
+
+    if command -v bwrap >/dev/null 2>&1; then
+        namespace_fixture="$TEST_ROOT/clojure-namespace-state"
+        namespace_project="$TEST_ROOT/clojure-namespace-project"
+        mkdir -p -- "$namespace_fixture" "$namespace_project/.git"
+        bwrap \
+            --unshare-user \
+            --unshare-ipc \
+            --unshare-pid \
+            --unshare-uts \
+            --unshare-cgroup-try \
+            --die-with-parent \
+            --new-session \
+            --ro-bind / / \
+            --dev /dev \
+            --tmpfs /proc \
+            --bind "$TEST_ROOT" "$TEST_ROOT" \
+            --ro-bind "$namespace_project/.git" "$namespace_project/.git" \
+            --chdir "$namespace_project" \
+            -- "$process_supervisor" service \
+            --control "$namespace_fixture/control.fifo" \
+            --project-root "$namespace_project" \
+            --state-root "$namespace_fixture" \
+            --namespace-scoped &
+        namespace_service_pid=$!
+        for _ in {1..100}; do
+            [[ -p "$namespace_fixture/control.fifo" ]] && break
+            kill -0 "$namespace_service_pid" 2>/dev/null || break
+            sleep 0.02
+        done
+        if [[ -p "$namespace_fixture/control.fifo" ]]; then
+            "$process_supervisor" start \
+                --log "$namespace_fixture/repl.log" \
+                --dir "$namespace_project" \
+                "$namespace_fixture/control.fifo" namespace-token \
+                -- bash -c \
+                'setsid bash -c '\''trap "" TERM; sleep 30'\'' & sleep 30' \
+                | grep -Eq '^started [0-9]+$' ||
+                fail "namespace-scoped supervisor did not start its process tree"
+            "$process_supervisor" control \
+                "$namespace_fixture/control.fifo" namespace-token stop \
+                | grep -Fxq 'stopped confirmed' ||
+                fail "namespace-scoped supervisor did not kill a detached descendant"
+            "$process_supervisor" control \
+                "$namespace_fixture/control.fifo" namespace-token status \
+                | grep -Fxq stopped ||
+                fail "namespace-scoped supervisor released incomplete process state"
+            kill "$namespace_service_pid"
+            wait "$namespace_service_pid" || [[ $? == 143 ]] ||
+                fail "namespace-scoped supervisor failed during shutdown"
+        else
+            wait "$namespace_service_pid" 2>/dev/null || true
+            printf 'skip - namespace-scoped REPL supervisor (Bubblewrap unavailable to this user)\n'
+        fi
+    fi
+
+    config_fixture="$TEST_ROOT/clojure-config"
+    config_state="$TEST_ROOT/clojure-runtime"
+    helper="$workflow_skill/scripts/clojure-development"
+    fake_nrepl="$ROOT/tests/fixtures/fake-nrepl.py"
+    mkdir -p -- "$config_fixture/.codex" "$config_fixture/bb-work"
+    mkdir -p -- "$config_state"
+    "$process_supervisor" service \
+        --control "$config_state/service-control.fifo" \
+        --project-root "$config_fixture" \
+        --state-root "$config_state" &
+    config_service_pid=$!
+    for _ in {1..100}; do
+        [[ -p "$config_state/service-control.fifo" ]] && break
+        sleep 0.02
+    done
+    [[ -p "$config_state/service-control.fifo" ]] ||
+        fail "neutral Clojure REPL service did not become ready"
+    printf '%s\n' \
+        '{:default-runtime :dev :runtimes {:dev {:kind :deps :repl ["clojure" "-M:dev" "-m" "nrepl.cmdline" "--bind" "127.0.0.1" "--port" "0"]}} :tests {:unit {:command ["clojure" "-M:test"] :fresh-process :when-required}}}' \
+        > "$config_fixture/.codex/clojure-development.edn"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$workflow_skill/scripts/clojure-development" config-validate \
+        | grep -Fxq '{:status :valid}' ||
+        fail "Clojure development config validation rejected a valid argv configuration"
+    printf '%s\n' \
+        '{:default-runtime :dev :runtimes {:dev {:kind :deps :repl "clojure -M:dev"}}}' \
+        > "$config_fixture/.codex/clojure-development.edn"
+    if CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$workflow_skill/scripts/clojure-development" config-validate \
+        >"$config_fixture/invalid.out" 2>&1; then
+        fail "Clojure development config accepted a shell-string command"
+    fi
+    grep -Fq 'argv vector' "$config_fixture/invalid.out" ||
+        fail "Clojure development config rejection is not useful"
+    long_command_arg="$(printf '%02049d' 0)"
+    printf \
+        '{:runtimes {:dev {:kind :lein :repl ["%s"]}}}\n' \
+        "$long_command_arg" \
+        > "$config_fixture/.codex/clojure-development.edn"
+    if CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" config-validate \
+        > "$config_fixture/oversized-command.out" 2>&1; then
+        fail "Clojure config accepted a command larger than its service transport"
+    fi
+    grep -Fq '2048-byte process-service transport limit' \
+        "$config_fixture/oversized-command.out" ||
+        fail "oversized Clojure command rejection was not useful"
+
+    printf '%s\n' \
+        "{:runtimes {:only {:kind :lein :repl [\"python3\" \"$fake_nrepl\"]}}}" \
+        > "$config_fixture/.codex/clojure-development.edn"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-start > "$config_fixture/start.out"
+    grep -Fq ':runtime :only' "$config_fixture/start.out" &&
+        grep -Fq ':status :running' "$config_fixture/start.out" ||
+        fail "single-runtime REPL startup without a default failed"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-eval multiple-values > "$config_fixture/multiple.out"
+    grep -Fq ':status :done' "$config_fixture/multiple.out" &&
+        grep -Fq ':text "\none\n\ncafé"' "$config_fixture/multiple.out" &&
+        grep -Fq ':value-count 4' "$config_fixture/multiple.out" ||
+        fail "nREPL evaluation did not preserve separate values"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-eval eval-error > "$config_fixture/eval-error.out"
+    grep -Fq ':status :evaluation-error' "$config_fixture/eval-error.out" ||
+        fail "nREPL evaluation error was reported as successful"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        CODEX_CLOJURE_EVAL_TIMEOUT_MS=100 \
+        bb "$helper" repl-eval timeout > "$config_fixture/timeout.out"
+    grep -Fq ':status :timeout' "$config_fixture/timeout.out" &&
+        grep -Fq ':execution-state :unknown' "$config_fixture/timeout.out" &&
+        grep -Fq 'partial-before-timeout' "$config_fixture/timeout.out" ||
+        fail "nREPL timeout did not retain partial evidence and uncertainty"
+    raw_record="$(
+        bb -e '(println (:raw-record (read-string (slurp *in*))))' \
+            < "$config_fixture/timeout.out"
+    )"
+    [[ -s "$raw_record" ]] ||
+        fail "nREPL timeout referenced a missing raw evidence record"
+    if CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-eval retry \
+        > "$config_fixture/retry.out" 2>&1; then
+        fail "nREPL helper retried after an unresolved timeout"
+    fi
+    grep -Fq 'unknown server execution state' "$config_fixture/retry.out" ||
+        fail "nREPL retry rejection did not explain the unresolved state"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-status > "$config_fixture/timeout-status.out"
+    grep -Fq ':evaluation {:status :unknown' "$config_fixture/timeout-status.out" ||
+        fail "nREPL status lost unresolved timeout state"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-stop > "$config_fixture/stop.out"
+    grep -Fq ':termination :confirmed' "$config_fixture/stop.out" ||
+        fail "nREPL stop did not confirm process termination"
+    [[ ! -e "$config_state/state.edn" ]] ||
+        fail "nREPL stop removed neither the process nor its state"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-start > "$config_fixture/recovery-start.out"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-eval recovered > "$config_fixture/recovery-eval.out"
+    grep -Fq ':status :done' "$config_fixture/recovery-eval.out" &&
+        grep -Fq ':text "recovered"' "$config_fixture/recovery-eval.out" ||
+        fail "nREPL did not recover after the required timeout stop/restart"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-eval oversized > "$config_fixture/oversized.out"
+    grep -Fq ':status :connection-failure' "$config_fixture/oversized.out" &&
+        grep -Fq 'exceeds the bounded decoder limit' "$config_fixture/oversized.out" ||
+        fail "nREPL decoder accepted an unbounded response field"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-stop > "$config_fixture/recovery-stop.out"
+    grep -Fq ':termination :confirmed' "$config_fixture/recovery-stop.out" ||
+        fail "nREPL recovery stop did not confirm termination"
+
+    printf '%s\n' \
+        '{:default-runtime :jvm :runtimes {:jvm {:kind :lein :repl ["unused"]} :bb {:kind :babashka :workdir "bb-work" :one-off ["bb" "-e"]}}}' \
+        > "$config_fixture/.codex/clojure-development.edn"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" one-off '(print (System/getProperty "user.dir"))' bb \
+        > "$config_fixture/bb-workdir.out"
+    grep -Fq ":status :done" "$config_fixture/bb-workdir.out" &&
+        grep -Fq "$config_fixture/bb-work" "$config_fixture/bb-workdir.out" ||
+        fail "Babashka one-off ignored its configured workdir"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        CODEX_CLOJURE_ONE_OFF_TIMEOUT_MS=100 \
+        bb "$helper" one-off '(Thread/sleep 2000)' bb \
+        > "$config_fixture/bb-timeout.out"
+    grep -Fq ':status :timeout' "$config_fixture/bb-timeout.out" &&
+        grep -Fq ':termination-confirmed true' "$config_fixture/bb-timeout.out" ||
+        fail "Babashka one-off timeout did not confirm termination"
+
+    descendant_marker="$TEST_ROOT/one-off-descendant-leak"
+    printf '%s\n' \
+        "{:runtimes {:bb {:kind :babashka :one-off [\"bash\" \"-c\" \"python3 -c 'import os,time; os.setsid(); time.sleep(3); open(\\\"$descendant_marker\\\",\\\"w\\\").write(\\\"leaked\\\")' & wait\" \"fixture\"]}}}" \
+        > "$config_fixture/.codex/clojure-development.edn"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        CODEX_CLOJURE_ONE_OFF_TIMEOUT_MS=100 \
+        bb "$helper" one-off ignored > "$config_fixture/bb-tree-timeout.out"
+    grep -Fq ':status :timeout' "$config_fixture/bb-tree-timeout.out" &&
+        grep -Fq ':termination-confirmed true' "$config_fixture/bb-tree-timeout.out" ||
+        fail "Babashka process-tree timeout did not confirm termination"
+    sleep 1.2
+    [[ ! -e "$descendant_marker" ]] ||
+        fail "Babashka timeout left a descendant process running"
+
+    completed_descendant_marker="$TEST_ROOT/one-off-completed-descendant-leak"
+    printf '%s\n' \
+        "{:runtimes {:bb {:kind :babashka :one-off [\"bash\" \"-c\" \"python3 -c 'import os,time; os.setsid(); time.sleep(3); open(\\\"$completed_descendant_marker\\\",\\\"w\\\").write(\\\"leaked\\\")' &\" \"fixture\"]}}}" \
+        > "$config_fixture/.codex/clojure-development.edn"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" one-off ignored > "$config_fixture/bb-tree-completed.out"
+    grep -Fq ':status :done' "$config_fixture/bb-tree-completed.out" &&
+        grep -Fq ':termination-confirmed true' "$config_fixture/bb-tree-completed.out" ||
+        fail "Babashka normal completion did not clean up surviving descendants"
+    sleep 1.2
+    [[ ! -e "$completed_descendant_marker" ]] ||
+        fail "Babashka normal completion left a descendant process running"
+
+    printf '%s\n' \
+        '{:runtimes {:bb {:kind :babashka :one-off ["bash" "-c" "printf %4095s x | tr x a; printf é" "fixture"]}}}' \
+        > "$config_fixture/.codex/clojure-development.edn"
+    CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" one-off ignored > "$config_fixture/bb-unicode.out"
+    grep -Fq 'é' "$config_fixture/bb-unicode.out" &&
+        ! grep -Fq '�' "$config_fixture/bb-unicode.out" ||
+        fail "Babashka output corrupted UTF-8 split across a read boundary"
+
+    for unsafe_options in \
+        '"--bind" "0.0.0.0"' \
+        '"--bind=0.0.0.0"' \
+        '"--port=4444"' \
+        '"-b" "0.0.0.0"' \
+        '"-p" "4444"'; do
+        printf \
+            '{:runtimes {:dev {:kind :deps :repl ["clojure" "-M:dev" "-m" "nrepl.cmdline" "--bind" "127.0.0.1" "--port" "0" %s]}}}\n' \
+            "$unsafe_options" \
+            > "$config_fixture/.codex/clojure-development.edn"
+        if CODEX_PROJECT_ROOT="$config_fixture" \
+            CODEX_CLOJURE_STATE_DIR="$config_state" \
+            bb "$helper" config-validate \
+            > "$config_fixture/unsafe-option.out" 2>&1; then
+            fail "Clojure config accepted conflicting option $unsafe_options"
+        fi
+    done
+
+    mkdir -p -- "$config_fixture/unsafe-state"
+    ln -s -- "$config_fixture/unsafe-state" "$TEST_ROOT/clojure-state-link"
+    if CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$TEST_ROOT/clojure-state-link" \
+        bb "$helper" repl-status \
+        > "$config_fixture/state-overlap.out" 2>&1; then
+        fail "Clojure helper accepted a symlinked state directory inside the project"
+    fi
+    grep -Fq 'must not be the filesystem root or overlap the project' \
+        "$config_fixture/state-overlap.out" ||
+        fail "Clojure state overlap rejection was not useful"
+    [[ -z "$(find "$config_fixture/unsafe-state" -mindepth 1 -print -quit)" ]] ||
+        fail "Clojure helper wrote state through an overlapping symlink"
+
+    printf '%s\n' \
+        "{:runtimes {:wildcard {:kind :lein :repl [\"python3\" \"$fake_nrepl\" \"--host\" \"0.0.0.0\"]}}}" \
+        > "$config_fixture/.codex/clojure-development.edn"
+    if CODEX_PROJECT_ROOT="$config_fixture" \
+        CODEX_CLOJURE_STATE_DIR="$config_state" \
+        bb "$helper" repl-start \
+        > "$config_fixture/wildcard.out" 2>&1; then
+        fail "Clojure helper accepted a wildcard nREPL listener"
+    fi
+    grep -Fq 'not restricted to loopback' "$config_fixture/wildcard.out" ||
+        fail "wildcard listener rejection was not useful"
+    [[ ! -e "$config_state/state.edn" ]] ||
+        fail "failed REPL startup retained stale owned-process state"
+    [[ -z "$(find "$config_state" -maxdepth 1 -name 'response-*' -print -quit)" ]] ||
+        fail "Clojure REPL service left an orphaned response file"
+    kill "$config_service_pid"
+    wait "$config_service_pid" ||
+        fail "neutral Clojure REPL service failed during shutdown"
+    [[ ! -e "$config_state/service-control.fifo" ]] ||
+        fail "neutral Clojure REPL service left a stale control channel"
+    pass "Clojure development runtime lifecycle and bounded probe evidence"
+else
+    printf 'skip - Clojure development runtime checks (bb or python3 unavailable on host)\n'
+fi
 grep -q 'container/codex-bwrap-cuda /usr/bin/bwrap' "$ROOT/Dockerfile.cuda" ||
     fail "CUDA image does not preserve NVIDIA devices inside Codex Bubblewrap"
 grep -q 'mv /usr/bin/bwrap /usr/bin/bwrap.real' "$ROOT/Dockerfile.cuda" ||
@@ -477,6 +964,7 @@ for output in "$new_output" "$resume_output"; do
     assert_contains "$output" 'mcp_servers.clojure_lsp.enabled_tools=['
     assert_contains "$output" '"start_lsp"'
     assert_contains "$output" '"find_references"'
+    assert_not_contains "$output" '"blast_radius"'
     assert_contains "$output" '"safe_apply_edit"'
     assert_not_contains "$output" '"run_tests"'
     assert_contains "$output" 'mcp_servers.clojure_lsp.default_tools_approval_mode="writes"'
@@ -1029,6 +1517,7 @@ smoke_image() {
         --security-opt "seccomp=$ROOT/security/seccomp/codex-bwrap.json"
         --user "$runtime_uid:$runtime_gid"
         -e HOME=/home/codex
+        -w /workspace
         --entrypoint /usr/local/bin/codex-entrypoint
     )
 
@@ -1081,6 +1570,9 @@ smoke_image() {
         command -v codex-acp-entrypoint >/dev/null
         command -v agent-lsp >/dev/null
         command -v codex-clojure-lsp-mcp >/dev/null
+        command -v codex-lsp-message-proxy >/dev/null
+        command -v codex-no-nested-userns >/dev/null
+        command -v setsid >/dev/null
         command -v bb >/dev/null
         command -v clj >/dev/null
         command -v cljfmt >/dev/null
@@ -1095,6 +1587,12 @@ smoke_image() {
         [[ "$(stat -c %u /usr/local/bin/codex-entrypoint)" == 0 ]]
         [[ "$(stat -c %u /usr/local/share/npm-global/bin/codex)" == 0 ]]
         [[ "$(stat -c %u /etc/codex/requirements.toml)" == 0 ]]
+        test -x /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-development
+        test -x /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-process-supervisor
+        test -p "$CODEX_CLOJURE_STATE_DIR/service-control.fifo"
+        /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-process-supervisor \
+            control "$CODEX_CLOJURE_STATE_DIR/service-control.fifo" neutral status \
+            | grep -Fxq stopped
         nss_module="$(find /usr/lib -name libnss_codex.so.2 -print -quit)"
         [[ -n "$nss_module" && "$(stat -c %u:%g:%a "$nss_module")" == 0:0:644 ]]
         bwrap \
@@ -1115,6 +1613,23 @@ smoke_image() {
                 chmod 0700 /tmp/sandbox-tmp-is-executable
                 /tmp/sandbox-tmp-is-executable
             '\''
+        fixture_dir="$HOME/clojure-lsp-smoke"
+        mkdir -p "$fixture_dir/src/example" "$fixture_dir/test/example" "$fixture_dir/dev"
+        printf "%s\n" \
+            "{:paths [\"src\" \"test\" \"dev\"] :aliases {:dev {} :test {}}}" \
+            > "$fixture_dir/deps.edn"
+        printf "%s\n" \
+            "(ns example.core)" \
+            "(defn public-fn [] :ok)" \
+            > "$fixture_dir/src/example/core.clj"
+        printf "%s\n" \
+            "(ns example.core-test" \
+            "  (:require [clojure.test :refer [deftest is]]" \
+            "            [example.core :as sut]))" \
+            "(deftest public-fn-test" \
+            "  (is (= :ok (sut/public-fn))))" \
+            > "$fixture_dir/test/example/core_test.clj"
+        cd "$fixture_dir"
         coproc MCP_BRIDGE {
             exec codex-clojure-lsp-mcp clojure:clojure-lsp
         }
@@ -1134,9 +1649,36 @@ smoke_image() {
                 break
             fi
         done
+        (( mcp_ready == 1 ))
+        lsp_ready=0
+        printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_lsp","arguments":{"root_dir":"%s","language_id":"clojure","ready_timeout_seconds":60}}}\n' \
+            "$fixture_dir" >&"$mcp_input_fd"
+        for _ in {1..75}; do
+            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
+               jq -e \
+                   '\''.id == 2 and .result.content[0].text == "LSP server started successfully"'\'' \
+                   <<<"$mcp_line" >/dev/null 2>&1; then
+                lsp_ready=1
+                break
+            fi
+        done
+        (( lsp_ready == 1 ))
+        references_ready=0
+        printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_references","arguments":{"file_path":"%s/src/example/core.clj","line":2,"column":7,"language_id":"clojure","include_declaration":true}}}\n' \
+            "$fixture_dir" >&"$mcp_input_fd"
+        for _ in {1..75}; do
+            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
+               jq -e --arg test_file "$fixture_dir/test/example/core_test.clj" \
+                   '\''.id == 3 and ([.result.content[]?.text] | join("\\n") | contains($test_file))'\'' \
+                   <<<"$mcp_line" >/dev/null 2>&1; then
+                references_ready=1
+                break
+            fi
+        done
         kill "$mcp_pid" 2>/dev/null || true
         wait "$mcp_pid" 2>/dev/null || true
-        (( mcp_ready == 1 ))
+        (( references_ready == 1 ))
+        codex-clojure-lsp-mcp --check-java >/dev/null
         codex --version
         bb --version
         cljfmt --version

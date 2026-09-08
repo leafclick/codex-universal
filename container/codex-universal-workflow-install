@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+source_root="${CODEX_UNIVERSAL_WORKFLOW_SOURCE:-/usr/local/share/codex-universal/workflow}"
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+state_root="$codex_home/codex-universal-workflow"
+workflow_mode="${CODEX_UNIVERSAL_WORKFLOW:-1}"
+
+case "$workflow_mode" in
+    0) exit 0 ;;
+    1|uninstall) ;;
+    *) echo "CODEX_UNIVERSAL_WORKFLOW must be 0, 1, or uninstall" >&2; exit 2 ;;
+esac
+
+[[ -d "$source_root" ]] || { echo "codex-universal workflow assets are unavailable" >&2; exit 1; }
+mkdir -p -- "$state_root"
+exec 9>"$state_root/.install.lock"
+flock -w 10 9 || { echo "codex-universal workflow update is busy" >&2; exit 1; }
+
+sync_asset() {
+    local relative source target marker expected previous current temporary
+    relative="$1"
+    source="$source_root/$relative"
+    target="$codex_home/$relative"
+    marker="$state_root/${relative//\//__}.sha256"
+    expected="$(sha256sum -- "$source" | awk '{print $1}')"
+    if [[ -e "$target" ]]; then
+        current="$(sha256sum -- "$target" | awk '{print $1}')"
+        previous="$(cat -- "$marker" 2>/dev/null || true)"
+        if [[ "$current" != "$expected" && "$current" != "$previous" ]]; then
+            echo "codex-universal: preserving user-modified $target" >&2
+            return
+        fi
+    fi
+    mkdir -p -- "$(dirname -- "$target")"
+    temporary="$(mktemp -- "${target}.tmp.XXXXXX")"
+    install -m 0644 -- "$source" "$temporary"
+    mv -f -- "$temporary" "$target"
+    temporary="$(mktemp -- "${marker}.tmp.XXXXXX")"
+    printf '%s\n' "$expected" > "$temporary"
+    mv -f -- "$temporary" "$marker"
+}
+
+disable_asset() {
+    local relative target marker expected current
+    relative="$1"
+    target="$codex_home/$relative"
+    marker="$state_root/${relative//\//__}.sha256"
+    [[ -e "$target" && -f "$marker" ]] || return 0
+    expected="$(cat -- "$marker")"
+    current="$(sha256sum -- "$target" | awk '{print $1}')"
+    if [[ "$current" == "$expected" ]]; then
+        rm -f -- "$target" "$marker"
+    else
+        echo "codex-universal: preserving user-modified $target while disabling workflow" >&2
+    fi
+}
+
+assets=(
+    agents/code_reader.toml
+    agents/clojure_probe.toml
+    agents/mechanical_worker.toml
+    skills/clojure-development/SKILL.md
+    skills/clojure-development/references/schema.md
+    skills/clojure-development/references/first-project.md
+    skills/clojure-development/references/deps.md
+    skills/clojure-development/references/leiningen.md
+    skills/clojure-development/references/babashka.md
+    skills/clojure-development/scripts/clojure-development
+    skills/clojure-development/scripts/clojure-process-supervisor
+    AGENTS.md
+)
+
+case "$workflow_mode" in
+    uninstall)
+        echo "codex-universal: uninstalling unmodified managed workflow assets from shared CODEX_HOME" >&2
+        for asset in "${assets[@]}"; do disable_asset "$asset"; done
+        exit 0
+        ;;
+    1) ;;
+esac
+
+for agent in code_reader clojure_probe mechanical_worker; do
+    sync_asset "agents/$agent.toml"
+done
+for asset in \
+    skills/clojure-development/SKILL.md \
+    skills/clojure-development/references/schema.md \
+    skills/clojure-development/references/first-project.md \
+    skills/clojure-development/references/deps.md \
+    skills/clojure-development/references/leiningen.md \
+    skills/clojure-development/references/babashka.md; do
+    sync_asset "$asset"
+done
+sync_asset "skills/clojure-development/scripts/clojure-development"
+sync_asset "skills/clojure-development/scripts/clojure-process-supervisor"
+for helper in clojure-development clojure-process-supervisor; do
+    helper_target="$codex_home/skills/clojure-development/scripts/$helper"
+    helper_source="$source_root/skills/clojure-development/scripts/$helper"
+    if [[ "$(sha256sum -- "$helper_target" | awk '{print $1}')" == "$(sha256sum -- "$helper_source" | awk '{print $1}')" ]]; then
+        chmod 0755 -- "$helper_target"
+    fi
+done
+
+# Codex reads a global AGENTS.md before repository-scoped instructions. Do not
+# merge into a user-owned file: a pre-existing file is authoritative.
+if [[ ! -e "$codex_home/AGENTS.md" ]]; then
+    sync_asset AGENTS.md
+else
+    marker="$state_root/AGENTS.md.sha256"
+    if [[ -f "$marker" ]]; then
+        sync_asset AGENTS.md
+    else
+        echo "codex-universal: preserving existing global $codex_home/AGENTS.md; routing guidance is not injected" >&2
+    fi
+fi

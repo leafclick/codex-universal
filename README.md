@@ -383,7 +383,12 @@ private PID namespace and an empty `/proc`. It can update the working tree and
 its caches, but `.git` and `.codex` remain read-only; Codex prompts before
 invoking MCP tools declared as write-capable. This preserves the same outer
 boundary as ordinary Codex commands without exposing other container
-processes through procfs. Set a persistent per-project override with:
+processes through procfs. The bridge derives the selected image JDK's library
+directories and carries required inherited native-library paths into that
+boundary, so Clojure CLI classpath discovery remains usable despite the empty
+`/proc`. A child seccomp filter also prevents nested user namespaces from
+remounting writable parents around protected `.git` or `.codex` paths. Set a
+persistent per-project override with:
 
 ```bash
 run-codex --set-clojure-mcp my-project on
@@ -408,11 +413,145 @@ The integration follows the persistent MCP/LSP design described in the
 through a private loopback relay, avoiding a second language-server index and
 exposing the IDE's project-aware tools to Codex.
 
-For Clojure repositories using these images, copy and adapt the
-[suggested `AGENTS.md` interactive-development section](docs/clojure-agents.md).
-Its baseline workflow is editor-independent: Babashka tasks, native LSP and
-lint/format tools, a persistent nREPL, watchers, and a fresh JVM for final
-verification. IDEA MCP is documented as an optional semantic provider.
+Semantic navigation can be incomplete while indexing is in progress. Treat
+synthetic names, locationless references, and self-edges as diagnostic clues,
+not proof of a Clojure LSP or adapter defect. Record the MCP provider, symbol,
+and query; compare raw language-server output with the adapter result when the
+provider exposes both. If raw output is unavailable, report that limitation,
+preserve usable source locations, and label the result incomplete rather than
+inventing locations or silently filtering edges.
+
+The Clojure server runs through a small protocol proxy because the selected
+adapter does not consume `window/showMessage`. Error and warning messages are
+duplicated as `window/logMessage`, which the adapter forwards to Codex. If the
+server reports a type-1 error before returning its initialize result, the proxy
+turns that result into an initialization error, so `start_lsp` cannot report a
+successful start after a known classpath/indexing failure. Later server errors
+remain visible notifications; readiness still requires semantic evidence.
+
+The terminal bridge requests agent-lsp JSON output so native LSP URI/range
+locations survive navigation results. This is a location-preservation
+mitigation, not a repair for derived impact analysis. `blast_radius` is not
+exposed while its adapter cache and Clojure caller/test/export classification
+remain unverified; use `find_references` and `find_callers`, retaining the
+reported locations and treating incomplete indexing explicitly. A successful
+MCP initialize handshake proves connection only. It does not prove classpath
+resolution or indexing readiness: report explicit server/classpath failures
+and establish readiness with project-appropriate semantic evidence rather than
+assuming a particular symbol or namespace count.
+
+For Clojure repositories, the bundled `clojure-development` skill supplies the
+editor-independent workflow. A project needs only its own invariants in
+`AGENTS.md` and an optional `.codex/clojure-development.edn` recording selected
+runtime recipes; see [Clojure development](#bundled-codex-routing-and-clojure-development).
+IDEA MCP remains an optional semantic provider.
+
+## Bundled Codex routing and Clojure development
+
+New `run-codex` containers install a small managed workflow into the mounted
+Codex home. It provides three custom agents without changing the selected
+primary model or its reasoning effort:
+
+| Agent | Fixed model and effort | Use |
+| --- | --- | --- |
+| `code_reader` | `gpt-5.6-luna`, low | Read-heavy exploration and compact evidence. |
+| `clojure_probe` | `gpt-5.6-luna`, medium | Execute configured Clojure probes and reduce runtime output. |
+| `mechanical_worker` | `gpt-5.6-luna`, medium | Specified repetitive edits and deterministic focused checks. |
+
+The global routing instruction is advisory: it recommends delegation based on
+avoided context and specialization, even for a Luna primary. Architecture,
+probe design, ambiguous behavior, integration, and final review stay with the
+primary. The reader owns its delegated semantic query, bounded source reads,
+and corroborating searches; the parent consumes that evidence and repeats only
+targeted verification where necessary. Small targeted work remains local. No
+hook blocks a primary or a worker, so normal targeted `rg`, `sed`, Clojure LSP,
+and IDEA MCP operations remain available.
+
+The assets require Codex CLI 0.153.4 or newer, which supports
+`~/.codex/agents`, `~/.codex/skills`, and a global `~/.codex/AGENTS.md`.
+Inspect active agent roles in the Codex agent picker and verify the skill with
+`$clojure-development`. Routing is advisory, not enforced: Codex has no
+supported parent-only routing hook in this version. A pre-existing global
+`AGENTS.md` is intentionally preserved and cannot be safely composed by the
+installer. To retain central routing in that case, add one reference to the
+image-owned routing text in your global file, or move its short text there;
+projects do not need a copy. Set `CODEX_UNIVERSAL_WORKFLOW=0 run-codex ...` to
+skip workflow installation and updates for that launch without modifying the
+shared Codex home. Already-installed assets remain available. To explicitly
+remove all unmodified managed assets from the shared home, run once with
+`CODEX_UNIVERSAL_WORKFLOW=uninstall`; this global operation can affect other
+active containers, preserves user-modified assets, and is reversed by the next
+enabled (`1`) launch.
+
+The skill uses session-local `/tmp/codex-clojure.*` state for process ownership,
+endpoint, log, client-session, and full evaluation records. An entrypoint-owned
+service keeps the configured REPL alive across separate Codex tool-command
+sandboxes. The service has its own Bubblewrap boundary: working-tree and cache
+writes are allowed, while `.git` and `.codex` stay recursively read-only and a
+private PID namespace with an empty `/proc` prevents outer-mount bypasses. An
+inherited seccomp filter rejects nested user namespaces that could remount a
+writable parent around those protected paths. It
+never publishes an nREPL port or uses a host JVM. The launcher permits loopback
+binding solely for this container-local use; external network access remains
+disabled. Run its helper as
+`~/.codex/skills/clojure-development/scripts/clojure-development repl-start
+<runtime>`, `repl-status`, `repl-eval '(+ 1 2)'`, and `repl-stop`. Evaluations
+are serialized. A timeout means execution may continue and must not be
+blindly retried.
+
+Add `.codex/clojure-development.edn` for a shared REPL, selected aliases or
+profiles, and one-off Babashka commands. Commands are argv vectors, not shell
+strings, and their EDN representation is bounded to 2048 UTF-8 bytes for the
+atomic process-service transport. This compact example names a Clojure CLI
+development profile and a one-off Babashka runtime:
+
+```clojure
+{:default-runtime :dev
+ :runtimes {:dev {:kind :deps
+                  :repl ["clojure" "-M:dev" "-m" "nrepl.cmdline"
+                         "--bind" "127.0.0.1" "--port" "0"]}
+            :bb {:kind :babashka :one-off ["bb" "-e"]}}
+ :tests {:unit {:command ["clojure" "-M:test"] :fresh-process :when-required}
+         :integration {:command ["clojure" "-M:integration-test"] :fresh-process :always}}
+ :validation {:lint-command ["clj-kondo" "--lint"]
+              :format-command ["cljfmt" "check"]
+              :format-fix-command ["cljfmt" "fix"]}}
+```
+
+`deps` preserves its selected `-M`, `-X`, or legacy `-A` semantics; the helper
+does not translate them. Leiningen preserves its selected profiles and
+`repl-options`; a Leiningen recipe is valid only when those project settings
+select loopback and an ephemeral port, which the helper also verifies from the
+actual listener. Babashka probes use the explicit `one-off FORM [runtime]`
+operation; output and overall runtime are bounded, and timeout or normal
+leader exit cleans up the complete process group before termination is
+reported as confirmed. Persistent nREPL is for retained state and is not
+evidence for JVM-only behavior. A `bb` task can launch a JVM, so classify the
+invoked runtime. Use configured `:always` tests
+for integration suites and a fresh process after classpath, JVM-option, native
+backend, generated-class, or global-state changes.
+
+For a first Clojure project without this file, inspect documented commands and
+configuration first, including `AGENTS.md`, README/developer documentation,
+`deps.edn`, `project.clj`, `bb.edn`, and relevant tool configuration. Propose a
+complete argv recipe that preserves the documented profile or alias, JVM
+options, and entry point, then ask only about genuine choices between documented
+profiles or an undocumented REPL dependency. Do not infer a recipe merely from
+`deps.edn`, `project.clj`, or `bb.edn`; those files remain useful evidence for a
+documented proposal. See the skill's [first-project setup](container/codex-workflow/skills/clojure-development/references/first-project.md).
+
+Discovery of the bundled reader or successful Luna/low spawning does not verify
+the persistent REPL or `clojure_probe`. Verify them with a successful start,
+one probe that defines a harmless sentinel, a separate probe that consumes the
+retained sentinel, and a status/stop sequence that confirms the same runtime
+and termination. Project tests are a separate correctness gate, not a
+prerequisite for exploratory REPL verification.
+
+For a migration, a large project `AGENTS.md` can shrink to project invariants
+plus: `Clojure runtime commands: see .codex/clojure-development.edn.` The
+full schema and runtime references are bundled with the skill; the legacy
+[copyable guidance](docs/clojure-agents.md) remains useful for installations
+that intentionally disable the bundled workflow.
 
 ## Codex sandboxing inside Docker
 

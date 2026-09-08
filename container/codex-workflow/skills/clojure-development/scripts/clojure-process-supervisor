@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+"""Session owner for configured REPL processes, controlled through a FIFO."""
+
+import argparse
+import ctypes
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+
+REQUEST_ID = re.compile(r"^[a-f0-9]{32}$")
+MAX_REQUEST_BYTES = 4096
+
+
+def group_alive(group_id):
+    try:
+        os.killpg(group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def namespace_has_runtime_processes():
+    try:
+        os.kill(-1, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def terminate_process_tree(process, namespace_scoped):
+    if namespace_scoped:
+        signal_target = -1
+        alive = namespace_has_runtime_processes
+    else:
+        signal_target = -process.pid
+        alive = lambda: group_alive(process.pid)
+    try:
+        os.kill(signal_target, signal.SIGTERM)
+    except ProcessLookupError:
+        process.poll()
+        return True
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        process.poll()
+        if not alive():
+            return True
+        time.sleep(0.02)
+    try:
+        os.kill(signal_target, signal.SIGKILL)
+    except ProcessLookupError:
+        process.poll()
+        return True
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        process.poll()
+        if not alive():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def response_path(control_path, request_id):
+    return os.path.join(os.path.dirname(control_path), f"response-{request_id}.txt")
+
+
+def request(control_path, token, operation, payload=None):
+    request_id = uuid.uuid4().hex
+    response = response_path(control_path, request_id)
+    body = {"token": token, "operation": operation, "id": request_id}
+    if payload:
+        body.update(payload)
+    try:
+        encoded = json.dumps(body, ensure_ascii=False).encode("utf-8") + b"\n"
+        if len(encoded) > MAX_REQUEST_BYTES:
+            raise ValueError("request exceeds FIFO message limit")
+        descriptor = os.open(control_path, os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            if os.write(descriptor, encoded) != len(encoded):
+                raise OSError("partial FIFO request write")
+        finally:
+            os.close(descriptor)
+        timeout = 10 if operation == "stop" else 5
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with open(response, encoding="utf-8") as stream:
+                    result = stream.readline().strip()
+                os.unlink(response)
+                print(result)
+                if (result.startswith("running ")
+                        or result.startswith("started ")
+                        or result in ("stopped", "stopped confirmed")):
+                    return 0
+                return 4
+            except FileNotFoundError:
+                time.sleep(0.02)
+    except (OSError, UnicodeError, ValueError) as error:
+        print(f"unavailable {type(error).__name__}")
+        return 3
+    finally:
+        try:
+            os.unlink(response)
+        except FileNotFoundError:
+            pass
+    print("unavailable Timeout")
+    return 3
+
+
+def write_response(control_path, request_id, message):
+    if not REQUEST_ID.fullmatch(request_id):
+        return
+    target = response_path(control_path, request_id)
+    temporary = target + ".tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(descriptor, message.encode() + b"\n")
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, target)
+
+
+def set_parent_death_signal():
+    parent = os.getppid()
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+    if os.getppid() != parent:
+        raise RuntimeError("parent exited while supervisor was starting")
+
+
+def set_child_subreaper():
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(36, 1) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_CHILD_SUBREAPER) failed")
+
+
+def descendant_pids(parent_pid):
+    parents = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", encoding="ascii") as stream:
+                fields = stream.read().rsplit(")", 1)[1].split()
+            parents[int(entry)] = int(fields[1])
+        except (FileNotFoundError, IndexError, OSError, ValueError):
+            continue
+    descendants = set()
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if pid not in descendants and (parent == parent_pid or parent in descendants):
+                descendants.add(pid)
+                changed = True
+    return descendants
+
+
+def reap_children():
+    while True:
+        try:
+            waited, _ = os.waitpid(-1, os.WNOHANG)
+            if waited == 0:
+                return
+        except ChildProcessError:
+            return
+
+
+def terminate_descendants(parent_pid):
+    for sig, timeout in ((signal.SIGTERM, 0.75), (signal.SIGKILL, 0.75)):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            reap_children()
+            descendants = descendant_pids(parent_pid)
+            if descendants is None:
+                return False
+            if not descendants:
+                return True
+            for pid in descendants:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+            time.sleep(0.02)
+    reap_children()
+    descendants = descendant_pids(parent_pid)
+    return descendants == set()
+
+
+def write_one_off_status(path, confirmed):
+    temporary = path + ".tmp"
+    with open(temporary, "x", encoding="ascii") as stream:
+        stream.write("confirmed\n" if confirmed else "unresolved\n")
+    os.replace(temporary, path)
+
+
+def run_one_off(directory, status_file, argv):
+    set_child_subreaper()
+    stop_requested = False
+
+    def request_stop(_signum, _frame):
+        nonlocal stop_requested
+        stop_requested = True
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    set_parent_death_signal()
+    child = subprocess.Popen(argv, cwd=directory)
+    while True:
+        if stop_requested:
+            confirmed = terminate_descendants(os.getpid())
+            write_one_off_status(status_file, confirmed)
+            return 124 if confirmed else 125
+        result = child.poll()
+        if result is not None:
+            confirmed = terminate_descendants(os.getpid())
+            write_one_off_status(status_file, confirmed)
+            return result if confirmed else 125
+        time.sleep(0.02)
+
+
+def canonical(path):
+    return os.path.realpath(path)
+
+
+def inside(path, root):
+    try:
+        return os.path.commonpath((canonical(path), root)) == root
+    except ValueError:
+        return False
+
+
+def serve(control_path, project_root, state_root, namespace_scoped):
+    set_parent_death_signal()
+    project_root = canonical(project_root)
+    state_root = canonical(state_root)
+    control_path = canonical(control_path)
+    if (project_root == "/" or state_root == "/"
+            or inside(state_root, project_root)
+            or inside(project_root, state_root)
+            or os.path.dirname(control_path) != state_root):
+        raise ValueError("unsafe supervisor project, state, or control path")
+    try:
+        os.unlink(control_path)
+    except FileNotFoundError:
+        pass
+    os.mkfifo(control_path, 0o600)
+    control_fd = os.open(control_path, os.O_RDWR | os.O_NONBLOCK)
+    process = None
+    owner_token = None
+    cleanup_unresolved = False
+    stop_service = False
+
+    def stop_for_signal(_signum, _frame):
+        nonlocal stop_service
+        stop_service = True
+
+    signal.signal(signal.SIGTERM, stop_for_signal)
+    signal.signal(signal.SIGINT, stop_for_signal)
+    buffer = b""
+    try:
+        while not stop_service:
+            if process is not None and process.poll() is not None:
+                if cleanup_unresolved:
+                    if not (namespace_has_runtime_processes()
+                            if namespace_scoped else group_alive(process.pid)):
+                        process = None
+                        owner_token = None
+                        cleanup_unresolved = False
+                elif terminate_process_tree(process, namespace_scoped):
+                    process = None
+                    owner_token = None
+                else:
+                    cleanup_unresolved = True
+            readable, _, _ = select.select([control_fd], [], [], 0.2)
+            if not readable:
+                continue
+            chunk = os.read(control_fd, 65536)
+            if not chunk:
+                continue
+            buffer += chunk
+            if len(buffer) > 65536:
+                buffer = b""
+                continue
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                request_id = ""
+                try:
+                    command = json.loads(line)
+                    if not isinstance(command, dict):
+                        continue
+                    request_id = command.get("id", "")
+                    supplied_token = command.get("token")
+                    operation = command.get("operation")
+                    if operation == "start":
+                        if process is not None:
+                            response = "already-running"
+                        else:
+                            argv = command.get("command")
+                            directory = command.get("directory")
+                            log_path = command.get("log")
+                            if not (isinstance(argv, list) and argv
+                                    and all(isinstance(item, str) and item for item in argv)
+                                    and isinstance(directory, str)
+                                    and isinstance(log_path, str)
+                                    and isinstance(supplied_token, str)
+                                    and supplied_token
+                                    and inside(directory, project_root)
+                                    and canonical(log_path)
+                                    == os.path.join(state_root, "repl.log")):
+                                response = "invalid-start"
+                            else:
+                                with open(log_path, "ab", buffering=0) as log:
+                                    process = subprocess.Popen(
+                                        argv,
+                                        cwd=directory,
+                                        stdout=log,
+                                        stderr=subprocess.STDOUT,
+                                        start_new_session=True,
+                                    )
+                                owner_token = supplied_token
+                                response = f"started {process.pid}"
+                    elif process is None:
+                        response = "stopped"
+                    elif supplied_token != owner_token:
+                        response = "ownership-mismatch"
+                    elif operation == "status":
+                        if cleanup_unresolved:
+                            response = "termination-timeout"
+                        else:
+                            response = f"running {process.pid}"
+                    elif operation == "stop":
+                        if terminate_process_tree(process, namespace_scoped):
+                            process = None
+                            owner_token = None
+                            cleanup_unresolved = False
+                            response = "stopped confirmed"
+                        else:
+                            cleanup_unresolved = True
+                            response = "termination-timeout"
+                    else:
+                        response = "invalid-operation"
+                    write_response(control_path, request_id, response)
+                except (json.JSONDecodeError, OSError, TypeError, UnicodeError,
+                        ValueError) as error:
+                    try:
+                        write_response(control_path, request_id,
+                                       f"service-error {type(error).__name__}")
+                    except (OSError, UnboundLocalError):
+                        pass
+    finally:
+        os.close(control_fd)
+        if process is not None:
+            terminate_process_tree(process, namespace_scoped)
+        try:
+            os.unlink(control_path)
+        except FileNotFoundError:
+            pass
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+    service_parser = subparsers.add_parser("service")
+    service_parser.add_argument("--control", required=True)
+    service_parser.add_argument("--project-root", required=True)
+    service_parser.add_argument("--state-root", required=True)
+    service_parser.add_argument("--namespace-scoped", action="store_true")
+    control_parser = subparsers.add_parser("control")
+    control_parser.add_argument("path")
+    control_parser.add_argument("token")
+    control_parser.add_argument("operation", choices=("status", "stop"))
+    start_parser = subparsers.add_parser("start")
+    start_parser.add_argument("path")
+    start_parser.add_argument("token")
+    start_parser.add_argument("--log", required=True)
+    start_parser.add_argument("--dir", required=True)
+    start_parser.add_argument("command", nargs=argparse.REMAINDER)
+    one_off_parser = subparsers.add_parser("one-off")
+    one_off_parser.add_argument("--dir", required=True)
+    one_off_parser.add_argument("--status-file", required=True)
+    one_off_parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.mode == "service":
+        return serve(
+            args.control,
+            args.project_root,
+            args.state_root,
+            args.namespace_scoped,
+        )
+    if args.mode == "control":
+        return request(args.path, args.token, args.operation)
+    if args.mode == "one-off":
+        command = args.command
+        if command and command[0] == "--":
+            command = command[1:]
+        if not command:
+            parser.error("one-off requires a command after --")
+        return run_one_off(args.dir, args.status_file, command)
+    command = args.command
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        parser.error("start requires a command after --")
+    return request(
+        args.path,
+        args.token,
+        "start",
+        {"log": args.log, "directory": args.dir, "command": command},
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())

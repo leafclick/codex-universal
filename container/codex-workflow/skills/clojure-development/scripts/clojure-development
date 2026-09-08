@@ -1,0 +1,918 @@
+#!/usr/bin/env bb
+(ns clojure-development
+  (:require [babashka.fs :as fs]
+            [babashka.process :as process]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [clojure.string :as str])
+  (:import (java.io DataInputStream File)
+           (java.net InetSocketAddress Socket SocketTimeoutException)
+           (java.nio.channels FileChannel)
+           (java.nio.file CopyOption Files StandardCopyOption StandardOpenOption)
+           (java.util UUID)
+           (java.util.concurrent TimeUnit)))
+
+(def project-root
+  (.toPath
+   (.getCanonicalFile
+    (File. (or (System/getenv "CODEX_PROJECT_ROOT")
+               (System/getProperty "user.dir"))))))
+(def state-root
+  (let [path
+        (.toPath
+         (.getCanonicalFile
+          (File.
+           (or (System/getenv "CODEX_CLOJURE_STATE_DIR")
+               (throw
+                (ex-info
+                 "CODEX_CLOJURE_STATE_DIR is required; the container entrypoint creates a private per-chat directory"
+                 {}))))))]
+    (when (or (= path (.toPath (File. "/")))
+              (.startsWith path project-root)
+              (.startsWith project-root path))
+      (throw
+       (ex-info
+        "CODEX_CLOJURE_STATE_DIR must not be the filesystem root or overlap the project"
+        {:state-root (str path) :project-root (str project-root)})))
+    path))
+(def state-file (str state-root "/state.edn"))
+(def log-file (str state-root "/repl.log"))
+(def lifecycle-lock-file (str state-root "/lifecycle.lock"))
+(def evaluation-lock-file (str state-root "/eval.lock"))
+(def control-path (str state-root "/service-control.fifo"))
+(def supervisor-command
+  (or (System/getenv "CODEX_CLOJURE_SUPERVISOR")
+      (str (fs/parent *file*) "/clojure-process-supervisor")))
+(def output-limit 16384)
+(def max-bencode-string-bytes 1048576)
+(def max-command-description-bytes 2048)
+
+(defn die [& xs]
+  (binding [*out* *err*]
+    (apply println xs))
+  (System/exit 2))
+
+(defn environment-timeout [name default]
+  (if-let [raw (System/getenv name)]
+    (let [value (parse-long raw)]
+      (when-not (and value (pos? value))
+        (die name "must be a positive integer number of milliseconds"))
+      value)
+    default))
+
+(defn slurp-edn [path]
+  (edn/read-string (slurp path)))
+
+(defn argv? [value]
+  (and (vector? value)
+       (seq value)
+       (every? #(and (string? %) (not (str/blank? %))) value)))
+
+(defn command? [value]
+  (or (nil? value) (argv? value)))
+
+(defn validate-command-size! [description command]
+  (when (and command
+             (> (alength (.getBytes (pr-str command) "UTF-8"))
+                max-command-description-bytes))
+    (die description "exceeds the 2048-byte process-service transport limit")))
+
+(defn option-values [argv option]
+  (loop [tokens argv values []]
+    (if-let [token (first tokens)]
+      (if (= option token)
+        (if-let [value (second tokens)]
+          (recur (nnext tokens) (conj values value))
+          (die option "requires a value in argv recipe"))
+        (recur (next tokens) values))
+      values)))
+
+(defn alternate-bind-or-port-option? [token]
+  (or (contains? #{"-b" "-p"} token)
+      (boolean (re-matches #"--(?:bind|port)=.*" token))
+      (boolean (re-matches #"-[bp].+" token))))
+
+(defn project-config []
+  (let [path (str project-root "/.codex/clojure-development.edn")]
+    (when (fs/exists? path)
+      (slurp-edn path))))
+
+(defn resolved-config []
+  (or (project-config)
+      (die
+       "No .codex/clojure-development.edn. Runtime aliases and Leiningen profiles are ambiguous; add explicit argv recipes.")))
+
+(defn validate! [config]
+  (when-not (map? config)
+    (die "Clojure development config must be an EDN map"))
+  (let [allowed #{:default-runtime :runtimes :repl-test-helpers :tests :validation}
+        unknown (seq (remove allowed (keys config)))]
+    (when unknown
+      (die "Unknown Clojure development config keys:" (pr-str unknown))))
+  (when-not (map? (:runtimes config))
+    (die "Clojure development config requires :runtimes map"))
+  (when (empty? (:runtimes config))
+    (die "Clojure development config :runtimes cannot be empty"))
+  (when (and (:default-runtime config)
+             (not (contains? (:runtimes config) (:default-runtime config))))
+    (die ":default-runtime does not name a configured runtime:"
+         (pr-str (:default-runtime config))))
+  (doseq [[runtime spec] (:runtimes config)]
+    (when-not (keyword? runtime)
+      (die "Runtime names must be keywords:" (pr-str runtime)))
+    (when-not (map? spec)
+      (die "Runtime" runtime "must be an EDN map"))
+    (let [unknown (seq (remove #{:kind :workdir :repl :one-off :repl-test-helper}
+                               (keys spec)))]
+      (when unknown
+        (die "Runtime" runtime "has unknown keys" (pr-str unknown))))
+    (when-not (contains? #{:deps :lein :babashka} (:kind spec))
+      (die "Runtime" runtime "has invalid :kind" (pr-str (:kind spec))))
+    (when-not (or (nil? (:workdir spec)) (string? (:workdir spec)))
+      (die "Runtime" runtime ":workdir must be a string"))
+    (when-not (command? (:repl spec))
+      (die "Runtime" runtime ":repl must be an argv vector"))
+    (when-not (command? (:one-off spec))
+      (die "Runtime" runtime ":one-off must be an argv vector"))
+    (validate-command-size! (str "Runtime " runtime " :repl") (:repl spec))
+    (validate-command-size! (str "Runtime " runtime " :one-off") (:one-off spec))
+    (when (and (:one-off spec) (not= :babashka (:kind spec)))
+      (die "Runtime" runtime ":one-off is only valid for :babashka"))
+    (when-not (or (nil? (:repl-test-helper spec))
+                  (symbol? (:repl-test-helper spec)))
+      (die "Runtime" runtime ":repl-test-helper must be a symbol"))
+    (when-let [repl (:repl spec)]
+      (when (= :deps (:kind spec))
+        (when-let [alternate (some #(when (alternate-bind-or-port-option? %) %)
+                                   repl)]
+          (die "Deps runtime" runtime
+               ":repl contains unsupported bind/port option syntax"
+               (pr-str alternate)))
+        (let [bind-values (option-values repl "--bind")
+              port-values (option-values repl "--port")]
+          (when-not (= ["127.0.0.1"] bind-values)
+            (die "Deps runtime" runtime
+                 ":repl must pass exactly one --bind 127.0.0.1 option"))
+          (when-not (= ["0"] port-values)
+            (die "Deps runtime" runtime
+                 ":repl must pass exactly one --port 0 option"))))))
+  (when-not (or (nil? (:tests config)) (map? (:tests config)))
+    (die ":tests must be a map"))
+  (doseq [[name spec] (:tests config)]
+    (when-not (and (map? spec)
+                   (argv? (:command spec))
+                   (contains? #{:always :when-required}
+                              (:fresh-process spec)))
+      (die "Test" name
+           "requires argv :command and :fresh-process :always or :when-required"))
+    (validate-command-size! (str "Test " name " :command") (:command spec)))
+  (when-not (or (nil? (:repl-test-helpers config))
+                (map? (:repl-test-helpers config)))
+    (die ":repl-test-helpers must be a map"))
+  (doseq [[name helper] (:repl-test-helpers config)]
+    (when-not (symbol? helper)
+      (die "REPL test helper" name "must be a symbol")))
+  (when-not (or (nil? (:validation config)) (map? (:validation config)))
+    (die ":validation must be a map"))
+  (doseq [[key command] (:validation config)]
+    (when-not (and (contains? #{:lint-command
+                               :format-command
+                               :format-fix-command}
+                             key)
+                   (argv? command))
+      (die "Validation" key "must be a supported argv vector"))
+    (validate-command-size! (str "Validation " key) command))
+  config)
+
+(defn select-runtime! [config requested operation]
+  (let [runtime (cond
+                  requested (keyword requested)
+                  (:default-runtime config) (:default-runtime config)
+                  (= 1 (count (:runtimes config)))
+                  (first (keys (:runtimes config)))
+                  :else
+                  (die "Multiple configured runtimes; pass a runtime name to"
+                       operation))
+        spec (get (:runtimes config) runtime)]
+    (when-not spec
+      (die "Unknown runtime" (pr-str runtime)
+           "in .codex/clojure-development.edn"))
+    [runtime spec]))
+
+(defn with-file-lock [path function]
+  (fs/create-dirs state-root)
+  (with-open [channel (FileChannel/open
+                       (.toPath (File. path))
+                       (into-array java.nio.file.OpenOption
+                                   [StandardOpenOption/CREATE
+                                    StandardOpenOption/WRITE]))
+              lock (.lock channel)]
+    (function)))
+
+(defn with-runtime-locks [function]
+  (with-file-lock lifecycle-lock-file
+    #(with-file-lock evaluation-lock-file function)))
+
+(defn read-state []
+  (when (fs/exists? state-file)
+    (slurp-edn state-file)))
+
+(defn write-state! [value]
+  (fs/create-dirs state-root)
+  (let [temporary (str state-file ".tmp." (UUID/randomUUID))]
+    (spit temporary (pr-str value))
+    (Files/move (.toPath (File. temporary))
+                (.toPath (File. state-file))
+                (into-array
+                 CopyOption
+                 [StandardCopyOption/ATOMIC_MOVE
+                  StandardCopyOption/REPLACE_EXISTING]))))
+
+(defn supervisor-request [state operation]
+  (process/shell
+   {:continue true :out :string :err :string}
+   supervisor-command
+   "control"
+   (:control-path state)
+   (:control-token state)
+   operation))
+
+(defn supervisor-output [result]
+  (str/trim (or (:out result) "")))
+
+(defn fifo? [path]
+  (zero?
+   (:exit
+    (process/shell {:continue true :out :string :err :string}
+                   "test" "-p" (str path)))))
+
+(defn endpoint-open? [port]
+  (try
+    (with-open [socket (Socket.)]
+      (.connect socket (InetSocketAddress. "127.0.0.1" (int port)) 250)
+      true)
+    (catch Exception _
+      false)))
+
+(defn read-lines [path]
+  (let [result (process/shell {:continue true :out :string :err :string}
+                              "cat" (str path))]
+    (when-not (zero? (:exit result))
+      (throw (ex-info "Unable to inspect listener table"
+                      {:path (str path) :error (:err result)})))
+    (str/split-lines (:out result))))
+
+(defn listener-addresses [port]
+  (let [port-hex (format "%04X" (long port))]
+    (->> ["/proc/net/tcp" "/proc/net/tcp6"]
+         (filter fs/exists?)
+         (mapcat #(rest (read-lines %)))
+         (keep
+          (fn [line]
+            (let [fields (str/split (str/trim line) #"\s+")
+                  local (nth fields 1 nil)
+                  state (nth fields 3 nil)
+                  [address local-port] (str/split (or local "") #":" 2)]
+              (when (and (= "0A" state) (= port-hex local-port))
+                address))))
+         set)))
+
+(def loopback-listener-addresses
+  #{"0100007F"
+    "00000000000000000000000001000000"
+    "00000000000000000000000000000001"
+    "0000000000000000FFFF00000100007F"})
+
+(defn loopback-listener? [port]
+  (let [addresses (listener-addresses port)]
+    (and (seq addresses)
+         (every? loopback-listener-addresses addresses))))
+
+(defn command-dir [spec]
+  (let [dir (or (:workdir spec) ".")
+        root (.toPath (.getCanonicalFile (File. (str project-root))))
+        path (.toPath
+              (.getCanonicalFile
+               (File. (str (fs/path project-root dir)))))]
+    (when-not (.startsWith path root)
+      (die "Runtime workdir escapes project root"))
+    (when-not (fs/directory? path)
+      (die "Runtime workdir is not a directory:" (str path)))
+    path))
+
+(defn port-from-log []
+  (when (fs/exists? log-file)
+    (let [text (:out
+                (process/shell {:continue true :out :string :err :string}
+                               "tail" "-c" "65536" log-file))]
+      (some
+       (fn [pattern]
+         (some-> (re-find pattern text) second parse-long))
+       [#"(?i)nREPL server started on port ([0-9]+)"
+        #"(?i)started nREPL server at .*:([0-9]+)"]))))
+
+(defn status []
+  (if-let [state (read-state)]
+    (let [reported (supervisor-request state "status")
+          owner-status (supervisor-output reported)]
+      (assoc
+       state
+       :status
+       (cond
+         (and (zero? (:exit reported))
+              (str/starts-with? owner-status "running "))
+         (cond
+           (= :starting (:phase state)) :starting
+           (and (:port state) (endpoint-open? (:port state))) :running
+           :else :unreachable)
+         (= "stopped" owner-status) :stale
+         (= "ownership-mismatch" owner-status) :ownership-mismatch
+         (= "termination-timeout" owner-status) :termination-timeout
+         :else :service-unavailable)))
+    {:status :stopped}))
+
+(defn terminate-owned! [state]
+  (let [result (supervisor-request state "stop")]
+    (and (zero? (:exit result))
+         (= "stopped confirmed" (str/trim (:out result))))))
+
+(defn failed-start! [state message]
+  (let [reported (supervisor-request state "status")
+        owner-status (supervisor-output reported)
+        terminated?
+        (cond
+          (or (str/starts-with? owner-status "running ")
+              (= "termination-timeout" owner-status))
+          (terminate-owned! state)
+
+          (= "stopped" owner-status) true
+
+          :else false)]
+    (if terminated?
+      (fs/delete-if-exists state-file)
+      (write-state! (assoc state :phase :cleanup-failed))))
+  (die message "; inspect" log-file))
+
+(defn start! [requested]
+  (with-runtime-locks
+    (fn []
+      (let [config (validate! (resolved-config))
+            [runtime spec] (select-runtime! config requested "repl-start")
+            command (:repl spec)
+            timeout (environment-timeout
+                     "CODEX_CLOJURE_REPL_START_TIMEOUT_MS" 30000)]
+        (when-not command
+          (die "Runtime" runtime "has no persistent REPL recipe"))
+        (when-not (fs/executable? supervisor-command)
+          (die "Clojure process supervisor is unavailable:" supervisor-command))
+        (when-not (fifo? control-path)
+          (die "Container REPL service is unavailable; restart this Codex session"))
+        (when-let [existing (read-state)]
+          (let [reported (supervisor-request existing "status")
+                owner-status (supervisor-output reported)]
+            (cond
+              (str/starts-with? owner-status "running ")
+              (die "A configured REPL process already exists:" (pr-str (status)))
+
+              (= "stopped" owner-status)
+              (fs/delete-if-exists state-file)
+
+              :else
+              (die "Existing REPL ownership cannot be verified; state retained for manual recovery"))))
+        (fs/create-dirs state-root)
+        (spit log-file "")
+        (let [token (str (UUID/randomUUID))
+              directory (str (command-dir spec))
+              starting-state {:control-path control-path
+                              :control-token token
+                              :runtime runtime
+                              :command command
+                              :phase :starting
+                              :started-at (System/currentTimeMillis)}
+              _ (write-state! starting-state)
+              started
+              (apply process/shell
+                     {:continue true :out :string :err :string}
+                     (into [supervisor-command
+                            "start"
+                            "--log" log-file
+                            "--dir" directory
+                            control-path
+                            token
+                            "--"]
+                           command))
+              started-output (supervisor-output started)
+              pid-match (re-matches #"started ([0-9]+)" started-output)
+              running-state (if pid-match
+                              (assoc starting-state
+                                     :runtime-pid (parse-long (second pid-match)))
+                              starting-state)
+              deadline (+ (System/nanoTime) (* timeout 1000000))]
+          (when-not (and (zero? (:exit started)) pid-match)
+            (failed-start! starting-state
+                           (str "Container REPL service rejected startup: "
+                                started-output " " (str/trim (:err started)))))
+          (write-state! running-state)
+          (loop []
+            (let [reported (supervisor-request running-state "status")
+                  owner-status (supervisor-output reported)]
+              (cond
+                (= "stopped" owner-status)
+                (failed-start! running-state
+                               "nREPL process exited during startup")
+
+                (not (and (zero? (:exit reported))
+                          (str/starts-with? owner-status "running ")))
+                (failed-start! running-state
+                               "Container REPL service became unavailable during startup")
+
+                (>= (System/nanoTime) deadline)
+                (failed-start! running-state
+                               "nREPL startup deadline expired")
+
+                :else
+                (if-let [port (port-from-log)]
+                  (if (and (endpoint-open? port)
+                           (seq (listener-addresses port)))
+                    (if (loopback-listener? port)
+                      (let [ready-state (assoc running-state
+                                               :port port
+                                               :phase :running)]
+                        (write-state! ready-state)
+                        (println (pr-str (status))))
+                      (failed-start!
+                       running-state
+                       "nREPL listener is not restricted to loopback"))
+                    (do (Thread/sleep 50) (recur)))
+                  (do (Thread/sleep 50) (recur)))))))))))
+
+(defn stop! []
+  (with-runtime-locks
+    (fn []
+      (if-let [state (read-state)]
+        (let [reported (supervisor-request state "status")
+              supervisor-status (str/trim (:out reported))]
+          (cond
+            (= "ownership-mismatch" supervisor-status)
+            (do
+              (println
+               (pr-str
+                {:status :ownership-mismatch
+                 :runtime-pid (:runtime-pid state)
+                 :warning "State retained; refusing to control an unverified process."}))
+              (System/exit 2))
+
+            (= "stopped" supervisor-status)
+            (do
+              (fs/delete-if-exists state-file)
+              (println "{:status :stopped, :previous :stale}"))
+
+            (= "termination-timeout" supervisor-status)
+            (if (terminate-owned! state)
+              (do
+                (fs/delete-if-exists state-file)
+                (println "{:status :stopped, :termination :confirmed}"))
+              (do
+                (write-state! (assoc state :phase :termination-timeout))
+                (println
+                 (pr-str
+                  {:status :termination-timeout
+                   :runtime-pid (:runtime-pid state)
+                   :warning "Process group remains alive; state retained."}))
+                (System/exit 2)))
+
+            (not (and (zero? (:exit reported))
+                      (str/starts-with? supervisor-status "running ")))
+            (do
+              (write-state! (assoc state :phase :service-unavailable))
+              (println
+               (pr-str
+                {:status :service-unavailable
+                 :runtime-pid (:runtime-pid state)
+                 :warning "Container REPL service is unavailable; state retained."}))
+              (System/exit 2))
+
+            (terminate-owned! state)
+            (do
+              (fs/delete-if-exists state-file)
+              (println "{:status :stopped, :termination :confirmed}"))
+
+            :else
+            (do
+              (write-state! (assoc state :phase :termination-timeout))
+              (println
+               (pr-str
+                {:status :termination-timeout
+                 :runtime-pid (:runtime-pid state)
+                 :warning "Process remains alive; state retained."}))
+              (System/exit 2))))
+        (println "{:status :stopped}")))))
+
+(defn bencode [value]
+  (cond
+    (string? value)
+    (let [bytes (.getBytes value "UTF-8")]
+      (str (alength bytes) ":" value))
+    (integer? value) (str "i" value "e")
+    (map? value)
+    (str "d"
+         (apply str
+                (mapcat
+                 (fn [[key item]] [(bencode (name key)) (bencode item)])
+                 (sort-by (comp name key) value)))
+         "e")
+    (sequential? value)
+    (str "l" (apply str (map bencode value)) "e")
+    :else (bencode (str value))))
+
+(defn remaining-millis [deadline]
+  (long (Math/ceil (/ (double (- deadline (System/nanoTime))) 1000000.0))))
+
+(defn read-byte! [stream socket deadline]
+  (let [remaining (remaining-millis deadline)]
+    (when-not (pos? remaining)
+      (throw (SocketTimeoutException. "nREPL evaluation deadline exceeded")))
+    (.setSoTimeout socket (int (min Integer/MAX_VALUE remaining)))
+    (let [value (.read stream)]
+      (when (= -1 value)
+        (throw (ex-info "nREPL closed connection" {})))
+      value)))
+
+(defn read-bytes! [stream socket deadline length]
+  (let [bytes (byte-array length)]
+    (dotimes [index length]
+      (aset-byte bytes index
+                 (unchecked-byte (read-byte! stream socket deadline))))
+    bytes))
+
+(declare bdecode)
+
+(defn bdecode [stream socket deadline first-byte]
+  (cond
+    (= first-byte (int \i))
+    (let [text (loop [chars [] byte (read-byte! stream socket deadline)]
+                 (if (= byte (int \e))
+                   (apply str chars)
+                   (recur (conj chars (char byte))
+                          (read-byte! stream socket deadline))))]
+      (parse-long text))
+    (= first-byte (int \l))
+    (loop [values [] byte (read-byte! stream socket deadline)]
+      (if (= byte (int \e))
+        values
+        (recur (conj values (bdecode stream socket deadline byte))
+               (read-byte! stream socket deadline))))
+    (= first-byte (int \d))
+    (loop [values {} byte (read-byte! stream socket deadline)]
+      (if (= byte (int \e))
+        values
+        (let [key (bdecode stream socket deadline byte)
+              value (bdecode stream socket deadline
+                             (read-byte! stream socket deadline))]
+          (recur (assoc values key value)
+                 (read-byte! stream socket deadline)))))
+    (<= (int \0) first-byte (int \9))
+    (let [length-text
+          (loop [chars [(char first-byte)]
+                 byte (read-byte! stream socket deadline)]
+            (if (= byte (int \:))
+              (apply str chars)
+              (recur (conj chars (char byte))
+                     (read-byte! stream socket deadline))))
+          length (parse-long length-text)]
+      (when (> length max-bencode-string-bytes)
+        (throw
+         (ex-info "nREPL response field exceeds the bounded decoder limit"
+                  {:length length :limit max-bencode-string-bytes})))
+      (let [bytes (read-bytes! stream socket deadline length)]
+        (String. bytes "UTF-8")))
+    :else
+    (throw (ex-info "Invalid bencode token" {:token first-byte}))))
+
+(defn message! [outgoing message]
+  (.write outgoing (.getBytes (bencode message) "UTF-8"))
+  (.flush outgoing))
+
+(defn done-message? [message]
+  (some #{"done"} (get message "status")))
+
+(defn receive-until-done! [incoming socket deadline on-message]
+  (loop []
+    (let [message (bdecode incoming socket deadline
+                           (read-byte! incoming socket deadline))]
+      (on-message message)
+      (if (done-message? message)
+        message
+        (recur)))))
+
+(def empty-display {:text "" :truncated false})
+
+(defn append-display [current value prefix]
+  (let [text (str (or value ""))
+        addition (str prefix text)
+        available (max 0 (- output-limit (count (:text current))))
+        kept (subs addition 0 (min available (count addition)))]
+    {:text (str (:text current) kept)
+     :truncated (or (:truncated current)
+                    (> (count addition) available))}))
+
+(defn update-evidence [evidence message]
+  (let [evidence (if (contains? message "value")
+                   (-> evidence
+                       (update :value append-display (get message "value")
+                               (if (pos? (:value-count evidence)) "\n" ""))
+                       (update :value-count inc))
+                   evidence)
+        evidence (if (contains? message "out")
+                   (update evidence :out append-display (get message "out") "")
+                   evidence)
+        evidence (if (contains? message "err")
+                   (update evidence :err append-display (get message "err") "")
+                   evidence)]
+    (-> evidence
+        (update :statuses into (or (get message "status") []))
+        (update :ex #(or % (get message "ex")))
+        (update :root-ex #(or % (get message "root-ex"))))))
+
+(defn raw-record! [writer record]
+  (.write writer (pr-str record))
+  (.newLine writer)
+  (.flush writer))
+
+(def evaluation-error-statuses
+  #{"error" "eval-error" "interrupted" "namespace-not-found"})
+
+(defn evidence-result [evidence]
+  {:value (:value evidence)
+   :out (:out evidence)
+   :err (:err evidence)
+   :ex (:ex evidence)
+   :root-ex (:root-ex evidence)
+   :value-count (:value-count evidence)
+   :nrepl-statuses (vec (sort (:statuses evidence)))})
+
+(defn unresolved-evaluation? [state]
+  (= :unknown (get-in state [:evaluation :status])))
+
+(defn eval! [form]
+  (with-file-lock
+    evaluation-lock-file
+    (fn []
+      (let [{:keys [status port] :as reported-state} (status)
+            state (dissoc reported-state :status)]
+        (when-not (= :running status)
+          (die "No running configured nREPL; start it first"))
+        (when (unresolved-evaluation? state)
+          (die
+           "Previous evaluation has unknown server execution state; stop and restart the REPL before another evaluation"))
+        (let [timeout (environment-timeout
+                       "CODEX_CLOJURE_EVAL_TIMEOUT_MS" 30000)
+              started-at (System/currentTimeMillis)
+              deadline (+ (System/nanoTime) (* timeout 1000000))
+              raw-file (str state-root "/eval-" started-at ".edn-lines")
+              evidence (atom {:value empty-display
+                              :value-count 0
+                              :out empty-display
+                              :err empty-display
+                              :statuses #{}
+                              :ex nil
+                              :root-ex nil})
+              current-state (atom state)
+              eval-sent? (atom false)]
+          (with-open [writer (io/writer raw-file)]
+            (raw-record! writer {:event :request
+                                 :started-at started-at
+                                 :form form})
+            (try
+              (with-open [socket (Socket.)]
+                (.connect socket
+                          (InetSocketAddress. "127.0.0.1" (int port))
+                          (int (max 1 (remaining-millis deadline))))
+                (let [incoming (DataInputStream. (.getInputStream socket))
+                      outgoing (.getOutputStream socket)
+                      session
+                      (or
+                       (:client-session @current-state)
+                       (let [new-session (atom nil)]
+                         (message! outgoing
+                                   {"op" "clone"
+                                    "id" (str "clone-" started-at)})
+                         (receive-until-done!
+                          incoming socket deadline
+                          (fn [message]
+                            (raw-record! writer {:event :clone-response
+                                                 :message message})
+                            (when-let [session (get message "new-session")]
+                              (reset! new-session session))))
+                         (or @new-session
+                             (throw
+                              (ex-info
+                               "nREPL did not return a client session" {})))))]
+                  (swap! current-state assoc :client-session session)
+                  (write-state! @current-state)
+                  (reset! eval-sent? true)
+                  (swap! current-state assoc
+                         :evaluation {:status :running
+                                      :started-at started-at
+                                      :raw-record raw-file})
+                  (write-state! @current-state)
+                  (message! outgoing
+                            {"op" "eval"
+                             "id" (str "eval-" started-at)
+                             "session" session
+                             "code" form})
+                  (receive-until-done!
+                   incoming socket deadline
+                   (fn [message]
+                     (raw-record! writer {:event :eval-response
+                                          :message message})
+                     (swap! evidence update-evidence message)))
+                  (let [result-status
+                        (if (some evaluation-error-statuses
+                                  (:statuses @evidence))
+                          :evaluation-error
+                          :done)
+                        final-state (-> @current-state
+                                        (dissoc :evaluation)
+                                        (assoc :last-raw raw-file))]
+                    (write-state! final-state)
+                    (println
+                     (pr-str
+                      (merge {:status result-status
+                              :raw-record raw-file}
+                             (evidence-result @evidence)))))))
+              (catch SocketTimeoutException _
+                (let [unknown? @eval-sent?
+                      final-state
+                      (cond-> (assoc @current-state :last-raw raw-file)
+                        unknown?
+                        (assoc :evaluation
+                               {:status :unknown
+                                :started-at started-at
+                                :raw-record raw-file
+                                :reason :deadline}))]
+                  (write-state! final-state)
+                  (raw-record! writer {:event :timeout
+                                       :execution-state
+                                       (if unknown? :unknown :not-started)})
+                  (println
+                   (pr-str
+                    (merge
+                     {:status :timeout
+                      :execution-state (if unknown? :unknown :not-started)
+                      :warning
+                      "Timeout does not prove the evaluation stopped or had no side effects; do not retry blindly."
+                      :raw-record raw-file}
+                     (evidence-result @evidence))))))
+              (catch Exception error
+                (let [unknown? @eval-sent?
+                      final-state
+                      (cond-> (assoc @current-state :last-raw raw-file)
+                        unknown?
+                        (assoc :evaluation
+                               {:status :unknown
+                                :started-at started-at
+                                :raw-record raw-file
+                                :reason :connection-failure}))]
+                  (write-state! final-state)
+                  (raw-record! writer {:event :connection-failure
+                                       :execution-state
+                                       (if unknown? :unknown :not-started)
+                                       :exception (.getName (class error))
+                                       :message (.getMessage error)})
+                  (println
+                   (pr-str
+                    (merge
+                     {:status :connection-failure
+                      :execution-state (if unknown? :unknown :not-started)
+                      :exception (.getName (class error))
+                      :message (.getMessage error)
+                      :raw-record raw-file}
+                     (evidence-result @evidence)))))))))))))
+
+(defn pump-stream! [stream evidence]
+  (try
+    (with-open [input (io/reader stream :encoding "UTF-8")]
+      (let [buffer (char-array 4096)]
+        (loop []
+          (let [length (.read input buffer)]
+            (when (pos? length)
+              (swap! evidence append-display
+                     (String. buffer 0 length) "")
+              (recur))))))
+    (catch Exception error
+      (swap! evidence assoc :read-error (.getMessage error)))))
+
+(defn process-group-alive? [pid]
+  (zero?
+   (:exit
+    (process/shell {:continue true :out :string :err :string}
+                   "kill" "-0" "--" (str "-" pid)))))
+
+(defn wait-for-process-group-death [proc timeout]
+  (let [deadline (+ (System/nanoTime) (* timeout 1000000))]
+    (loop []
+      (cond
+        (not (process-group-alive? (.pid proc))) true
+        (>= (System/nanoTime) deadline) false
+        :else
+        (do
+          (.isAlive proc)
+          (Thread/sleep 20)
+          (recur))))))
+
+(defn terminate-process-group! [proc]
+  (process/shell {:continue true :out :string :err :string}
+                 "kill" "-TERM" "--" (str "-" (.pid proc)))
+  (if (wait-for-process-group-death proc 2000)
+    true
+    (do
+      (process/shell {:continue true :out :string :err :string}
+                     "kill" "-KILL" "--" (str "-" (.pid proc)))
+      (wait-for-process-group-death proc 2000))))
+
+(defn run-bounded-process! [command directory timeout]
+  (fs/create-dirs state-root)
+  (let [termination-status-file
+        (str state-root "/one-off-" (UUID/randomUUID) ".status")
+        group-command (into ["setsid" "--wait"
+                             supervisor-command "one-off"
+                             "--dir" (str directory)
+                             "--status-file" termination-status-file
+                             "--"]
+                            command)
+        builder (doto (ProcessBuilder. ^java.util.List group-command)
+                  (.directory (File. (str directory))))
+        proc (.start builder)
+        out (atom empty-display)
+        err (atom empty-display)
+        out-reader (future (pump-stream! (.getInputStream proc) out))
+        err-reader (future (pump-stream! (.getErrorStream proc) err))
+        completed? (.waitFor proc timeout TimeUnit/MILLISECONDS)
+        group-remained? (and completed? (process-group-alive? (.pid proc)))
+        group-terminated?
+        (if (and completed? (not group-remained?))
+          true
+          (terminate-process-group! proc))
+        exit (when (not (.isAlive proc)) (.exitValue proc))
+        cleanup-status (when (fs/exists? termination-status-file)
+                         (str/trim (slurp termination-status-file)))
+        _ (fs/delete-if-exists termination-status-file)
+        terminated? (and group-terminated? (= "confirmed" cleanup-status))]
+    (deref out-reader 2000 nil)
+    (deref err-reader 2000 nil)
+    (future-cancel out-reader)
+    (future-cancel err-reader)
+    {:completed? completed?
+     :terminated? terminated?
+     :exit exit
+     :out @out
+     :err @err}))
+
+(defn one-off! [form requested]
+  (let [config (validate! (resolved-config))
+        [runtime spec] (select-runtime! config requested "one-off")
+        command (:one-off spec)]
+    (when-not (and (= :babashka (:kind spec)) command)
+      (die "Runtime" runtime "has no Babashka :one-off recipe"))
+    (let [timeout (environment-timeout
+                   "CODEX_CLOJURE_ONE_OFF_TIMEOUT_MS" 30000)
+          result (run-bounded-process! (conj command form)
+                                       (command-dir spec)
+                                       timeout)
+          status (cond
+                   (not (:terminated? result)) :termination-timeout
+                   (not (:completed? result)) :timeout
+                   (zero? (:exit result)) :done
+                   :else :error)]
+      (println
+       (pr-str
+        {:status status
+         :runtime runtime
+         :kind :babashka-one-off
+         :value :no-return
+         :out (:out result)
+         :err (:err result)
+         :exit (:exit result)
+         :termination-confirmed (:terminated? result)})))))
+
+(defn config-validate! []
+  (validate! (or (project-config)
+                 (die "No .codex/clojure-development.edn found")))
+  (println "{:status :valid}"))
+
+(defn usage []
+  (die
+   "Usage: clojure-development repl-start [runtime] | repl-status | repl-stop | repl-eval FORM | one-off FORM [runtime] | config-validate"))
+
+(let [[operation & args] *command-line-args*]
+  (case operation
+    "repl-start" (if (<= (count args) 1) (start! (first args)) (usage))
+    "repl-status" (if (empty? args) (println (pr-str (status))) (usage))
+    "repl-stop" (if (empty? args) (stop!) (usage))
+    "repl-eval" (if (= 1 (count args)) (eval! (first args)) (usage))
+    "one-off" (if (<= 1 (count args) 2)
+                  (one-off! (first args) (second args))
+                  (usage))
+    "config-validate" (if (empty? args) (config-validate!) (usage))
+    (usage)))

@@ -72,6 +72,7 @@ RUN apt-get update \
         pkg-config \
         procps \
         protobuf-compiler \
+        python3-minimal \
         ripgrep \
         rlwrap \
         rsync \
@@ -111,6 +112,15 @@ RUN multiarch="$(gcc -print-multiarch)" \
         /etc/nsswitch.conf \
     && rm -f /tmp/libnss_codex.so.2 /usr/local/src/libnss_codex.c \
     && ldconfig
+
+COPY --chmod=0644 container/codex-no-nested-userns.c /usr/local/src/codex-no-nested-userns.c
+RUN gcc -std=c11 -O2 -fstack-protector-strong \
+        -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror \
+        -Wl,-z,relro,-z,now \
+        -o /tmp/codex-no-nested-userns /usr/local/src/codex-no-nested-userns.c \
+    && install -o root -g root -m 0755 /tmp/codex-no-nested-userns \
+        /usr/local/bin/codex-no-nested-userns \
+    && rm -f /tmp/codex-no-nested-userns /usr/local/src/codex-no-nested-userns.c
 
 # Give the image a fixed non-root default identity. run-codex replaces this
 # with the invoking host user's numeric identity and supplies a writable tmpfs
@@ -195,9 +205,15 @@ RUN install -d -o root -g root -m 0755 /etc/codex
 COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
 RUN install -d -o root -g root -m 0755 /usr/local/share/codex
 COPY --chmod=0644 container/codex-cuda-failure-signatures /usr/local/share/codex/cuda-failure-signatures
+RUN install -d -o root -g root -m 0755 /usr/local/share/codex-universal
+COPY --chmod=0644 container/codex-workflow/ /usr/local/share/codex-universal/workflow/
+RUN find /usr/local/share/codex-universal/workflow -type d -exec chmod 0755 {} + \
+    && chmod 0755 /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/*
+COPY --chmod=0755 container/codex-universal-workflow-install /usr/local/bin/codex-universal-workflow-install
 COPY --chmod=0755 container/codex-entrypoint /usr/local/bin/codex-entrypoint
 COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint
 COPY --chmod=0755 container/codex-clojure-lsp-mcp /usr/local/bin/codex-clojure-lsp-mcp
+COPY --chmod=0755 container/codex-lsp-message-proxy /usr/local/bin/codex-lsp-message-proxy
 RUN mv /usr/bin/bwrap /usr/bin/bwrap.real
 COPY --chmod=0755 container/codex-bwrap-cuda /usr/bin/bwrap
 

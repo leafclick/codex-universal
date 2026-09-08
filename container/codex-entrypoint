@@ -23,6 +23,12 @@ fi
 export USER=codex
 export LOGNAME=codex
 
+# Assets are canonical in the image and copied into the persistent Codex home
+# only when absent or still equal to the prior managed version. This keeps
+# custom agents and skills available in new sessions without replacing user
+# configuration. The per-container REPL state deliberately remains in /tmp.
+/usr/local/bin/codex-universal-workflow-install
+
 # Preserve NVIDIA's upstream initialization as the outer wrapper around the
 # requested CUDA command. It ultimately executes this script again with the
 # original arguments. Generic images do not contain the NVIDIA entrypoint.
@@ -46,6 +52,131 @@ unset CODEX_NVIDIA_ENTRYPOINT_DONE
 if [[ "${CODEX_NVIDIA_RESTORE_STDOUT:-0}" == 1 ]]; then
     exec 1>&3 3>&-
     unset CODEX_NVIDIA_RESTORE_STDOUT
+fi
+
+if [[ -z "${CODEX_CLOJURE_STATE_DIR:-}" ]]; then
+    CODEX_CLOJURE_STATE_DIR="$(mktemp -d -- /tmp/codex-clojure.XXXXXX)"
+    export CODEX_CLOJURE_STATE_DIR
+else
+    [[ "$CODEX_CLOJURE_STATE_DIR" == /tmp/?* &&
+       "$CODEX_CLOJURE_STATE_DIR" != *$'\n'* ]] || {
+        echo "CODEX_CLOJURE_STATE_DIR must be a private path below /tmp" >&2
+        exit 1
+    }
+    canonical_state="$(realpath -m -- "$CODEX_CLOJURE_STATE_DIR")"
+    [[ "$canonical_state" == /tmp/?* ]] || {
+        echo "CODEX_CLOJURE_STATE_DIR must resolve below /tmp" >&2
+        exit 1
+    }
+    mkdir -p -- "$canonical_state"
+    CODEX_CLOJURE_STATE_DIR="$(realpath -e -- "$canonical_state")"
+    export CODEX_CLOJURE_STATE_DIR
+fi
+chmod 0700 -- "$CODEX_CLOJURE_STATE_DIR"
+
+start_clojure_repl_service() {
+    local project_root state_root home_root control_path service_log supervisor
+    local java_command java_binary java_home java_lib java_server_lib jvm_library_path
+    local protected_root protected_path
+    local -a bwrap_args
+
+    project_root="$(pwd -P)"
+    state_root="$(realpath -e -- "$CODEX_CLOJURE_STATE_DIR")"
+    home_root="$(realpath -e -- "$HOME")"
+    # Image/doctor probes intentionally start at /. There is no project or
+    # persistent REPL to own in those diagnostic containers.
+    [[ "$project_root" != / ]] || return 0
+    [[ "$state_root" != / ]] || {
+        echo "Unsafe Clojure state root" >&2
+        exit 1
+    }
+    case "$state_root/" in
+        "$project_root/"*|/) echo "Clojure state must not be inside the project" >&2; exit 1 ;;
+    esac
+    case "$project_root/" in
+        "$state_root/"*) echo "Project must not be inside the Clojure state directory" >&2; exit 1 ;;
+    esac
+
+    control_path="$state_root/service-control.fifo"
+    service_log="$state_root/service.log"
+    supervisor="${CODEX_UNIVERSAL_WORKFLOW_SOURCE:-/usr/local/share/codex-universal/workflow}/skills/clojure-development/scripts/clojure-process-supervisor"
+    [[ -x "$supervisor" ]] || {
+        echo "Clojure REPL service executable is unavailable: $supervisor" >&2
+        exit 1
+    }
+    java_command="$(command -v java)"
+    java_binary="$(readlink -f -- "$java_command")"
+    java_home="$(dirname -- "$(dirname -- "$java_binary")")"
+    java_lib="$java_home/lib"
+    java_server_lib="$java_lib/server"
+    [[ -x "$java_binary" && -d "$java_server_lib" ]] || {
+        echo "Selected Java installation is incomplete: $java_binary" >&2
+        exit 1
+    }
+    jvm_library_path="$java_lib:$java_server_lib"
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        jvm_library_path+=":$LD_LIBRARY_PATH"
+    fi
+    bwrap_args=(
+        --unshare-user
+        --unshare-ipc
+        --unshare-pid
+        --unshare-uts
+        --unshare-cgroup-try
+        --die-with-parent
+        --new-session
+        --setenv LD_LIBRARY_PATH "$jvm_library_path"
+        --ro-bind / /
+        --dev /dev
+        # Do not expose /proc/<pid>/root from the outer container: that path
+        # could otherwise bypass this service's read-only metadata mounts.
+        --tmpfs /proc
+        # Docker already gives the container a network namespace with only
+        # loopback. Sharing it lets Codex probes reach nREPL without restoring
+        # any external network access.
+        --bind /tmp /tmp
+        --bind "$home_root" "$home_root"
+        --bind "$project_root" "$project_root"
+        --bind "$state_root" "$state_root"
+    )
+
+    # Match Codex's recursive protection within every writable root. The
+    # service can persist past an individual tool call, but it cannot use that
+    # lifetime to write Git metadata or Codex configuration.
+    for protected_root in "$home_root" "$project_root"; do
+        while IFS= read -r -d '' protected_path; do
+            bwrap_args+=(--ro-bind "$protected_path" "$protected_path")
+        done < <(
+            find "$protected_root" -xdev \
+                \( -name .git -o -name .codex \) -prune -print0
+        )
+    done
+    bwrap_args+=(--chdir "$project_root")
+
+    bwrap "${bwrap_args[@]}" -- \
+        /usr/local/bin/codex-no-nested-userns \
+        "$supervisor" \
+        service \
+        --control "$control_path" \
+        --project-root "$project_root" \
+        --state-root "$state_root" \
+        --namespace-scoped \
+        >>"$service_log" 2>&1 &
+    local service_pid=$!
+    for _ in {1..250}; do
+        if [[ -p "$control_path" ]]; then
+            return 0
+        fi
+        kill -0 "$service_pid" 2>/dev/null || break
+        sleep 0.02
+    done
+    echo "Clojure REPL service failed to start; recent log output:" >&2
+    tail -c 65536 -- "$service_log" >&2 || true
+    exit 1
+}
+
+if [[ "${CODEX_UNIVERSAL_WORKFLOW:-1}" == 1 ]]; then
+    start_clojure_repl_service
 fi
 
 exec "$@"

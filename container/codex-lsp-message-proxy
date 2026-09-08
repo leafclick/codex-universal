@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Forward LSP traffic while surfacing server messages hidden by the client."""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+
+
+def read_frame(stream):
+    headers = {}
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        name, separator, value = line.decode("ascii").partition(":")
+        if not separator:
+            raise ValueError("malformed LSP header")
+        headers[name.lower()] = value.strip()
+    length = int(headers["content-length"])
+    body = stream.read(length)
+    if len(body) != length:
+        raise EOFError("short LSP body")
+    return body
+
+
+def write_frame(stream, body):
+    stream.write(f"Content-Length: {len(body)}\r\n\r\n".encode("ascii"))
+    stream.write(body)
+    stream.flush()
+
+
+def message_text(params):
+    message = str(params.get("message", "language server error"))
+    extra = params.get("extra")
+    if extra:
+        message += "\n" + str(extra).strip()
+    return message
+
+
+def main():
+    child_command = sys.argv[1:] or ["clojure-lsp"]
+    child = subprocess.Popen(
+        child_command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    state = {
+        "initialize_id": None,
+        "initialize_finished": False,
+        "initialize_error": None,
+    }
+    state_lock = threading.Lock()
+
+    def terminate_child(signum, _frame):
+        try:
+            os.killpg(child.pid, signum)
+        except ProcessLookupError:
+            pass
+
+    signal.signal(signal.SIGTERM, terminate_child)
+    signal.signal(signal.SIGINT, terminate_child)
+
+    def forward_client():
+        try:
+            while True:
+                body = read_frame(sys.stdin.buffer)
+                if body is None:
+                    break
+                try:
+                    message = json.loads(body)
+                    if message.get("method") == "initialize":
+                        with state_lock:
+                            state["initialize_id"] = message.get("id")
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                write_frame(child.stdin, body)
+        except (BrokenPipeError, EOFError, OSError, ValueError):
+            pass
+        finally:
+            try:
+                child.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+    client_thread = threading.Thread(target=forward_client, daemon=True)
+    client_thread.start()
+
+    try:
+        while True:
+            body = read_frame(child.stdout)
+            if body is None:
+                break
+            message = None
+            try:
+                message = json.loads(body)
+            except json.JSONDecodeError:
+                pass
+            if isinstance(message, dict) and message.get("method") in (
+                "window/showMessage",
+                "window/showMessageRequest",
+            ):
+                params = message.get("params") or {}
+                severity = params.get("type")
+                visible_text = message_text(params)
+                if severity in (1, 2):
+                    log_message = {
+                        "jsonrpc": "2.0",
+                        "method": "window/logMessage",
+                        "params": {"type": severity, "message": visible_text},
+                    }
+                    write_frame(
+                        sys.stdout.buffer,
+                        json.dumps(log_message, separators=(",", ":")).encode(),
+                    )
+                if severity == 1:
+                    with state_lock:
+                        if not state["initialize_finished"]:
+                            state["initialize_error"] = visible_text
+            if isinstance(message, dict) and "id" in message and "method" not in message:
+                with state_lock:
+                    is_initialize = (
+                        state["initialize_id"] is not None
+                        and message.get("id") == state["initialize_id"]
+                    )
+                    if is_initialize:
+                        state["initialize_finished"] = True
+                        if state["initialize_error"] and "error" not in message:
+                            message = {
+                                "jsonrpc": "2.0",
+                                "id": message.get("id"),
+                                "error": {
+                                    "code": -32002,
+                                    "message": "language server reported an initialization failure: "
+                                    + state["initialize_error"],
+                                },
+                            }
+                            body = json.dumps(message, separators=(",", ":")).encode()
+            write_frame(sys.stdout.buffer, body)
+    except (BrokenPipeError, EOFError, OSError, ValueError):
+        pass
+    finally:
+        if child.poll() is None:
+            terminate_child(signal.SIGTERM, None)
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                terminate_child(signal.SIGKILL, None)
+        client_thread.join(timeout=2)
+    return child.returncode or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

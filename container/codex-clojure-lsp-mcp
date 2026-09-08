@@ -6,6 +6,28 @@ set -Eeuo pipefail
 # home are writable, while Codex state and Git metadata stay read-only.
 project_root="$(pwd -P)"
 container_home="${HOME:?HOME must be set}"
+java_command="$(command -v java)"
+[[ "$java_command" == /* ]] || {
+    echo "Refusing non-absolute Java command: $java_command" >&2
+    exit 1
+}
+java_binary="$(readlink -f -- "$java_command")"
+java_home="$(dirname -- "$(dirname -- "$java_binary")")"
+java_lib="$java_home/lib"
+java_server_lib="$java_lib/server"
+
+[[ -x "$java_binary" && -d "$java_lib" && -d "$java_server_lib" ]] || {
+    echo "Selected Java installation is incomplete: $java_binary" >&2
+    exit 1
+}
+
+# An empty /proc prevents this Temurin launcher from discovering its own
+# libjli.so path. Keep the image-selected JDK's directories first, but retain
+# any image-provided library paths needed by other native tools.
+jvm_library_path="$java_lib:$java_server_lib"
+if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+    jvm_library_path+=":$LD_LIBRARY_PATH"
+fi
 
 [[ "$project_root" != / ]] || {
     echo "Refusing to expose the filesystem root to agent-lsp" >&2
@@ -25,6 +47,10 @@ bwrap_args=(
     --unshare-cgroup-try
     --die-with-parent
     --new-session
+    --setenv LD_LIBRARY_PATH "$jvm_library_path"
+    # JSON preserves native Location URI/range data that agent-lsp's GCF graph
+    # conversion currently discards for several navigation tools.
+    --setenv AGENT_LSP_OUTPUT_FORMAT json
     --ro-bind / /
     --dev /dev
     # Mounting a fresh procfs after unsharing both user and PID namespaces is
@@ -49,5 +75,22 @@ done < <(
 
 bwrap_args+=(--chdir "$project_root")
 
+agent_args=("$@")
+for index in "${!agent_args[@]}"; do
+    if [[ "${agent_args[index]}" == clojure:clojure-lsp ]]; then
+        agent_args[index]=clojure:/usr/local/bin/codex-lsp-message-proxy
+    fi
+done
+
+if [[ "${1:-}" == --check-java ]]; then
+    (($# == 1)) || {
+        echo "--check-java does not accept arguments" >&2
+        exit 2
+    }
+    exec bwrap "${bwrap_args[@]}" -- \
+        /usr/local/bin/codex-no-nested-userns "$java_binary" -version
+fi
+
 exec bwrap "${bwrap_args[@]}" -- \
-    /usr/local/share/npm-global/bin/agent-lsp "$@"
+    /usr/local/bin/codex-no-nested-userns \
+    /usr/local/share/npm-global/bin/agent-lsp "${agent_args[@]}"

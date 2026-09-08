@@ -17,6 +17,7 @@ CLOJURE_LSP_MCP_OVERRIDE="${CODEX_CLOJURE_LSP_MCP:-}"
 IDEA_MCP="${CODEX_IDEA_MCP:-1}"
 IDEA_MCP_PORT="${CODEX_IDEA_MCP_PORT:-64342}"
 IDEA_MCP_PATH="${CODEX_IDEA_MCP_PATH:-/stream}"
+WORKFLOW_ENABLED="${CODEX_UNIVERSAL_WORKFLOW:-1}"
 HOST_UID="$EUID"
 HOST_GID="${GROUPS[0]}"
 IDEA_MCP_ALLOWED_TOOLS='[
@@ -50,7 +51,6 @@ CLOJURE_LSP_MCP_ALLOWED_TOOLS='[
     "go_to_implementation",
     "find_references",
     "find_callers",
-    "blast_radius",
     "get_diagnostics",
     "get_completions",
     "get_signature_help",
@@ -241,6 +241,10 @@ esac
 case "$IDEA_MCP" in
     0|1) ;;
     *) die "CODEX_IDEA_MCP must be 0 or 1" ;;
+esac
+case "$WORKFLOW_ENABLED" in
+    0|1|uninstall) ;;
+    *) die "CODEX_UNIVERSAL_WORKFLOW must be 0, 1, or uninstall" ;;
 esac
 
 validate_container_mount_path CONTAINER_HOME
@@ -1005,6 +1009,7 @@ doctor_runtime_probe() {
         --tmpfs "$DOCTOR_WORKSPACE_TMPFS_SPEC"
         --user "$HOST_UID:$HOST_GID"
         -e "HOME=$CONTAINER_HOME"
+        -e "CODEX_UNIVERSAL_WORKFLOW=1"
         --entrypoint /usr/local/bin/codex-entrypoint
     )
 
@@ -1061,6 +1066,15 @@ doctor_runtime_probe() {
             /etc/codex/requirements.toml
         command -v codex-acp >/dev/null
         command -v codex-acp-entrypoint >/dev/null
+        command -v codex-universal-workflow-install >/dev/null
+        test -f /usr/local/share/codex-universal/workflow/agents/code_reader.toml
+        test -f /usr/local/share/codex-universal/workflow/agents/clojure_probe.toml
+        test -f /usr/local/share/codex-universal/workflow/agents/mechanical_worker.toml
+        test -x /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-development
+        test -f "$HOME/.codex/agents/code_reader.toml"
+        test -f "$HOME/.codex/agents/clojure_probe.toml"
+        test -f "$HOME/.codex/agents/mechanical_worker.toml"
+        test -f "$HOME/.codex/skills/clojure-development/SKILL.md"
 
         printf '\''codex: '\''
         codex --version
@@ -1076,6 +1090,7 @@ doctor_runtime_probe() {
         clojure-lsp --version
         printf '\''rlwrap: '\''
         rlwrap --version
+        printf '\''bundled workflow: code_reader, clojure_probe, mechanical_worker, clojure-development\n'\''
         command -v clj >/dev/null
 
         if [[ "$3" == cuda ]]; then
@@ -1677,6 +1692,7 @@ fi
 docker_args+=(
     --user "$HOST_UID:$HOST_GID"
     -e "HOME=$CONTAINER_HOME"
+    -e "CODEX_UNIVERSAL_WORKFLOW=$WORKFLOW_ENABLED"
 )
 
 if $IDEA_MODE; then
@@ -1695,6 +1711,7 @@ if $IDEA_MODE; then
                         network_access: false,
                         writable_roots: [$home]
                     },
+                    network: {allow_local_binding: true},
                     mcp_optional_startup_grace_ms: 5000,
                     mcp_servers: {
                         idea: {
@@ -1720,7 +1737,8 @@ if $IDEA_MODE; then
                     sandbox_workspace_write: {
                         network_access: false,
                         writable_roots: [$home]
-                    }
+                    },
+                    network: {allow_local_binding: true}
                 }'
         )"
     fi
@@ -1766,6 +1784,9 @@ codex_args=(
     -c 'approvals_reviewer="user"'
     -c "sandbox_workspace_write.network_access=false"
     -c "sandbox_workspace_write.writable_roots=[\"$CONTAINER_HOME\"]"
+    # This permits only container-local listeners such as the nREPL helper;
+    # external network access remains disabled above.
+    -c 'network.allow_local_binding=true'
 )
 
 if ! $IDEA_MODE && [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
