@@ -19,6 +19,13 @@ they are short and cross the user approval boundary. Delegate only substantial
 repetitive pre-commit validation or a complex staging audit; the primary still
 performs the final staging and commit.
 
+Keep Fast service scoped to the `code_reader` and `clojure_probe` custom-agent
+files. The primary and `mechanical_worker` remain on Standard service. The
+primary must never invoke `/fast` or enable Fast in global `config.toml`, and no
+subagent may change the primary, global, or another agent's service tier. Treat
+the agent-local setting as unverified until a spawned child reports
+`service_tier = "fast"` while the primary still reports `default`.
+
 Optimize routing for estimated credits, elapsed time, and correct accepted
 evidence rather than raw token count. Before spawning, give the worker an
 exclusive evidence boundary and acceptance criteria. Until its result arrives,

@@ -483,6 +483,14 @@ primary model or its reasoning effort:
 | `clojure_probe` | `gpt-5.6-luna`, low | Execute configured Clojure probes and reduce runtime output. |
 | `mechanical_worker` | `gpt-5.6-luna`, medium | Specified repetitive edits and deterministic focused checks. |
 
+Fast service is scoped to the two Luna/low custom agents. The primary and
+`mechanical_worker` remain on Standard service; routing instructions prohibit
+workers from invoking `/fast` or changing global or parent configuration. Fast
+mode targets roughly 1.5x model speed at 2.5x ChatGPT credit consumption, so it
+is a deliberate latency tradeoff rather than a credit-saving default for the
+Thinker. After changing this setting, verify that a spawned Luna/low child
+reports `service_tier = "fast"` while the primary remains `default`.
+
 The global routing instruction is advisory: it recommends delegation based on
 avoided context and specialization, even for a Luna primary. Architecture,
 probe design, ambiguous behavior, integration, and final review stay with the
