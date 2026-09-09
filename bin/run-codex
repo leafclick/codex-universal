@@ -71,6 +71,8 @@ usage() {
 Usage:
   run-codex [PROJECT] [--new] [--codex-option OPTION]...
   run-codex --new [PROJECT] [--codex-option OPTION]...
+  run-codex [PROJECT] --sessions
+  run-codex [PROJECT] --resume QUERY [--codex-option OPTION]...
   run-codex --idea PROJECT
 
   run-codex --init [--profile generic|cuda] [--clojure-mcp auto|on|off] [PROJECT [PATH]]
@@ -96,6 +98,8 @@ Examples:
 
   run-codex cortex
   run-codex cortex --new
+  run-codex cortex --sessions
+  run-codex cortex --resume gpu-tuning
   run-codex cortex --new --codex-option model=gpt-5.6-sol --codex-option reasoning=high
   run-codex cortex --codex-option no-alt-screen
   run-codex --idea cortex
@@ -401,6 +405,24 @@ parse_launch_args() {
                 NEW_SESSION=true
                 shift
                 ;;
+            --sessions)
+                ! $SESSION_LIST_MODE || die "--sessions may be specified only once"
+                SESSION_LIST_MODE=true
+                shift
+                ;;
+            --resume)
+                (($# >= 2)) || die "--resume requires a session name substring or UUID"
+                ! $RESUME_QUERY_SET || die "--resume may be specified only once"
+                RESUME_QUERY_SET=true
+                RESUME_QUERY="$2"
+                shift 2
+                ;;
+            --resume=*)
+                ! $RESUME_QUERY_SET || die "--resume may be specified only once"
+                RESUME_QUERY_SET=true
+                RESUME_QUERY="${1#--resume=}"
+                shift
+                ;;
             --codex-option)
                 (($# >= 2)) || die "--codex-option requires a value"
                 add_codex_option "$2"
@@ -420,6 +442,103 @@ parse_launch_args() {
                 ;;
         esac
     done
+}
+
+SESSION_ROWS='[]'
+RESOLVED_SESSION_ID=""
+RESOLVED_SESSION_NAME=""
+
+load_project_sessions() {
+    local container_cwd="$1"
+    local state_db="$HOME/.codex/state_5.sqlite"
+    local rows=""
+
+    need jq
+    need sqlite3
+
+    if [[ ! -e "$state_db" ]]; then
+        SESSION_ROWS='[]'
+        return 0
+    fi
+    [[ -f "$state_db" && -r "$state_db" ]] ||
+        die "Codex session index is not a readable regular file: $state_db"
+
+    if ! rows="$(
+        sqlite3 -readonly -json -cmd '.timeout 2000' -- "$state_db" \
+            "SELECT id,
+                    COALESCE(name, '') AS name,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', updated_at, 'unixepoch') AS updated_at,
+                    cwd
+               FROM threads
+              WHERE archived = 0
+              ORDER BY updated_at DESC, id DESC;"
+    )"; then
+        die "Unable to read the Codex session index: $state_db"
+    fi
+    [[ -n "$rows" ]] || rows='[]'
+    SESSION_ROWS="$(
+        jq -ce --arg cwd "$container_cwd" \
+            '[.[] | select(.cwd == $cwd) | {id, name, updated_at}]' <<<"$rows"
+    )" || die "Codex session index returned invalid data"
+}
+
+print_session_rows() {
+    local rows="$1"
+    local count
+    count="$(jq -r 'length' <<<"$rows")"
+
+    printf '%-20s %-36s %s\n' UPDATED ID NAME
+    if ((count == 0)); then
+        echo "(no matching active sessions)"
+        return 0
+    fi
+
+    while IFS=$'\t' read -r updated_at session_id session_name; do
+        [[ -n "$session_name" ]] || session_name="(unnamed)"
+        printf '%-20s %-36s %s\n' "$updated_at" "$session_id" "$session_name"
+    done < <(
+        jq -r '.[] |
+            [(.updated_at // "-"), .id,
+             ((.name // "") | gsub("[\\t\\r\\n]"; " "))] | @tsv' <<<"$rows"
+    )
+}
+
+resolve_session_query() {
+    local query="$1"
+    local matches count
+
+    [[ -n "$query" && "$query" != *$'\n'* && "$query" != *$'\r'* ]] ||
+        die "--resume requires a non-empty single-line session name substring or UUID"
+
+    matches="$(jq -ce --arg query "$query" \
+        '[.[] | select(.id == $query)]' <<<"$SESSION_ROWS")"
+    count="$(jq -r 'length' <<<"$matches")"
+    if ((count == 0)); then
+        matches="$(jq -ce --arg query "$query" \
+            '[.[] | select(
+                (.name // "") != "" and
+                ((.name | ascii_downcase) | contains($query | ascii_downcase))
+            )]' <<<"$SESSION_ROWS")"
+        count="$(jq -r 'length' <<<"$matches")"
+    fi
+
+    case "$count" in
+        0)
+            echo "ERROR: No active session for project '$PROJECT' matches '$query'." >&2
+            echo "List available sessions with: run-codex '$PROJECT' --sessions" >&2
+            exit 1
+            ;;
+        1)
+            RESOLVED_SESSION_ID="$(jq -r '.[0].id' <<<"$matches")"
+            RESOLVED_SESSION_NAME="$(jq -r '.[0].name' <<<"$matches")"
+            ;;
+        *)
+            echo "ERROR: Session query '$query' is ambiguous for project '$PROJECT'." >&2
+            echo "Matching sessions:" >&2
+            print_session_rows "$matches" >&2
+            exit 2
+            ;;
+    esac
 }
 
 profile_image() {
@@ -1333,6 +1452,9 @@ run_doctor() {
 }
 
 NEW_SESSION=false
+SESSION_LIST_MODE=false
+RESUME_QUERY_SET=false
+RESUME_QUERY=""
 IDEA_MODE=false
 DOCTOR_MODE=false
 PROJECT=""
@@ -1389,6 +1511,16 @@ case "${1:-}" in
         ;;
 esac
 
+$NEW_SESSION && $RESUME_QUERY_SET &&
+    die "--new and --resume are mutually exclusive"
+$SESSION_LIST_MODE && $RESUME_QUERY_SET &&
+    die "--sessions and --resume are mutually exclusive"
+if $SESSION_LIST_MODE &&
+   { $NEW_SESSION || ((${#CODEX_FORWARD_ARGS[@]} > 0)) ||
+     ((${#CODEX_IMAGE_REQUESTS[@]} > 0)) || $CODEX_PROMPT_SET; }; then
+    die "--sessions cannot be combined with launch options"
+fi
+
 if $DOCTOR_MODE; then
     run_doctor "$PROJECT"
     exit $?
@@ -1423,6 +1555,16 @@ PROFILE="$RESOLVED_PROFILE"
 IMAGE="$(profile_image "$PROFILE")"
 resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
 resolve_codex_image_options "$WORKSPACE_ROOT/$PROJECT"
+
+if $SESSION_LIST_MODE || $RESUME_QUERY_SET; then
+    load_project_sessions "$WORKSPACE_ROOT/$PROJECT"
+    if $SESSION_LIST_MODE; then
+        echo "Active Codex sessions for '$PROJECT':"
+        print_session_rows "$SESSION_ROWS"
+        exit 0
+    fi
+    resolve_session_query "$RESUME_QUERY"
+fi
 
 # Git identity is resolved on the host and exposed as container-local Git
 # configuration. This preserves normal per-repository/global Git identity
@@ -1806,6 +1948,8 @@ if $IDEA_MODE; then
     echo "Starting IntelliJ ACP agent for '$PROJECT'" >&2
 elif $NEW_SESSION; then
     echo "Starting new Codex session for '$PROJECT'"
+elif $RESUME_QUERY_SET; then
+    echo "Resuming Codex session '$RESOLVED_SESSION_NAME' for '$PROJECT'"
 else
     echo "Resuming last Codex session for '$PROJECT'"
 fi
@@ -1834,7 +1978,9 @@ if $IDEA_MODE; then
     docker "${docker_args[@]}" /usr/local/bin/codex-acp-entrypoint
 else
     session_args=(codex "${codex_args[@]}")
-    if ! $NEW_SESSION; then
+    if $RESUME_QUERY_SET; then
+        session_args+=(resume "$RESOLVED_SESSION_ID")
+    elif ! $NEW_SESSION; then
         session_args+=(resume --last)
     fi
     session_args+=("${CODEX_FORWARD_ARGS[@]}")

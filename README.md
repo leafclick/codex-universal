@@ -40,13 +40,13 @@ editor-aware navigation is useful.
 This is the shortest supported setup. Follow the linked detailed sections if a
 step fails or needs customization.
 
-1. Install Docker Engine, Bash, Git, AppArmor, `jq`, `socat`, and
+1. Install Docker Engine, Bash, Git, AppArmor, `jq`, `sqlite3`, `socat`, and
    `util-linux`. See
    [host requirements](#host-requirements); CUDA users must also complete
    [CUDA host setup](#cuda-host-setup).
 
    ```bash
-   sudo apt install apparmor apparmor-utils jq socat util-linux
+   sudo apt install apparmor apparmor-utils jq sqlite3 socat util-linux
    ```
 
 2. Clone the repository and build one image. Substitute `cuda` for `generic`
@@ -249,6 +249,7 @@ Building and running the containers requires:
 - GNU `coreutils`, including `realpath`
 - `util-linux`, including `flock` and `setpriv`
 - `jq`
+- `sqlite3`
 - `socat` for the optional IntelliJ MCP relay
 - AppArmor and `apparmor_parser`
 - `sudo` for the one-time AppArmor policy installation
@@ -476,7 +477,7 @@ primary model or its reasoning effort:
 | --- | --- | --- |
 | `code_reader` | `gpt-5.6-luna`, low | Read-heavy exploration and compact evidence. |
 | `clojure_probe` | `gpt-5.6-luna`, medium | Execute configured Clojure probes and reduce runtime output. |
-| `mechanical_worker` | `gpt-5.6-luna`, medium | Specified repetitive edits and deterministic focused checks. |
+| `mechanical_worker` | `gpt-5.6-luna`, medium | Specified repetitive edits, deterministic focused checks, and user-authorized Git bookkeeping. |
 
 The global routing instruction is advisory: it recommends delegation based on
 avoided context and specialization, even for a Luna primary. Architecture,
@@ -674,7 +675,7 @@ default seccomp and AppArmor policies intentionally block. Install this
 project's host policy once from the checkout:
 
 ```bash
-sudo apt install apparmor apparmor-utils jq socat util-linux
+sudo apt install apparmor apparmor-utils jq sqlite3 socat util-linux
 bin/setup-codex-host-security
 ```
 
@@ -1124,6 +1125,27 @@ or:
 ```bash
 run-codex my-project --new
 ```
+
+List the active, non-archived sessions recorded for a project:
+
+```bash
+run-codex my-project --sessions
+```
+
+The list contains only the session name, update time, and UUID; it does not
+print prompts or transcript previews. Names assigned automatically by Codex
+and names changed with `/rename` are both supported. Resume by full UUID or by
+a case-insensitive substring of the session name:
+
+```bash
+run-codex my-project --resume gpu-tuning
+```
+
+A unique match starts `codex resume UUID` inside the normal hardened project
+container. An ambiguous query prints only its matching sessions and exits
+without launching Docker. A missing query fails with a hint to run
+`--sessions`. Matching is restricted to non-archived sessions whose recorded
+container working directory belongs to the selected project.
 
 ### Per-session Codex options
 

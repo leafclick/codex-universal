@@ -485,6 +485,9 @@ for agent in clojure_probe mechanical_worker; do
         "$ROOT/container/codex-workflow/agents/$agent.toml" ||
         fail "$agent does not use medium reasoning"
 done
+grep -Fq 'routine status, staging, and commit execution' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "bundled routing does not delegate user-authorized Git bookkeeping"
 workflow_skill="$ROOT/container/codex-workflow/skills/clojure-development"
 [[ -x "$workflow_skill/scripts/clojure-development" ]] ||
     fail "Clojure development helper is not executable"
@@ -1052,6 +1055,8 @@ assert_contains "$launcher_help" \
     "Codex options (terminal mode, repeat --codex-option as needed):"
 assert_contains "$launcher_help" "reasoning=minimal|low|medium|high|xhigh"
 assert_contains "$launcher_help" "image=PROJECT_PATH"
+assert_contains "$launcher_help" "run-codex [PROJECT] --sessions"
+assert_contains "$launcher_help" "run-codex [PROJECT] --resume QUERY"
 
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     --init --profile generic smoke-project "$TEST_ROOT/repo" >/dev/null
@@ -1074,6 +1079,91 @@ assert_contains "$list_output" "generic"
 assert_contains "$list_output" "CLOJURE-MCP"
 assert_contains "$list_output" "auto"
 assert_contains "$list_output" "OK"
+
+mkdir -p -- "$TEST_ROOT/launcher-home/.codex"
+session_db="$TEST_ROOT/launcher-home/.codex/state_5.sqlite"
+sqlite3 "$session_db" <<'SQL'
+CREATE TABLE threads (
+    id TEXT PRIMARY KEY,
+    updated_at INTEGER NOT NULL,
+    cwd TEXT NOT NULL,
+    name TEXT,
+    archived INTEGER NOT NULL
+);
+INSERT INTO threads VALUES
+    ('11111111-1111-4111-8111-111111111111', 1788951000, '/workspace/smoke-project', 'GPU tuning baseline', 0),
+    ('22222222-2222-4222-8222-222222222222', 1788952000, '/workspace/smoke-project', 'GPU tuning follow-up', 0),
+    ('33333333-3333-4333-8333-333333333333', 1788953000, '/workspace/smoke-project', 'Release verification', 0),
+    ('44444444-4444-4444-8444-444444444444', 1788954000, '/workspace/other-project', 'Other project session', 0),
+    ('55555555-5555-4555-8555-555555555555', 1788955000, '/workspace/smoke-project', 'Archived GPU tuning', 1);
+SQL
+
+sessions_docker_log="$TEST_ROOT/sessions-docker-argv.log"
+sessions_output="$(
+    "${launcher_env[@]}" "CODEX_TEST_DOCKER_ARGV_LOG=$sessions_docker_log" \
+        "$ROOT/bin/run-codex" smoke-project --sessions
+)"
+assert_contains "$sessions_output" "Active Codex sessions for 'smoke-project':"
+assert_contains "$sessions_output" 'GPU tuning baseline'
+assert_contains "$sessions_output" 'GPU tuning follow-up'
+assert_contains "$sessions_output" 'Release verification'
+assert_not_contains "$sessions_output" 'Other project session'
+assert_not_contains "$sessions_output" 'Archived GPU tuning'
+[[ ! -e "$sessions_docker_log" ]] ||
+    fail "session listing invoked Docker"
+
+ambiguous_docker_log="$TEST_ROOT/ambiguous-sessions-docker-argv.log"
+if "${launcher_env[@]}" "CODEX_TEST_DOCKER_ARGV_LOG=$ambiguous_docker_log" \
+    "$ROOT/bin/run-codex" smoke-project --resume GPU \
+    >"$TEST_ROOT/ambiguous-sessions.out" 2>&1; then
+    fail "ambiguous session substring selected a session"
+fi
+ambiguous_output="$(<"$TEST_ROOT/ambiguous-sessions.out")"
+assert_contains "$ambiguous_output" "Session query 'GPU' is ambiguous"
+assert_contains "$ambiguous_output" 'GPU tuning baseline'
+assert_contains "$ambiguous_output" 'GPU tuning follow-up'
+assert_not_contains "$ambiguous_output" 'Release verification'
+[[ ! -e "$ambiguous_docker_log" ]] ||
+    fail "ambiguous session selection invoked Docker"
+
+missing_docker_log="$TEST_ROOT/missing-session-docker-argv.log"
+if "${launcher_env[@]}" "CODEX_TEST_DOCKER_ARGV_LOG=$missing_docker_log" \
+    "$ROOT/bin/run-codex" smoke-project --resume missing-name \
+    >"$TEST_ROOT/missing-session.out" 2>&1; then
+    fail "missing session substring selected a session"
+fi
+missing_output="$(<"$TEST_ROOT/missing-session.out")"
+assert_contains "$missing_output" "No active session for project 'smoke-project' matches 'missing-name'"
+assert_contains "$missing_output" "run-codex 'smoke-project' --sessions"
+[[ ! -e "$missing_docker_log" ]] ||
+    fail "missing session selection invoked Docker"
+
+unique_session_id='33333333-3333-4333-8333-333333333333'
+unique_docker_log="$TEST_ROOT/unique-session-docker-argv.log"
+unique_output="$(
+    "${launcher_env[@]}" "CODEX_TEST_DOCKER_ARGV_LOG=$unique_docker_log" \
+        "$ROOT/bin/run-codex" smoke-project --resume vErIfIcAtIoN
+)"
+assert_contains "$unique_output" \
+    "Resuming Codex session 'Release verification' for 'smoke-project'"
+assert_contains "$unique_output" "resume $unique_session_id"
+assert_not_contains "$unique_output" 'resume --last'
+grep -Fxq -- 'resume' "$unique_docker_log" ||
+    fail "unique session selection did not pass the resume subcommand"
+grep -Fxq -- "$unique_session_id" "$unique_docker_log" ||
+    fail "unique session selection did not pass the resolved UUID"
+
+exact_uuid_docker_log="$TEST_ROOT/exact-session-docker-argv.log"
+exact_uuid_output="$(
+    "${launcher_env[@]}" "CODEX_TEST_DOCKER_ARGV_LOG=$exact_uuid_docker_log" \
+        "$ROOT/bin/run-codex" smoke-project \
+        --resume 11111111-1111-4111-8111-111111111111
+)"
+assert_contains "$exact_uuid_output" \
+    "Resuming Codex session 'GPU tuning baseline' for 'smoke-project'"
+grep -Fxq -- '11111111-1111-4111-8111-111111111111' \
+    "$exact_uuid_docker_log" ||
+    fail "exact session UUID was not passed to Codex"
 
 mkdir -p "$TEST_ROOT/doctor-missing-bin"
 ln -s "$(type -P bash)" "$TEST_ROOT/doctor-missing-bin/bash"

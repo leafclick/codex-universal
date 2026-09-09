@@ -12,7 +12,9 @@ Keep architecture, probe design, ambiguous behavior, debugging conclusions,
 integration, and final review in the primary agent. Small targeted operations
 may stay local. Delegate when it avoids context or uses useful specialization,
 including when the primary model is Luna. Request worker summaries rather than
-raw intermediate output.
+raw intermediate output. When the user explicitly authorizes a commit, the
+primary owns the final diff review, commit scope, and message, then delegates
+routine status, staging, and commit execution to `mechanical_worker`.
 
 Once per Codex session, in the first user-visible response after acknowledging
 the request, add this concise notice: `Worker inspection: ask "agent status" or

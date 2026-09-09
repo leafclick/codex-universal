@@ -28,9 +28,10 @@ Only one machine should actively modify the shared Codex state at a time.
 ## Install required software
 
 The synchronization commands require Bash and standard GNU/Linux utilities.
-The complete host tool set below also includes `jq`, which is used by the
+The complete host tool set below also includes `jq` and `sqlite3`, which are
+used by `run-codex` session listing and selection. `jq` is also used by the
 optional `setup-codex-idea` command. On Debian, Ubuntu, and related
-distributions, install it with:
+distributions, install them with:
 
 ```bash
 sudo apt-get update
@@ -56,9 +57,9 @@ Important package-to-command mappings include:
 | `coreutils` | `sha256sum`, `realpath`, `basename`, `date`, `mktemp`, `sync` |
 | `findutils` | `find` |
 | `gawk` | `awk` |
-| `jq` | `jq` for `setup-codex-idea` |
+| `jq` | `jq` for `run-codex` session selection and `setup-codex-idea` |
 | `lsof` | `lsof` |
-| `sqlite3` | `sqlite3` |
+| `sqlite3` | `sqlite3` for Codex session selection and snapshot validation |
 | `tar` | GNU `tar` |
 | `util-linux` | `flock` |
 | `zstd` | `zstd` |
