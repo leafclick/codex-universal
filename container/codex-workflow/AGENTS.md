@@ -19,13 +19,6 @@ they are short and cross the user approval boundary. Delegate only substantial
 repetitive pre-commit validation or a complex staging audit; the primary still
 performs the final staging and commit.
 
-Keep Fast service scoped to the `code_reader` and `clojure_probe` custom-agent
-files. The primary and `mechanical_worker` remain on Standard service. The
-primary must never invoke `/fast` or enable Fast in global `config.toml`, and no
-subagent may change the primary, global, or another agent's service tier. Treat
-the agent-local setting as unverified until a spawned child reports
-`service_tier = "fast"` while the primary still reports `default`.
-
 Optimize routing for estimated credits, elapsed time, and correct accepted
 evidence rather than raw token count. Before spawning, give the worker an
 exclusive evidence boundary and acceptance criteria. Until its result arrives,
@@ -36,9 +29,15 @@ reuse the same worker with a correction that relies on retained evidence before
 starting a fresh investigation or taking the scope back locally. Batch related
 questions known at dispatch time into one worker assignment with one compact
 final summary; reserve follow-ups for genuinely new information or a specific
-acceptance failure. Batch primary-side reads and checks into as few tool/model
-turns as practical, bound tool output, and prefer one worker with related
-questions over several overlapping workers. Semantic workers must validate
+acceptance failure. Keep exact targeted tools local when their output is known
+and bounded, batching such calls into a few primary turns. For uncertain or
+noisy output, delegate execution plus reduction when safe. If approval, state,
+or architecture boundaries require the primary to execute, redirect stdout and
+stderr to explicit shared files and delegate only reduction without first
+loading raw output into primary context; consume the compact packet and do not
+reread the full output. Batch primary-side reads and checks into as few
+tool/model turns as practical, bound tool output, and prefer one worker with
+related questions over several overlapping workers. Semantic workers must validate
 arguments against the exposed tool schema, set a small result limit for symbol
 search, select the exact match before downstream queries, and prefer an exact
 file position after discovery. Treat semantic MCP readiness as client-local.

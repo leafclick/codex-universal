@@ -483,13 +483,14 @@ primary model or its reasoning effort:
 | `clojure_probe` | `gpt-5.6-luna`, low | Execute configured Clojure probes and reduce runtime output. |
 | `mechanical_worker` | `gpt-5.6-luna`, medium | Specified repetitive edits and deterministic focused checks. |
 
-Fast service is scoped to the two Luna/low custom agents. The primary and
-`mechanical_worker` remain on Standard service; routing instructions prohibit
-workers from invoking `/fast` or changing global or parent configuration. Fast
-mode targets roughly 1.5x model speed at 2.5x ChatGPT credit consumption, so it
-is a deliberate latency tradeoff rather than a credit-saving default for the
-Thinker. After changing this setting, verify that a spawned Luna/low child
-reports `service_tier = "fast"` while the primary remains `default`.
+All bundled agent files leave Fast disabled, so Standard is the default. Fast is
+an explicit user choice for a session or globally; agents respect that live
+choice. Codex CLI 0.153.4 was observed loading agent-local model and effort but
+applying `service_tier=default` when Fast keys were placed in custom-agent TOML,
+so selective agent-local Fast is not claimed. Fast targets roughly 1.5x model
+speed at 2.5x ChatGPT credit consumption. Reconsider agent-local Fast only after
+runtime telemetry simultaneously proves a child on Fast and the primary on
+default.
 
 The global routing instruction is advisory: it recommends delegation based on
 avoided context and specialization, even for a Luna primary. Architecture,
@@ -499,6 +500,13 @@ and corroborating searches; the parent consumes that evidence and repeats only
 targeted verification where necessary. Once delegated, the parent consumes
 that result without repeating its investigation; independent work may continue
 meanwhile. Small targeted work remains local.
+
+Keep exact targeted tools local when their output is known and bounded, batching
+such calls into a few primary turns. Delegate uncertain or noisy execution plus
+reduction when safe. If approval, state, or architecture boundaries require
+primary-owned execution, capture stdout and stderr in explicit shared files and
+delegate only reduction without loading raw output into primary context; consume
+the compact packet without rereading the full output.
 
 After the user explicitly authorizes a commit, the primary performs the final
 diff review, exact-path staging, and commit itself. These short Git metadata

@@ -481,23 +481,16 @@ for agent in code_reader clojure_probe; do
     grep -Fxq 'model_reasoning_effort = "low"' \
         "$ROOT/container/codex-workflow/agents/$agent.toml" ||
         fail "$agent does not use low reasoning"
-    grep -Fxq 'service_tier = "fast"' \
-        "$ROOT/container/codex-workflow/agents/$agent.toml" ||
-        fail "$agent does not use agent-local Fast service"
-    grep -Fxq 'features.fast_mode = true' \
-        "$ROOT/container/codex-workflow/agents/$agent.toml" ||
-        fail "$agent does not enable agent-local Fast mode"
 done
 grep -Fxq 'model_reasoning_effort = "medium"' \
     "$ROOT/container/codex-workflow/agents/mechanical_worker.toml" ||
     fail "mechanical_worker does not use medium reasoning"
-if grep -Eq '^(service_tier = "fast"|features\.fast_mode = true)$' \
-    "$ROOT/container/codex-workflow/agents/mechanical_worker.toml"; then
-    fail "mechanical_worker unexpectedly enables Fast service"
-fi
-grep -Fq 'The primary and `mechanical_worker` remain on Standard service.' \
-    "$ROOT/container/codex-workflow/AGENTS.md" ||
-    fail "bundled routing does not keep the primary and mechanical worker on Standard"
+for agent in code_reader clojure_probe mechanical_worker; do
+    if grep -Eq '^(service_tier = "fast"|features\.fast_mode = true)$' \
+        "$ROOT/container/codex-workflow/agents/$agent.toml"; then
+        fail "$agent unexpectedly enables agent-local Fast service"
+    fi
+done
 grep -Fq 'Keep routine Git metadata writes local because' \
     "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "bundled routing does not keep authorized Git bookkeeping in the primary"
