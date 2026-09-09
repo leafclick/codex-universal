@@ -45,6 +45,17 @@ resident LSP is unhealthy. When reporting numerical aggregates, state the
 formula or invariant and require components to reconcile with the reported
 total.
 
+The worker owns evidence reduction and first-pass recovery inside its boundary,
+even when that requires processing substantially more Luna tokens. Before
+returning, it must check every acceptance criterion, reconcile counts and
+weighted totals, distinguish a successful empty result from proof of absence,
+resolve tool errors with an allowed bounded fallback, and remove unrelated
+diagnostics or findings. Return a compact decision packet containing conclusions,
+minimal evidence locations, coverage, and unresolved risk—not raw transcripts
+for the primary to sift. If that packet still has an objective defect, the
+primary sends only the defect back to the same worker; it does not reconstruct
+the worker's investigation unless correction fails and the claim is high-risk.
+
 Match semantic-provider lifecycle to the client. Terminal sessions use the
 container-local Clojure LSP lifecycle above. IntelliJ ACP sessions reuse IDEA's
 already-running project index and must not call `start_lsp`. If both read-only

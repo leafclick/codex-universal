@@ -512,6 +512,15 @@ validate arguments against each tool schema, apply small symbol-search limits,
 select exact matches before downstream queries, and bound result volume.
 Numerical summaries must reconcile their components and totals before the
 primary accepts them.
+
+Workers deliberately absorb evidence-processing volume when that keeps raw
+results and repair work out of the more expensive primary context. Before
+handoff, a worker self-audits every acceptance criterion, reconciles call and
+credit totals, treats empty results cautiously when indexing is incomplete,
+performs allowed bounded fallback, and removes unrelated findings. It returns a
+compact decision packet rather than a transcript. The primary sends an
+objective defect back to the same worker for correction from retained evidence
+instead of reconstructing the investigation.
 Semantic MCP readiness can be client-local. When substantial semantic work is
 likely, one reader starts the LSP early for the exact root with a bounded
 readiness timeout while the primary continues disjoint work. The same reader
