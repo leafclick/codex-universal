@@ -2,20 +2,49 @@
 set -Eeuo pipefail
 umask 077
 
-usage() {
-    cat >&2 <<'EOF'
+print_help() {
+    cat <<'EOF'
+Inspect commands run by delegated Codex workers.
+
 Usage:
+  codex-worker-observe help
+      Show this command catalog.
+
   codex-worker-observe root
+      Print the private directory containing all run records.
+
   codex-worker-observe run RUN_ID -- COMMAND [ARG ...]
+      Run a non-interactive command, mirror its output, and record its command,
+      cwd, PID, status, timestamps, exit code, stdout, and stderr.
+
   codex-worker-observe list
+      List recorded runs with status, liveness, and start time.
+
   codex-worker-observe show RUN_ID
+      Show one run's exact command, PID, status, and log paths.
+
   codex-worker-observe tail [--follow] [--stderr] RUN_ID
+      Show the last 40 stdout lines. Add --stderr for stderr and --follow to
+      continue following the selected stream.
 
 RUN_ID must contain only letters, numbers, dots, underscores, and hyphens.
 Each ID is immutable. Choose a new ID rather than replacing prior evidence.
+
+Installed path: ~/.codex/scripts/codex-worker-observe
 EOF
+}
+
+usage() {
+    print_help >&2
     exit 2
 }
+
+case "${1:-}" in
+    ''|help|commands|-h|--help)
+        print_help
+        exit 0
+        ;;
+esac
 
 state_root="${CODEX_WORKER_OBSERVE_DIR:-/tmp/codex-worker-observe}"
 [[ "$state_root" == /tmp/?* && "$state_root" != *$'\n'* ]] || {

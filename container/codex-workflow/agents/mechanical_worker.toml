@@ -6,7 +6,7 @@ model_verbosity = "low"
 developer_instructions = """
 Perform only clearly specified repetitive edits, cljfmt, clj-kondo, patterned tests/configuration, and focused validation. Do not delegate further unless the parent explicitly asks. Edit files directly. Do not make architectural decisions. Do not create tests during exploratory implementation; add tests only after working behavior is confirmed and the parent explicitly delegates final test work.
 
-Before a substantial or long-running command, send the parent a START update with your role, a unique run ID, cwd, exact command, and separate stdout/stderr paths. Use $CODEX_HOME/scripts/codex-worker-observe for non-interactive fresh-process commands, then send EXIT with its exit code and a concise output/error summary. Never include secrets. Do not wrap small deterministic checks merely to create noise.
+For a substantial or long-running non-interactive fresh-process command, use ~/.codex/scripts/codex-worker-observe with the parent-assigned run ID, or choose a unique ID if none was assigned. If direct parent messaging is available, send START, running status, and EXIT with the exact command, cwd, log paths, exit code, and a concise output/error summary; otherwise rely on the durable helper record and your final summary. Never include secrets. Do not wrap small deterministic checks merely to create noise.
 
 Return only changed paths, concise changes, validation, and unresolved ambiguity.
 """

@@ -225,10 +225,30 @@ grep -Fq 'name the exact' "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not require destructive target specificity"
 grep -Fq 'Keep delegation observable' "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not require observable delegation"
+grep -Fq 'Once per Codex session' "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not announce worker inspection"
+grep -Fq 'do not assume such messaging exists' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance relies on unavailable worker-to-parent messaging"
+if grep -R -Fq '$CODEX_HOME/scripts/codex-worker-observe' \
+    "$ROOT/container/codex-workflow/AGENTS.md" \
+    "$ROOT/container/codex-workflow/agents"; then
+    fail "workflow guidance requires CODEX_HOME to be set"
+fi
 pass "workflow installer lifecycle and update ownership"
 
 observe_root="$TEST_ROOT/worker-observe"
 observe_helper="$ROOT/container/codex-workflow/scripts/codex-worker-observe"
+observe_help="$(CODEX_WORKER_OBSERVE_DIR=/not/below/tmp "$observe_helper" help)"
+assert_contains "$observe_help" 'Inspect commands run by delegated Codex workers.'
+assert_contains "$observe_help" 'codex-worker-observe list'
+assert_contains "$observe_help" 'List recorded runs with status, liveness, and start time.'
+assert_contains "$observe_help" 'codex-worker-observe show RUN_ID'
+assert_contains "$observe_help" 'codex-worker-observe tail'
+assert_contains "$observe_help" 'Installed path: ~/.codex/scripts/codex-worker-observe'
+observe_commands="$("$observe_helper" commands)"
+[[ "$observe_commands" == "$observe_help" ]] ||
+    fail "worker observability command catalog aliases disagree"
 set +e
 observe_stdout="$(
     CODEX_WORKER_OBSERVE_DIR="$observe_root" \

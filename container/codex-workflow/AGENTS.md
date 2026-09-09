@@ -14,24 +14,33 @@ may stay local. Delegate when it avoids context or uses useful specialization,
 including when the primary model is Luna. Request worker summaries rather than
 raw intermediate output.
 
-Keep delegation observable. Before a worker starts a substantial or
-long-running command, it sends the parent a compact `START` update containing
-its role, a unique run ID, working directory, exact command, and the stdout and
-stderr paths. The parent promptly relays that update to the user. Run
-non-interactive fresh-process probes through
-`$CODEX_HOME/scripts/codex-worker-observe run RUN_ID -- COMMAND ...`; do not
-wrap persistent `clojure-development` REPL operations, which already preserve
-their own evaluation records. For a running command, report its PID and status
-when available. At completion, send `EXIT` with the exit code, elapsed time,
-and a concise stdout/stderr summary. Never expose credentials or other secrets
-in commands, logs, or updates.
+Once per Codex session, in the first user-visible response after acknowledging
+the request, add this concise notice: `Worker inspection: ask "agent status" or
+"show active probes"; run ~/.codex/scripts/codex-worker-observe help for every
+command.` Do not repeat the notice later in the same session.
 
-Treat `agent status`, `show active probes`, `show probe RUN_ID`, and
-`tail probe RUN_ID` as inspection requests. The primary uses
-`codex-worker-observe list`, `show`, and `tail` and reports the result without
-interrupting the worker. A PID that is invisible from another tool sandbox is
-not proof of exit; preserve the helper's `not-visible-or-exited` distinction.
-Do not rely on experimental Codex features for worker observability.
+Keep delegation observable. Before spawning a worker expected to run a
+substantial or long-running command, the primary assigns a unique run ID and
+promptly announces the role, scope, run ID, and expected stdout/stderr paths to
+the user. The worker uses that ID to run non-interactive fresh-process probes
+through `~/.codex/scripts/codex-worker-observe run RUN_ID -- COMMAND ...`.
+If direct parent messaging is available, the worker sends `START`, running
+status, and `EXIT` updates; do not assume such messaging exists. The primary
+uses the durable record to inspect and relay the exact command, cwd, PID,
+status, exit code, and relevant stdout/stderr while the worker runs. Do not
+wrap persistent `clojure-development` REPL operations, which already preserve
+their own evaluation records. Never expose credentials or other secrets in
+commands, logs, or updates.
+
+Treat `agent status`, `show active probes`, `show probe RUN_ID`, `tail probe
+RUN_ID`, and `worker inspection help` as inspection requests. The primary uses
+the helper's `list`, `show`, `tail`, and `help` commands and reports the result
+without interrupting the worker. After starting a long-running worker, inspect
+its assigned record before entering an extended wait so its exact command and
+status become visible even without child-to-parent messaging. A PID that is
+invisible from another tool sandbox is not proof of exit; preserve the
+helper's `not-visible-or-exited` distinction. Do not rely on experimental Codex
+features for worker observability.
 
 When an operation needs approval, make the approval question and any reusable
 command prefix identify the substantive executable, action, and scope. Shell

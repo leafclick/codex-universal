@@ -490,17 +490,25 @@ hook blocks a primary or a worker, so normal targeted `rg`, `sed`, Clojure LSP,
 and IDEA MCP operations remain available.
 
 Delegated substantial and long-running commands are observable without an
-experimental Codex feature. Workers announce the role, run ID, cwd, exact
-command, and separate stdout/stderr paths before execution, and the primary
-relays the announcement. Fresh-process commands use the managed helper:
+experimental Codex feature. The primary announces the role, scope, assigned run
+ID, and separate stdout/stderr paths before execution, then reads the exact
+command, cwd, PID, and status from the run record. Fresh-process commands use
+the managed helper:
 
 ```bash
+~/.codex/scripts/codex-worker-observe help
 ~/.codex/scripts/codex-worker-observe run cla-gpu-1 -- clojure -M:mkl:cuda -m simulation ...
 ~/.codex/scripts/codex-worker-observe list
 ~/.codex/scripts/codex-worker-observe show cla-gpu-1
 ~/.codex/scripts/codex-worker-observe tail cla-gpu-1
 ~/.codex/scripts/codex-worker-observe tail --stderr --follow cla-gpu-1
 ```
+
+On its first user-visible response in a session, the primary announces the
+natural-language `agent status` and `show active probes` requests and points to
+the helper's `help` catalog. The primary assigns run IDs before substantial
+delegated commands and reads the durable record directly; worker-to-parent
+messaging is used when available but is not required.
 
 The helper mirrors output into the normal tool transcript while retaining
 immutable, per-run metadata and separate logs under
