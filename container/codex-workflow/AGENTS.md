@@ -16,6 +16,36 @@ raw intermediate output. When the user explicitly authorizes a commit, the
 primary owns the final diff review, commit scope, and message, then delegates
 routine status, staging, and commit execution to `mechanical_worker`.
 
+Optimize routing for estimated credits, elapsed time, and correct accepted
+evidence rather than raw token count. Before spawning, give the worker an
+exclusive evidence boundary and acceptance criteria. Until its result arrives,
+the primary must not search, read, or query inside that boundary; continue only
+with disjoint work. Consume the summary first and verify only a specific
+uncertain, contradictory, or high-risk claim. If the result is inadequate,
+reuse the same worker with a correction that relies on retained evidence before
+starting a fresh investigation or taking the scope back locally. Batch related
+primary-side reads and checks into as few tool/model turns as practical, bound
+tool output, and prefer one worker with related questions over several
+overlapping workers. Treat semantic MCP readiness as client-local. When a
+session is likely to need substantial semantic work, initialize one reader for
+the exact project root early with one bounded `start_lsp` call while the primary
+continues disjoint work. Reuse that reader and its resident LSP across later
+assignments, including after the reader becomes idle; do not restart it between
+tasks. Do not pay this startup cost for an isolated lookup, and do not retry a
+stalled start in that client. Restart only after concrete evidence that the
+resident LSP is unhealthy. When reporting numerical aggregates, state the
+formula or invariant and require components to reconcile with the reported
+total.
+
+Match semantic-provider lifecycle to the client. Terminal sessions use the
+container-local Clojure LSP lifecycle above. IntelliJ ACP sessions reuse IDEA's
+already-running project index and must not call `start_lsp`. If both read-only
+providers are actually exposed, routine questions still use one provider; for
+an ambiguous, incomplete, or high-risk claim, Luna readers may query both under
+explicit provider-specific evidence boundaries and return a compact agreement
+or discrepancy report. Treat this as deliberate corroboration, not permission
+for the primary to repeat either investigation.
+
 Once per Codex session, in the first user-visible response after acknowledging
 the request, add this concise notice: `Worker inspection: ask "agent status" or
 "show active probes"; run ~/.codex/scripts/codex-worker-observe help for every

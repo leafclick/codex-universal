@@ -486,9 +486,34 @@ primary. The reader owns its delegated semantic query, bounded source reads,
 and corroborating searches; the parent consumes that evidence and repeats only
 targeted verification where necessary. Once delegated, the parent consumes
 that result without repeating its investigation; independent work may continue
-meanwhile. Small targeted work remains local. No
-hook blocks a primary or a worker, so normal targeted `rg`, `sed`, Clojure LSP,
-and IDEA MCP operations remain available.
+meanwhile. Small targeted work remains local.
+
+Routing is optimized for estimated credits, elapsed time, and accepted evidence
+rather than raw token count. Each delegation defines an exclusive evidence
+boundary and acceptance criteria; the primary stays out of that boundary until
+it consumes the worker summary. A deficient result is corrected by reusing the
+same worker and its retained evidence before starting over. Primary-side tool
+operations should be batched and output-bounded because each additional model
+turn can cost more than the Luna worker it coordinates. Numerical summaries
+must reconcile their components and totals before the primary accepts them.
+Semantic MCP readiness can be client-local. When substantial semantic work is
+likely, one reader starts the LSP early for the exact root with a bounded
+readiness timeout while the primary continues disjoint work. The same reader
+and its resident LSP are reused across later assignments and idle turns; a
+healthy LSP is not restarted between tasks. An isolated lookup should not pay
+an explicit startup cost, a stalled start is not retried in the same client,
+and restart requires concrete evidence of an unhealthy resident LSP. No hook
+enforces these practices or blocks a primary or worker, so normal targeted
+`rg`, `sed`, Clojure LSP, and IDEA MCP operations remain available.
+
+Provider lifecycle follows the client. Terminal Codex readers use the
+container-local Clojure LSP lifecycle above, while IntelliJ ACP readers reuse
+IDEA's already-running project index and do not call `start_lsp`. If a client
+actually exposes both read-only providers, ordinary questions use one. For an
+ambiguous, incomplete, or high-risk claim, Luna readers may instead receive
+provider-specific evidence assignments and return a compact agreement or
+discrepancy report. This deliberate corroboration does not authorize the
+primary to repeat either search.
 
 Delegated substantial and long-running commands are observable without an
 experimental Codex feature. The primary announces the role, scope, assigned run
