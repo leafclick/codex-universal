@@ -634,12 +634,14 @@ endpoint, log, client-session, and full evaluation records. An entrypoint-owned
 service keeps the configured REPL alive across separate Codex tool-command
 sandboxes. The service has its own Bubblewrap boundary: working-tree and cache
 writes are allowed, while `.git` and `.codex` stay recursively read-only and a
-private PID namespace with an empty `/proc` prevents outer-mount bypasses. An
+private PID namespace with an otherwise empty `/proc` prevents outer-mount
+bypasses. The sole compatibility entry, `/proc/self/exe`, points to the selected
+image JVM so native runtimes such as oneMKL can locate their internal loaders;
+no process tree, descriptors, environment, or root paths are exposed. An
 inherited seccomp filter rejects nested user namespaces that could remount a
-writable parent around those protected paths. It
-never publishes an nREPL port or uses a host JVM. The launcher permits loopback
-binding solely for this container-local use; external network access remains
-disabled. Run its helper as
+writable parent around those protected paths. The service never publishes an
+nREPL port or uses a host JVM. The launcher permits loopback binding solely for
+this container-local use; external network access remains disabled. Run its helper as
 `~/.codex/skills/clojure-development/scripts/clojure-development repl-start
 <runtime>`, `repl-status`, `repl-eval '(+ 1 2)'`, and `repl-stop`. Evaluations
 are serialized. A timeout means execution may continue and must not be

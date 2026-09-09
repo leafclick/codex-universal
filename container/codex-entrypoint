@@ -136,6 +136,11 @@ start_clojure_repl_service() {
         # Do not expose /proc/<pid>/root from the outer container: that path
         # could otherwise bypass this service's read-only metadata mounts.
         --tmpfs /proc
+        # oneMKL resolves its internal loader relative to /proc/self/exe. Keep
+        # procfs otherwise empty, but identify the JVM selected above so native
+        # Clojure backends work without exposing any outer process metadata.
+        --dir /proc/self
+        --symlink "$java_binary" /proc/self/exe
         # Docker already gives the container a network namespace with only
         # loopback. Sharing it lets Codex probes reach nREPL without restoring
         # any external network access.

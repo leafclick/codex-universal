@@ -536,8 +536,10 @@ grep -Fq '\( -name .git -o -name .codex \) -prune -print0' \
     fail "persistent Clojure service does not protect Git and Codex metadata"
 grep -Fq -- '--unshare-pid' "$ROOT/container/codex-entrypoint" &&
     grep -Fq -- '--tmpfs /proc' "$ROOT/container/codex-entrypoint" &&
+    grep -Fq -- '--dir /proc/self' "$ROOT/container/codex-entrypoint" &&
+    grep -Fq -- '--symlink "$java_binary" /proc/self/exe' "$ROOT/container/codex-entrypoint" &&
     grep -Fq -- '--namespace-scoped' "$ROOT/container/codex-entrypoint" ||
-    fail "persistent Clojure service exposes the outer container procfs"
+    fail "persistent Clojure service procfs boundary is incomplete"
 if grep -Fq -- '--unshare-net' "$ROOT/container/codex-entrypoint"; then
     fail "persistent Clojure service cannot share container loopback"
 fi
@@ -637,6 +639,8 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
             --ro-bind / / \
             --dev /dev \
             --tmpfs /proc \
+            --dir /proc/self \
+            --symlink /bin/sh /proc/self/exe \
             --bind "$TEST_ROOT" "$TEST_ROOT" \
             --ro-bind "$namespace_project/.git" "$namespace_project/.git" \
             --chdir "$namespace_project" \
@@ -658,9 +662,9 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
                 --dir "$namespace_project" \
                 "$namespace_fixture/control.fifo" namespace-token \
                 -- bash -c \
-                'setsid bash -c '\''trap "" TERM; sleep 30'\'' & sleep 30' \
+                '[[ "$(readlink /proc/self/exe)" == /bin/sh && ! -e /proc/1/root ]]; setsid bash -c '\''trap "" TERM; sleep 30'\'' & sleep 30' \
                 | grep -Eq '^started [0-9]+$' ||
-                fail "namespace-scoped supervisor did not start its process tree"
+                fail "namespace-scoped supervisor lost its minimal proc compatibility boundary"
             "$process_supervisor" control \
                 "$namespace_fixture/control.fifo" namespace-token stop \
                 | grep -Fxq 'stopped confirmed' ||
