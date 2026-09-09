@@ -481,7 +481,7 @@ primary model or its reasoning effort:
 | --- | --- | --- |
 | `code_reader` | `gpt-5.6-luna`, low | Read-heavy exploration and compact evidence. |
 | `clojure_probe` | `gpt-5.6-luna`, medium | Execute configured Clojure probes and reduce runtime output. |
-| `mechanical_worker` | `gpt-5.6-luna`, medium | Specified repetitive edits, deterministic focused checks, and user-authorized Git bookkeeping. |
+| `mechanical_worker` | `gpt-5.6-luna`, medium | Specified repetitive edits and deterministic focused checks. |
 
 The global routing instruction is advisory: it recommends delegation based on
 avoided context and specialization, even for a Luna primary. Architecture,
@@ -491,6 +491,12 @@ and corroborating searches; the parent consumes that evidence and repeats only
 targeted verification where necessary. Once delegated, the parent consumes
 that result without repeating its investigation; independent work may continue
 meanwhile. Small targeted work remains local.
+
+After the user explicitly authorizes a commit, the primary performs the final
+diff review, exact-path staging, and commit itself. These short Git metadata
+writes cross the user approval boundary and are not delegated merely to use a
+cheaper worker. A mechanical worker may still perform substantial repetitive
+pre-commit validation or a complex staging audit.
 
 Agent routing is explicitly optimized for Codex credit spending, elapsed time,
 and accepted evidence rather than raw token count. Each delegation defines an

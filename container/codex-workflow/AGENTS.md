@@ -13,8 +13,11 @@ integration, and final review in the primary agent. Small targeted operations
 may stay local. Delegate when it avoids context or uses useful specialization,
 including when the primary model is Luna. Request worker summaries rather than
 raw intermediate output. When the user explicitly authorizes a commit, the
-primary owns the final diff review, commit scope, and message, then delegates
-routine status, staging, and commit execution to `mechanical_worker`.
+primary owns the final diff review, commit scope and message, exact-path
+staging, and commit execution. Keep routine Git metadata writes local because
+they are short and cross the user approval boundary. Delegate only substantial
+repetitive pre-commit validation or a complex staging audit; the primary still
+performs the final staging and commit.
 
 Optimize routing for estimated credits, elapsed time, and correct accepted
 evidence rather than raw token count. Before spawning, give the worker an
