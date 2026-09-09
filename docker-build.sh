@@ -21,7 +21,7 @@ Usage: $(basename "$0") [generic|cuda|all]
 
 Environment:
   IMAGE_SLUG=SLUG             Image repository slug; defaults from GitHub origin
-  IMAGE_VERSION=VERSION       Docker tag; defaults from Git
+  IMAGE_VERSION=VERSION       Docker tag; defaults from Git tag lineage or branch
   TAG_LATEST=1                Also update the local latest alias
   CODEX_VERSION=latest        @openai/codex npm version
   CODEX_ACP_VERSION=latest    @agentclientprotocol/codex-acp npm version
@@ -52,6 +52,27 @@ docker_tag_slug() {
 
     [[ -n "$value" ]] || die "Could not derive a valid Docker tag"
     printf '%s\n' "$value"
+}
+
+git_describe_slug() {
+    local described="$1"
+    local tag distance revision suffix tag_slug max_tag_length
+
+    [[ "$described" =~ ^(.+)-([0-9]+)-g([0-9a-f]+)$ ]] ||
+        die "Unexpected git describe output: $described"
+    tag="${BASH_REMATCH[1]}"
+    distance="${BASH_REMATCH[2]}"
+    revision="${BASH_REMATCH[3]}"
+    suffix="-$distance-g$revision"
+    tag_slug="$(docker_tag_slug "$tag")"
+    max_tag_length=$((100 - ${#suffix}))
+    ((max_tag_length > 0)) || die "Git describe suffix is too long for a Docker tag"
+    tag_slug="${tag_slug:0:max_tag_length}"
+    while [[ "$tag_slug" == *[.-] ]]; do
+        tag_slug="${tag_slug::-1}"
+    done
+    [[ -n "$tag_slug" ]] || die "Could not derive a valid Docker tag from git describe"
+    printf '%s%s\n' "$tag_slug" "$suffix"
 }
 
 resolve_git_metadata() {
@@ -96,15 +117,20 @@ resolve_git_metadata() {
     fi
 
     if [[ -z "$IMAGE_VERSION" ]]; then
-        local exact_tag branch short_revision
+        local exact_tag described_version branch short_revision
         exact_tag="$(git -C "$SCRIPT_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
         short_revision="$(git -C "$SCRIPT_DIR" rev-parse --short=12 HEAD)"
 
         if [[ -n "$exact_tag" ]]; then
             IMAGE_VERSION="$(docker_tag_slug "$exact_tag")"
         else
-            branch="$(git -C "$SCRIPT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || echo detached)"
-            IMAGE_VERSION="dev-$(docker_tag_slug "$branch")-$short_revision"
+            described_version="$(git -C "$SCRIPT_DIR" describe --tags --long --abbrev=12 HEAD 2>/dev/null || true)"
+            if [[ -n "$described_version" ]]; then
+                IMAGE_VERSION="$(git_describe_slug "$described_version")"
+            else
+                branch="$(git -C "$SCRIPT_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || echo detached)"
+                IMAGE_VERSION="dev-$(docker_tag_slug "$branch")-$short_revision"
+            fi
         fi
 
         if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=normal)" ]]; then

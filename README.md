@@ -212,10 +212,14 @@ leafclick/codex-universal-generic
 leafclick/codex-universal-cuda
 ```
 
-Every build tags its image with a Git-derived version. A clean checkout at an exact Git tag uses that tag. Other commits use `dev-<branch-slug>-<short-commit>`, and a modified checkout adds `-dirty`:
+Every build tags its image with a Git-derived version. A clean checkout at an
+exact Git tag uses that tag. Descendant commits use the nearest tag's slug plus
+their distance and short commit, while a repository without a reachable tag
+uses `dev-<branch-slug>-<short-commit>`. A modified checkout adds `-dirty`:
 
 ```text
 leafclick/codex-universal-generic:v1.2.0
+leafclick/codex-universal-generic:v1.2.0-2-ga1b2c3d4e5f6
 leafclick/codex-universal-generic:dev-main-a1b2c3d4e5f6-dirty
 ```
 

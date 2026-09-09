@@ -1679,6 +1679,83 @@ assert_contains "$no_origin_output" "leafclick/codex-universal-generic:dev-"
 assert_contains "$no_origin_output" "--build-arg IMAGE_SOURCE="
 pass "Git metadata fallback without origin"
 
+# Git-derived image versions must remain stable and informative in isolated
+# local checkouts. Keep these builds behind the fake Docker frontend above so
+# the cases do not require a daemon, network, or image build.
+make_version_repo() {
+    local repo="$1"
+    mkdir -p -- "$repo"
+    cp -- "$ROOT/docker-build.sh" "$ROOT/Dockerfile.generic" "$repo/"
+    git -C "$repo" init -q
+    git -C "$repo" config user.name host-smoke
+    git -C "$repo" config user.email host-smoke.invalid
+    git -C "$repo" add docker-build.sh Dockerfile.generic
+    git -C "$repo" commit -q -m initial
+}
+
+tagged_repo="$TEST_ROOT/tagged-version"
+make_version_repo "$tagged_repo"
+git -C "$tagged_repo" tag 'Release/1.2.3'
+tagged_output="$({
+    cd -- "$tagged_repo"
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=0 PULL=0 ./docker-build.sh generic
+})"
+assert_contains "$tagged_output" \
+    "-t leafclick/codex-universal-generic:release-1.2.3"
+pass "exact Git tag image version slug"
+
+descended_repo="$TEST_ROOT/descended-version"
+make_version_repo "$descended_repo"
+git -C "$descended_repo" tag v2.4.0
+printf '%s\n' descended > "$descended_repo/marker"
+git -C "$descended_repo" add marker
+git -C "$descended_repo" commit -q -m descended
+descended_sha="$(git -C "$descended_repo" rev-parse --short=12 HEAD)"
+descended_output="$({
+    cd -- "$descended_repo"
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=0 PULL=0 ./docker-build.sh generic
+})"
+assert_contains "$descended_output" \
+    "-t leafclick/codex-universal-generic:v2.4.0-1-g$descended_sha"
+assert_not_contains "$descended_output" "dev-master-$descended_sha"
+pass "descended Git tag image version"
+
+long_descended_repo="$TEST_ROOT/long-descended-version"
+make_version_repo "$long_descended_repo"
+long_tag="release-$(printf 'x%.0s' {1..110})"
+git -C "$long_descended_repo" tag "$long_tag"
+printf '%s\n' long-descended > "$long_descended_repo/marker"
+git -C "$long_descended_repo" add marker
+git -C "$long_descended_repo" commit -q -m long-descended
+long_descended_sha="$(git -C "$long_descended_repo" rev-parse --short=12 HEAD)"
+long_descended_output="$({
+    cd -- "$long_descended_repo"
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=0 PULL=0 ./docker-build.sh generic
+})"
+assert_contains "$long_descended_output" "-1-g$long_descended_sha"
+pass "long Git tag preserves descendant suffix"
+
+fallback_repo="$TEST_ROOT/fallback-version"
+make_version_repo "$fallback_repo"
+git -C "$fallback_repo" checkout -q -b 'feature/smoke'
+fallback_sha="$(git -C "$fallback_repo" rev-parse --short=12 HEAD)"
+fallback_output="$({
+    cd -- "$fallback_repo"
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=0 PULL=0 ./docker-build.sh generic
+})"
+assert_contains "$fallback_output" \
+    "-t leafclick/codex-universal-generic:dev-feature-smoke-$fallback_sha"
+pass "unreachable-tag Git branch fallback image version"
+
+printf '%s\n' dirty > "$tagged_repo/untracked"
+dirty_output="$({
+    cd -- "$tagged_repo"
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=0 PULL=0 ./docker-build.sh generic
+})"
+assert_contains "$dirty_output" \
+    "-t leafclick/codex-universal-generic:release-1.2.3-dirty"
+pass "dirty Git-derived image version suffix"
+
 if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     SYNC_ROOT="$TEST_ROOT/sync"
     LOCK_FILE="$TEST_ROOT/codex-handoff.lock"
