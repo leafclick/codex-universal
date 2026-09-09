@@ -477,17 +477,17 @@ for agent in code_reader clojure_probe mechanical_worker; do
     grep -Fxq 'model = "gpt-5.6-luna"' "$agent_file" ||
         fail "bundled agent $agent does not use Luna"
 done
-grep -Fxq 'model_reasoning_effort = "low"' \
-    "$ROOT/container/codex-workflow/agents/code_reader.toml" ||
-    fail "code_reader does not use low reasoning"
-for agent in clojure_probe mechanical_worker; do
-    grep -Fxq 'model_reasoning_effort = "medium"' \
+for agent in code_reader clojure_probe; do
+    grep -Fxq 'model_reasoning_effort = "low"' \
         "$ROOT/container/codex-workflow/agents/$agent.toml" ||
-        fail "$agent does not use medium reasoning"
+        fail "$agent does not use low reasoning"
 done
-grep -Fq 'routine status, staging, and commit execution' \
+grep -Fxq 'model_reasoning_effort = "medium"' \
+    "$ROOT/container/codex-workflow/agents/mechanical_worker.toml" ||
+    fail "mechanical_worker does not use medium reasoning"
+grep -Fq 'Keep routine Git metadata writes local because' \
     "$ROOT/container/codex-workflow/AGENTS.md" ||
-    fail "bundled routing does not delegate user-authorized Git bookkeeping"
+    fail "bundled routing does not keep authorized Git bookkeeping in the primary"
 workflow_skill="$ROOT/container/codex-workflow/skills/clojure-development"
 [[ -x "$workflow_skill/scripts/clojure-development" ]] ||
     fail "Clojure development helper is not executable"

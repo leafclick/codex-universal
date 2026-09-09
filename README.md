@@ -480,7 +480,7 @@ primary model or its reasoning effort:
 | Agent | Fixed model and effort | Use |
 | --- | --- | --- |
 | `code_reader` | `gpt-5.6-luna`, low | Read-heavy exploration and compact evidence. |
-| `clojure_probe` | `gpt-5.6-luna`, medium | Execute configured Clojure probes and reduce runtime output. |
+| `clojure_probe` | `gpt-5.6-luna`, low | Execute configured Clojure probes and reduce runtime output. |
 | `mechanical_worker` | `gpt-5.6-luna`, medium | Specified repetitive edits and deterministic focused checks. |
 
 The global routing instruction is advisory: it recommends delegation based on
