@@ -499,7 +499,15 @@ primary. The reader owns its delegated semantic query, bounded source reads,
 and corroborating searches; the parent consumes that evidence and repeats only
 targeted verification where necessary. Once delegated, the parent consumes
 that result without repeating its investigation; independent work may continue
-meanwhile. Small targeted work remains local.
+meanwhile. Small targeted work remains local, and primary explanations are
+concise by default unless requested detail or correctness requires more.
+
+Several already-identified trivial tasks may be dispatched to workers
+concurrently when they are genuinely independent and overlapping them should
+materially reduce elapsed time. Their boundaries must be disjoint, all should
+start before the primary waits, and their compact results should be collected
+once. A lone trivial task stays local; dependent work is not split merely to
+create parallelism, and workers do not fan out further.
 
 Keep exact targeted tools local when their output is known and bounded, batching
 such calls into a few primary turns. Delegate uncertain or noisy execution plus
@@ -575,6 +583,7 @@ the managed helper:
 ~/.codex/scripts/codex-worker-observe run cla-gpu-1 -- clojure -M:mkl:cuda -m simulation ...
 ~/.codex/scripts/codex-worker-observe list
 ~/.codex/scripts/codex-worker-observe show cla-gpu-1
+~/.codex/scripts/codex-worker-observe summary cla-gpu-1
 ~/.codex/scripts/codex-worker-observe tail cla-gpu-1
 ~/.codex/scripts/codex-worker-observe tail --stderr --follow cla-gpu-1
 ```
@@ -582,8 +591,9 @@ the managed helper:
 On its first user-visible response in a session, the primary announces the
 natural-language `agent status` and `show active probes` requests and points to
 the helper's `help` catalog. The primary assigns run IDs before substantial
-delegated commands and reads the durable record directly; worker-to-parent
-messaging is used when available but is not required.
+delegated commands and reads the durable record directly. It uses the bounded
+`summary` view first and opens a longer log tail only when needed;
+worker-to-parent messaging is used when available but is not required.
 
 The helper mirrors output into the normal tool transcript while retaining
 immutable, per-run metadata and separate logs under

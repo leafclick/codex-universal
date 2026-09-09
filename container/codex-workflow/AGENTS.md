@@ -5,7 +5,16 @@ Clojure runtime experiments or noisy result reduction to `clojure_probe`, and
 clearly specified repetitive edits or deterministic validation to
 `mechanical_worker`. Keep architecture, probe design, ambiguous behavior,
 debugging conclusions, integration, and final review in the primary. Keep small
-targeted operations local, including when the primary model is Luna.
+targeted operations local, including when the primary model is Luna. Keep the
+primary's user-facing explanations concise by default; expand only when the
+user asks or correctness, risk, or a decision requires the detail.
+
+When several already-identified trivial tasks are genuinely independent, the
+primary may dispatch them concurrently if overlapping their execution should
+materially reduce elapsed time. Give them disjoint boundaries, start all of
+them before waiting, and collect their compact results once. Do not delegate a
+lone trivial task, split dependent work to manufacture parallelism, or ask a
+worker to fan out further.
 
 Optimize routing for estimated credits, elapsed time, and accepted evidence,
 not raw token count. Keep exact tools local when their output is known and
@@ -75,16 +84,19 @@ assign and announce a unique run ID, role, scope, and expected stdout/stderr
 paths. The worker runs it non-interactively through
 `~/.codex/scripts/codex-worker-observe run RUN_ID -- COMMAND ...`. Inspect the
 durable record before an extended wait and relay its exact command, cwd, PID,
-status, exit code, and relevant log excerpts. Prefer the record over model-visible
-progress chatter; terse `START` and `EXIT` messages are enough when direct parent
-messaging is useful, but do not assume such messaging exists. Do not wrap persistent `clojure-development` REPL actions,
+status, exit code, and relevant log excerpts. Use `summary RUN_ID` first and
+open a longer tail only when its bounded evidence is insufficient. Prefer the
+record over model-visible progress chatter; terse `START` and `EXIT` messages
+are enough when direct parent messaging is useful, but do not assume such
+messaging exists. Do not wrap persistent `clojure-development` REPL actions,
 which already preserve evaluation records. Never expose secrets.
 
-Treat `agent status`, `show active probes`, `show probe RUN_ID`, `tail probe
-RUN_ID`, and `worker inspection help` as inspection requests. Use the helper's
-`list`, `show`, `tail`, or `help` without interrupting the worker. Preserve its
-`not-visible-or-exited` distinction; cross-sandbox PID invisibility does not
-prove exit. Do not rely on experimental Codex features for observability.
+Treat `agent status`, `show active probes`, `show probe RUN_ID`, `summarize probe
+RUN_ID`, `tail probe RUN_ID`, and `worker inspection help` as inspection
+requests. Use the helper's `list`, `show`, `summary`, `tail`, or `help` without
+interrupting the worker. Preserve its `not-visible-or-exited` distinction;
+cross-sandbox PID invisibility does not prove exit. Do not rely on experimental
+Codex features for observability.
 
 Approval questions and reusable prefixes must name the substantive executable, action, and scope.
 Shell setup, environment assignments, or generic wrappers are not the approved

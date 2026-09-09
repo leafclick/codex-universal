@@ -23,6 +23,9 @@ Usage:
   codex-worker-observe show RUN_ID
       Show one run's exact command, PID, status, and log paths.
 
+  codex-worker-observe summary RUN_ID
+      Show run metadata, log line and byte counts, and bounded log tails.
+
   codex-worker-observe tail [--follow] [--stderr] RUN_ID
       Show the last 40 stdout lines. Add --stderr for stderr and --follow to
       continue following the selected stream.
@@ -98,6 +101,22 @@ liveness_for() {
         # Tool calls can use different PID namespaces. Absence is deliberately
         # not treated as proof that the command exited.
         printf '%s' 'not-visible-or-exited'
+    fi
+}
+
+print_log_summary() {
+    local stream="$1"
+    local log_path="$2"
+    local line_count byte_count
+    line_count="$(wc -l < "$log_path")"
+    byte_count="$(wc -c < "$log_path")"
+    printf '%-12s %s lines, %s bytes\n' "$stream:" "$line_count" "$byte_count"
+    printf '%s-tail (last 20 lines, max 4096 bytes):\n' "$stream"
+    if [[ -s "$log_path" ]]; then
+        tail -n 20 -- "$log_path" | tail -c 4096
+        printf '\n'
+    else
+        printf '%s\n' '(empty)'
     fi
 }
 
@@ -198,6 +217,17 @@ case "$command_name" in
         printf '%-12s %s\n' 'liveness:' "$(liveness_for "$run_dir")"
         printf '%-12s %s\n' 'stdout:' "$run_dir/stdout.log"
         printf '%-12s %s\n' 'stderr:' "$run_dir/stderr.log"
+        ;;
+    summary)
+        (($# == 2)) || usage
+        run_dir="$(run_dir_for "$2")"
+        [[ -d "$run_dir" ]] || { echo "Unknown run ID: $2" >&2; exit 1; }
+        for field in status pid wrapper-pid started-at finished-at exit-code signal cwd command; do
+            printf '%-12s %s\n' "$field:" "$(read_field "$run_dir" "$field")"
+        done
+        printf '%-12s %s\n' 'liveness:' "$(liveness_for "$run_dir")"
+        print_log_summary stdout "$run_dir/stdout.log"
+        print_log_summary stderr "$run_dir/stderr.log"
         ;;
     tail)
         shift

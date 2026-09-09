@@ -230,6 +230,13 @@ grep -Fq 'Once per Codex session' "$ROOT/container/codex-workflow/AGENTS.md" ||
 grep -Fq 'do not assume such messaging exists' \
     "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance relies on unavailable worker-to-parent messaging"
+grep -Fq 'user-facing explanations concise by default' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not keep user-facing explanations concise by default"
+grep -Fq 'genuinely independent' "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not require genuinely independent delegation"
+grep -Fq 'Use `summary RUN_ID` first' "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not prefer bounded worker summaries"
 if grep -R -Fq '$CODEX_HOME/scripts/codex-worker-observe' \
     "$ROOT/container/codex-workflow/AGENTS.md" \
     "$ROOT/container/codex-workflow/agents"; then
@@ -244,6 +251,7 @@ assert_contains "$observe_help" 'Inspect commands run by delegated Codex workers
 assert_contains "$observe_help" 'codex-worker-observe list'
 assert_contains "$observe_help" 'List recorded runs with status, liveness, and start time.'
 assert_contains "$observe_help" 'codex-worker-observe show RUN_ID'
+assert_contains "$observe_help" 'codex-worker-observe summary RUN_ID'
 assert_contains "$observe_help" 'codex-worker-observe tail'
 assert_contains "$observe_help" 'Installed path: ~/.codex/scripts/codex-worker-observe'
 observe_commands="$("$observe_helper" commands)"
@@ -273,6 +281,12 @@ grep -Fxq 7 "$observe_root/failing-probe/exit-code" ||
 observe_show="$(CODEX_WORKER_OBSERVE_DIR="$observe_root" "$observe_helper" show failing-probe)"
 assert_contains "$observe_show" 'status:      failed'
 assert_contains "$observe_show" 'exit-code:   7'
+observe_summary="$(CODEX_WORKER_OBSERVE_DIR="$observe_root" "$observe_helper" summary failing-probe)"
+assert_contains "$observe_summary" 'status:      failed'
+assert_contains "$observe_summary" 'stdout:      1 lines, 10 bytes'
+assert_contains "$observe_summary" 'stderr:      1 lines, 10 bytes'
+assert_contains "$observe_summary" 'probe-out'
+assert_contains "$observe_summary" 'probe-err'
 observe_list="$(CODEX_WORKER_OBSERVE_DIR="$observe_root" "$observe_helper" list)"
 assert_contains "$observe_list" 'failing-probe'
 [[ "$(CODEX_WORKER_OBSERVE_DIR="$observe_root" "$observe_helper" tail failing-probe)" == probe-out ]] ||
