@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+usage() {
+    cat >&2 <<'EOF'
+Usage:
+  codex-worker-observe root
+  codex-worker-observe run RUN_ID -- COMMAND [ARG ...]
+  codex-worker-observe list
+  codex-worker-observe show RUN_ID
+  codex-worker-observe tail [--follow] [--stderr] RUN_ID
+
+RUN_ID must contain only letters, numbers, dots, underscores, and hyphens.
+Each ID is immutable. Choose a new ID rather than replacing prior evidence.
+EOF
+    exit 2
+}
+
+state_root="${CODEX_WORKER_OBSERVE_DIR:-/tmp/codex-worker-observe}"
+[[ "$state_root" == /tmp/?* && "$state_root" != *$'\n'* ]] || {
+    echo "CODEX_WORKER_OBSERVE_DIR must be a path below /tmp" >&2
+    exit 2
+}
+mkdir -p -- "$state_root"
+state_root="$(realpath -e -- "$state_root")"
+[[ "$state_root" == /tmp/?* ]] || {
+    echo "CODEX_WORKER_OBSERVE_DIR must resolve below /tmp" >&2
+    exit 2
+}
+chmod 0700 -- "$state_root"
+
+validate_id() {
+    local run_id="$1"
+    [[ "$run_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
+        echo "Invalid run ID: $run_id" >&2
+        exit 2
+    }
+}
+
+run_dir_for() {
+    local run_id="$1"
+    validate_id "$run_id"
+    printf '%s/%s\n' "$state_root" "$run_id"
+}
+
+read_field() {
+    local run_dir="$1"
+    local field="$2"
+    if [[ -f "$run_dir/$field" ]]; then
+        cat -- "$run_dir/$field"
+    else
+        printf '%s' '-'
+    fi
+}
+
+liveness_for() {
+    local run_dir="$1"
+    local recorded pid
+    recorded="$(read_field "$run_dir" status)"
+    [[ "$recorded" == running ]] || {
+        printf '%s' 'not-applicable'
+        return
+    }
+    pid="$(read_field "$run_dir" pid)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        printf '%s' 'visible'
+    else
+        # Tool calls can use different PID namespaces. Absence is deliberately
+        # not treated as proof that the command exited.
+        printf '%s' 'not-visible-or-exited'
+    fi
+}
+
+command_name="${1:-}"
+case "$command_name" in
+    root)
+        (($# == 1)) || usage
+        printf '%s\n' "$state_root"
+        ;;
+    run)
+        (($# >= 4)) || usage
+        run_id="$2"
+        [[ "$3" == -- ]] || usage
+        shift 3
+        run_dir="$(run_dir_for "$run_id")"
+        if ! mkdir -- "$run_dir" 2>/dev/null; then
+            echo "Run ID already exists or cannot be created: $run_id" >&2
+            exit 2
+        fi
+        chmod 0700 -- "$run_dir"
+        printf '%s\n' "$(pwd -P)" > "$run_dir/cwd"
+        printf '%q ' "$@" > "$run_dir/command"
+        printf '\n' >> "$run_dir/command"
+        printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/started-at"
+        printf '%s\n' "$$" > "$run_dir/wrapper-pid"
+        : > "$run_dir/stdout.log"
+        : > "$run_dir/stderr.log"
+        printf '%s\n' starting > "$run_dir/status"
+
+        child_pid=""
+        finished=0
+        finish_interrupted() {
+            local signal_name="$1"
+            local exit_code="$2"
+            if [[ -n "$child_pid" ]]; then
+                kill -"$signal_name" "$child_pid" 2>/dev/null || true
+                wait "$child_pid" 2>/dev/null || true
+            fi
+            printf '%s\n' interrupted > "$run_dir/status"
+            printf '%s\n' "$exit_code" > "$run_dir/exit-code"
+            printf '%s\n' "$signal_name" > "$run_dir/signal"
+            printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
+            finished=1
+            exit "$exit_code"
+        }
+        finish_unknown() {
+            local exit_code=$?
+            if ((finished == 0)); then
+                printf '%s\n' unknown > "$run_dir/status"
+                printf '%s\n' "$exit_code" > "$run_dir/wrapper-exit-code"
+                printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
+            fi
+        }
+        trap 'finish_interrupted HUP 129' HUP
+        trap 'finish_interrupted INT 130' INT
+        trap 'finish_interrupted TERM 143' TERM
+        trap finish_unknown EXIT
+
+        "$@" > >(tee -- "$run_dir/stdout.log") \
+            2> >(tee -- "$run_dir/stderr.log" >&2) &
+        child_pid=$!
+        printf '%s\n' "$child_pid" > "$run_dir/pid"
+        printf '%s\n' running > "$run_dir/status"
+        set +e
+        wait "$child_pid"
+        exit_code=$?
+        set -e
+        printf '%s\n' "$exit_code" > "$run_dir/exit-code"
+        printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
+        if ((exit_code == 0)); then
+            printf '%s\n' completed > "$run_dir/status"
+        else
+            printf '%s\n' failed > "$run_dir/status"
+        fi
+        finished=1
+        exit "$exit_code"
+        ;;
+    list)
+        (($# == 1)) || usage
+        printf '%-32s %-12s %-24s %s\n' RUN_ID STATUS LIVENESS STARTED_AT
+        shopt -s nullglob
+        for run_dir in "$state_root"/*; do
+            [[ -d "$run_dir" ]] || continue
+            printf '%-32s %-12s %-24s %s\n' \
+                "${run_dir##*/}" \
+                "$(read_field "$run_dir" status)" \
+                "$(liveness_for "$run_dir")" \
+                "$(read_field "$run_dir" started-at)"
+        done
+        ;;
+    show)
+        (($# == 2)) || usage
+        run_dir="$(run_dir_for "$2")"
+        [[ -d "$run_dir" ]] || { echo "Unknown run ID: $2" >&2; exit 1; }
+        for field in status pid wrapper-pid started-at finished-at exit-code signal cwd command; do
+            printf '%-12s %s\n' "$field:" "$(read_field "$run_dir" "$field")"
+        done
+        printf '%-12s %s\n' 'liveness:' "$(liveness_for "$run_dir")"
+        printf '%-12s %s\n' 'stdout:' "$run_dir/stdout.log"
+        printf '%-12s %s\n' 'stderr:' "$run_dir/stderr.log"
+        ;;
+    tail)
+        shift
+        follow=0
+        stream=stdout
+        while (($# > 0)); do
+            case "$1" in
+                --follow|-f) follow=1; shift ;;
+                --stderr) stream=stderr; shift ;;
+                --) shift; break ;;
+                -*) usage ;;
+                *) break ;;
+            esac
+        done
+        (($# == 1)) || usage
+        run_dir="$(run_dir_for "$1")"
+        log_path="$run_dir/$stream.log"
+        [[ -f "$log_path" ]] || { echo "Unknown run ID or stream: $1 $stream" >&2; exit 1; }
+        if ((follow == 1)); then
+            exec tail -n 40 -f -- "$log_path"
+        else
+            exec tail -n 40 -- "$log_path"
+        fi
+        ;;
+    *) usage ;;
+esac

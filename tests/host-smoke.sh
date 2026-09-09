@@ -95,6 +95,7 @@ for script in \
     "$ROOT/container/codex-bwrap-cuda" \
     "$ROOT/container/codex-clojure-lsp-mcp" \
     "$ROOT/container/codex-universal-workflow-install" \
+    "$ROOT/container/codex-workflow/scripts/codex-worker-observe" \
     "$ROOT/container/install-clojure-tools"; do
     bash -n "$script"
 done
@@ -123,6 +124,8 @@ test -x "$workflow_home/codex-state/skills/clojure-development/scripts/clojure-d
     fail "workflow installer did not make its helper executable"
 test -x "$workflow_home/codex-state/skills/clojure-development/scripts/clojure-process-supervisor" ||
     fail "workflow installer did not make its process supervisor executable"
+test -x "$workflow_home/codex-state/scripts/codex-worker-observe" ||
+    fail "workflow installer did not make worker observability helper executable"
 "${workflow_install[@]}"
 printf '%s\n' '# user override' >> "$workflow_home/codex-state/agents/code_reader.toml"
 "${workflow_install[@]}"
@@ -220,7 +223,50 @@ grep -Fq 'Approval of such a prelude never' \
     fail "workflow guidance lets a shell prelude imply later authorization"
 grep -Fq 'name the exact' "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not require destructive target specificity"
+grep -Fq 'Keep delegation observable' "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not require observable delegation"
 pass "workflow installer lifecycle and update ownership"
+
+observe_root="$TEST_ROOT/worker-observe"
+observe_helper="$ROOT/container/codex-workflow/scripts/codex-worker-observe"
+set +e
+observe_stdout="$(
+    CODEX_WORKER_OBSERVE_DIR="$observe_root" \
+        "$observe_helper" run failing-probe -- \
+        bash -c 'printf "probe-out\\n"; printf "probe-err\\n" >&2; exit 7' \
+        2>"$TEST_ROOT/observe-stderr"
+)"
+observe_exit=$?
+set -e
+[[ "$observe_exit" == 7 ]] || fail "worker observability helper lost command exit status"
+[[ "$observe_stdout" == probe-out ]] || fail "worker observability helper lost stdout"
+grep -Fxq probe-err "$TEST_ROOT/observe-stderr" ||
+    fail "worker observability helper lost stderr"
+grep -Fxq probe-out "$observe_root/failing-probe/stdout.log" ||
+    fail "worker observability helper did not retain stdout"
+grep -Fxq probe-err "$observe_root/failing-probe/stderr.log" ||
+    fail "worker observability helper did not retain stderr"
+grep -Fxq failed "$observe_root/failing-probe/status" ||
+    fail "worker observability helper did not record failure"
+grep -Fxq 7 "$observe_root/failing-probe/exit-code" ||
+    fail "worker observability helper did not record exit status"
+observe_show="$(CODEX_WORKER_OBSERVE_DIR="$observe_root" "$observe_helper" show failing-probe)"
+assert_contains "$observe_show" 'status:      failed'
+assert_contains "$observe_show" 'exit-code:   7'
+observe_list="$(CODEX_WORKER_OBSERVE_DIR="$observe_root" "$observe_helper" list)"
+assert_contains "$observe_list" 'failing-probe'
+[[ "$(CODEX_WORKER_OBSERVE_DIR="$observe_root" "$observe_helper" tail failing-probe)" == probe-out ]] ||
+    fail "worker observability helper did not expose stdout tail"
+[[ "$(CODEX_WORKER_OBSERVE_DIR="$observe_root" "$observe_helper" tail --stderr failing-probe)" == probe-err ]] ||
+    fail "worker observability helper did not expose stderr tail"
+set +e
+CODEX_WORKER_OBSERVE_DIR="$observe_root" \
+    "$observe_helper" run failing-probe -- true >/dev/null 2>&1
+observe_reuse_exit=$?
+set -e
+[[ "$observe_reuse_exit" == 2 ]] ||
+    fail "worker observability helper replaced an immutable run ID"
+pass "worker command observability"
 
 jq -e '
     .defaultAction == "SCMP_ACT_ERRNO" and

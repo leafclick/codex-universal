@@ -69,6 +69,7 @@ assets=(
     skills/clojure-development/references/babashka.md
     skills/clojure-development/scripts/clojure-development
     skills/clojure-development/scripts/clojure-process-supervisor
+    scripts/codex-worker-observe
     AGENTS.md
 )
 
@@ -95,6 +96,7 @@ for asset in \
 done
 sync_asset "skills/clojure-development/scripts/clojure-development"
 sync_asset "skills/clojure-development/scripts/clojure-process-supervisor"
+sync_asset "scripts/codex-worker-observe"
 for helper in clojure-development clojure-process-supervisor; do
     helper_target="$codex_home/skills/clojure-development/scripts/$helper"
     helper_source="$source_root/skills/clojure-development/scripts/$helper"
@@ -102,6 +104,11 @@ for helper in clojure-development clojure-process-supervisor; do
         chmod 0755 -- "$helper_target"
     fi
 done
+observe_target="$codex_home/scripts/codex-worker-observe"
+observe_source="$source_root/scripts/codex-worker-observe"
+if [[ "$(sha256sum -- "$observe_target" | awk '{print $1}')" == "$(sha256sum -- "$observe_source" | awk '{print $1}')" ]]; then
+    chmod 0755 -- "$observe_target"
+fi
 
 # Codex reads a global AGENTS.md before repository-scoped instructions. Do not
 # merge into a user-owned file: a pre-existing file is authoritative.

@@ -14,6 +14,25 @@ may stay local. Delegate when it avoids context or uses useful specialization,
 including when the primary model is Luna. Request worker summaries rather than
 raw intermediate output.
 
+Keep delegation observable. Before a worker starts a substantial or
+long-running command, it sends the parent a compact `START` update containing
+its role, a unique run ID, working directory, exact command, and the stdout and
+stderr paths. The parent promptly relays that update to the user. Run
+non-interactive fresh-process probes through
+`$CODEX_HOME/scripts/codex-worker-observe run RUN_ID -- COMMAND ...`; do not
+wrap persistent `clojure-development` REPL operations, which already preserve
+their own evaluation records. For a running command, report its PID and status
+when available. At completion, send `EXIT` with the exit code, elapsed time,
+and a concise stdout/stderr summary. Never expose credentials or other secrets
+in commands, logs, or updates.
+
+Treat `agent status`, `show active probes`, `show probe RUN_ID`, and
+`tail probe RUN_ID` as inspection requests. The primary uses
+`codex-worker-observe list`, `show`, and `tail` and reports the result without
+interrupting the worker. A PID that is invisible from another tool sandbox is
+not proof of exit; preserve the helper's `not-visible-or-exited` distinction.
+Do not rely on experimental Codex features for worker observability.
+
 When an operation needs approval, make the approval question and any reusable
 command prefix identify the substantive executable, action, and scope. Shell
 setup such as `set -Eeuo pipefail`, environment assignments, or a generic shell

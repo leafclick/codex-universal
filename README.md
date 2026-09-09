@@ -489,6 +489,29 @@ meanwhile. Small targeted work remains local. No
 hook blocks a primary or a worker, so normal targeted `rg`, `sed`, Clojure LSP,
 and IDEA MCP operations remain available.
 
+Delegated substantial and long-running commands are observable without an
+experimental Codex feature. Workers announce the role, run ID, cwd, exact
+command, and separate stdout/stderr paths before execution, and the primary
+relays the announcement. Fresh-process commands use the managed helper:
+
+```bash
+~/.codex/scripts/codex-worker-observe run cla-gpu-1 -- clojure -M:mkl:cuda -m simulation ...
+~/.codex/scripts/codex-worker-observe list
+~/.codex/scripts/codex-worker-observe show cla-gpu-1
+~/.codex/scripts/codex-worker-observe tail cla-gpu-1
+~/.codex/scripts/codex-worker-observe tail --stderr --follow cla-gpu-1
+```
+
+The helper mirrors output into the normal tool transcript while retaining
+immutable, per-run metadata and separate logs under
+`/tmp/codex-worker-observe`. Set `CODEX_WORKER_OBSERVE_DIR` only to another
+private path below `/tmp`. The records last for the container session, never
+enter the repository or synchronized Codex state, and must not contain
+credentials. Because tool calls can use different PID namespaces, status
+reports `not-visible-or-exited` rather than treating an invisible PID as proof
+that a command stopped. Persistent Clojure REPL evaluations keep using the
+skill's existing raw records instead of this fresh-process wrapper.
+
 The workflow guidance requires approval prompts to identify the substantive
 executable, action, and scope. A shell prelude such as `set -Eeuo pipefail`, an
 environment assignment, or a generic shell wrapper is not a meaningful
