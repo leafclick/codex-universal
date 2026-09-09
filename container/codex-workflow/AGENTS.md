@@ -87,9 +87,9 @@ durable record before an extended wait and relay its exact command, cwd, PID,
 status, exit code, and relevant log excerpts. Use `summary RUN_ID` first and
 open a longer tail only when its bounded evidence is insufficient. Prefer the
 record over model-visible progress chatter; terse `START` and `EXIT` messages
-are enough when direct parent messaging is useful, but do not assume such
-messaging exists. Do not wrap persistent `clojure-development` REPL actions,
-which already preserve evaluation records. Never expose secrets.
+are enough when direct parent messaging is useful. However, do not assume such messaging exists.
+Do not wrap persistent `clojure-development` REPL actions, which already
+preserve evaluation records. Never expose secrets.
 
 Treat `agent status`, `show active probes`, `show probe RUN_ID`, `summarize probe
 RUN_ID`, `tail probe RUN_ID`, and `worker inspection help` as inspection
