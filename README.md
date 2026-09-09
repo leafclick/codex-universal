@@ -529,6 +529,14 @@ select exact matches before downstream queries, and bound result volume.
 Numerical summaries must reconcile their components and totals before the
 primary accepts them.
 
+Delegation prompts contain only a short task packet: the exclusive boundary,
+questions, acceptance criteria, and requested compact result. They reference
+paths instead of copying source and do not repeat stable role or tool guidance.
+Self-contained assignments use no inherited chat; otherwise they inherit only
+the smallest useful number of recent turns instead of the full conversation.
+Workers write predictable requested artifacts directly to disk and return paths
+and validation rather than echoing generated files into the primary context.
+
 Workers deliberately absorb evidence-processing volume when that keeps raw
 results and repair work out of the more expensive primary context. Before
 handoff, a worker self-audits every acceptance criterion, reconciles call and

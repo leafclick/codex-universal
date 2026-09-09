@@ -494,6 +494,15 @@ done
 grep -Fq 'Keep routine Git metadata writes local because' \
     "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "bundled routing does not keep authorized Git bookkeeping in the primary"
+grep -Fq 'Use `fork_turns="none"` when that packet is self-contained.' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "bundled routing does not minimize inherited worker chat"
+grep -Fq 'Do not use the default full-history fork unless the whole' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "bundled routing does not guard full-history worker forks"
+grep -Fq 'never echo complete files or patches unless asked' \
+    "$ROOT/container/codex-workflow/agents/mechanical_worker.toml" ||
+    fail "mechanical_worker can echo generated artifacts into primary context"
 workflow_skill="$ROOT/container/codex-workflow/skills/clojure-development"
 [[ -x "$workflow_skill/scripts/clojure-development" ]] ||
     fail "Clojure development helper is not executable"

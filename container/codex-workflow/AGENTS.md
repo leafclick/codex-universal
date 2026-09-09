@@ -1,107 +1,92 @@
 # Codex-universal routing
 
 Delegate substantial read-heavy exploration to `code_reader`, substantial
-Clojure runtime experiments and noisy result reduction to `clojure_probe`, and
+Clojure runtime experiments or noisy result reduction to `clojure_probe`, and
 clearly specified repetitive edits or deterministic validation to
-`mechanical_worker`. The reader owns semantic queries, bounded source reads,
-and corroborating searches for its delegated question. Consume its evidence;
-repeat only targeted verification needed to integrate or challenge a finding.
-After delegating an investigation, consume the worker's result rather than
-repeating its searches or source reads. Independent work may continue meanwhile.
-Keep architecture, probe design, ambiguous behavior, debugging conclusions,
-integration, and final review in the primary agent. Small targeted operations
-may stay local. Delegate when it avoids context or uses useful specialization,
-including when the primary model is Luna. Request worker summaries rather than
-raw intermediate output. When the user explicitly authorizes a commit, the
-primary owns the final diff review, commit scope and message, exact-path
-staging, and commit execution. Keep routine Git metadata writes local because
-they are short and cross the user approval boundary. Delegate only substantial
-repetitive pre-commit validation or a complex staging audit; the primary still
-performs the final staging and commit.
+`mechanical_worker`. Keep architecture, probe design, ambiguous behavior,
+debugging conclusions, integration, and final review in the primary. Keep small
+targeted operations local, including when the primary model is Luna.
 
-Optimize routing for estimated credits, elapsed time, and correct accepted
-evidence rather than raw token count. Before spawning, give the worker an
-exclusive evidence boundary and acceptance criteria. Until its result arrives,
-the primary must not search, read, or query inside that boundary; continue only
-with disjoint work. Consume the summary first and verify only a specific
-uncertain, contradictory, or high-risk claim. If the result is inadequate,
-reuse the same worker with a correction that relies on retained evidence before
-starting a fresh investigation or taking the scope back locally. Batch related
-questions known at dispatch time into one worker assignment with one compact
-final summary; reserve follow-ups for genuinely new information or a specific
-acceptance failure. Keep exact targeted tools local when their output is known
-and bounded, batching such calls into a few primary turns. For uncertain or
-noisy output, delegate execution plus reduction when safe. If approval, state,
-or architecture boundaries require the primary to execute, redirect stdout and
-stderr to explicit shared files and delegate only reduction without first
-loading raw output into primary context; consume the compact packet and do not
-reread the full output. Batch primary-side reads and checks into as few
-tool/model turns as practical, bound tool output, and prefer one worker with
-related questions over several overlapping workers. Semantic workers must validate
-arguments against the exposed tool schema, set a small result limit for symbol
-search, select the exact match before downstream queries, and prefer an exact
-file position after discovery. Treat semantic MCP readiness as client-local.
-When a session is likely to need substantial semantic work, initialize one
-reader for the exact project root early with one bounded `start_lsp` call while
-the primary continues disjoint work. Reuse that reader and its resident LSP across later
-assignments, including after the reader becomes idle; do not restart it between
-tasks. Do not pay this startup cost for an isolated lookup, and do not retry a
-stalled start in that client. Restart only after concrete evidence that the
-resident LSP is unhealthy. When reporting numerical aggregates, state the
-formula or invariant and require components to reconcile with the reported
-total.
+Optimize routing for estimated credits, elapsed time, and accepted evidence,
+not raw token count. Keep exact tools local when their output is known and
+bounded, and batch them into few primary turns. Delegate uncertain or noisy
+execution plus reduction when safe. If approval, state, or architecture requires
+primary execution, redirect stdout and stderr to explicit shared files; delegate
+their reduction without first loading them, consume the compact result, and do
+not reread the full output.
+
+Give each worker an exclusive evidence boundary and acceptance criteria. The
+primary must not search, read, or query inside that boundary before the result;
+it may continue disjoint work. Batch related questions over shared evidence into
+one assignment and one result. Reuse the same worker for a new question or an
+objective defect so it can retain evidence. Verify only a specific uncertain,
+contradictory, or high-risk claim; do not reconstruct a delegated investigation.
+
+Keep delegation prompts task-specific and short. Do not repeat repository
+background, stable role instructions, or tool procedures already available to
+the worker. Prefer this packet:
+
+- `Boundary:` exclusive paths, logs, or provider.
+- `Questions:` the decisions required.
+- `Acceptance:` facts and checks that must reconcile.
+- `Return:` compact conclusions, minimal evidence locations, coverage, and risk;
+  no transcript or complete file.
+
+Use `fork_turns="none"` when that packet is self-contained. When the worker needs
+recent user requirements, pass the smallest useful positive turn count rather
+than restating them. Do not use the default full-history fork unless the whole
+history is materially required. Workers should write requested predictable
+artifacts directly to project files and return paths and validation, not echo the
+generated content. Keep result packets brief unless correctness requires detail.
 
 The worker owns evidence reduction and first-pass recovery inside its boundary,
-even when that requires processing substantially more Luna tokens. Before
-returning, it must check every acceptance criterion, reconcile counts and
-weighted totals, distinguish a successful empty result from proof of absence,
-resolve tool errors with an allowed bounded fallback, and remove unrelated
-diagnostics or findings. Return a compact decision packet containing conclusions,
-minimal evidence locations, coverage, and unresolved risk—not raw transcripts
-for the primary to sift. If that packet still has an objective defect, the
-primary sends only the defect back to the same worker; it does not reconstruct
-the worker's investigation unless correction fails and the claim is high-risk.
+even when this uses more Luna tokens. It must check the acceptance criteria,
+reconcile counts and totals, distinguish an empty result from proof of absence,
+perform allowed bounded fallback, and remove unrelated findings. If a corrected
+packet still fails objectively and the claim is high-risk, the primary may take
+back that narrow scope.
 
-Match semantic-provider lifecycle to the client. Terminal sessions use the
-container-local Clojure LSP lifecycle above. IntelliJ ACP sessions reuse IDEA's
-already-running project index and must not call `start_lsp`. If both read-only
-providers are actually exposed, routine questions still use one provider; for
-an ambiguous, incomplete, or high-risk claim, Luna readers may query both under
-explicit provider-specific evidence boundaries and return a compact agreement
-or discrepancy report. Treat this as deliberate corroboration, not permission
-for the primary to repeat either investigation.
+The `code_reader` owns semantic queries, bounded source reads, and corroborating
+searches for its assignment. Semantic MCP readiness is client-local. For a
+session likely to need substantial terminal semantic work, initialize one reader
+early for the exact root with one bounded `start_lsp` call while the primary does
+disjoint work. Reuse that reader and resident LSP across idle turns; do not pay
+startup for an isolated lookup, retry a stalled start, or restart without
+evidence that it is unhealthy. IntelliJ ACP readers use IDEA's existing project
+index and never call `start_lsp`. When both providers exist, use one routinely;
+explicitly assign both only to corroborate an ambiguous, incomplete, or
+high-risk claim. Semantic workers validate tool arguments, bound result volume,
+select an exact symbol match before downstream queries, and prefer its exact
+file position. Numerical aggregates must state their invariant and reconcile.
+
+When the user explicitly authorizes a commit, the primary owns the final diff
+review, commit scope and message, exact-path staging, and commit execution.
+Keep routine Git metadata writes local because they are short and cross the user
+approval boundary. Delegate only substantial repetitive pre-commit validation
+or a complex staging audit; the primary still performs final staging and commit.
 
 Once per Codex session, in the first user-visible response after acknowledging
-the request, add this concise notice: `Worker inspection: ask "agent status" or
-"show active probes"; run ~/.codex/scripts/codex-worker-observe help for every
-command.` Do not repeat the notice later in the same session.
+the request, add: `Worker inspection: ask "agent status" or "show active
+probes"; run ~/.codex/scripts/codex-worker-observe help for every command.` Do
+not repeat it later in that session.
 
-Keep delegation observable. Before spawning a worker expected to run a
-substantial or long-running command, the primary assigns a unique run ID and
-promptly announces the role, scope, run ID, and expected stdout/stderr paths to
-the user. The worker uses that ID to run non-interactive fresh-process probes
-through `~/.codex/scripts/codex-worker-observe run RUN_ID -- COMMAND ...`.
-If direct parent messaging is available, the worker sends `START`, running
-status, and `EXIT` updates; do not assume such messaging exists. The primary
-uses the durable record to inspect and relay the exact command, cwd, PID,
-status, exit code, and relevant stdout/stderr while the worker runs. Do not
-wrap persistent `clojure-development` REPL operations, which already preserve
-their own evaluation records. Never expose credentials or other secrets in
-commands, logs, or updates.
+Keep delegation observable. Before a worker starts a substantial or long-running fresh-process command,
+assign and announce a unique run ID, role, scope, and expected stdout/stderr
+paths. The worker runs it non-interactively through
+`~/.codex/scripts/codex-worker-observe run RUN_ID -- COMMAND ...`. Inspect the
+durable record before an extended wait and relay its exact command, cwd, PID,
+status, exit code, and relevant log excerpts. Prefer the record over model-visible
+progress chatter; terse `START` and `EXIT` messages are enough when direct parent
+messaging is useful, but do not assume such messaging exists. Do not wrap persistent `clojure-development` REPL actions,
+which already preserve evaluation records. Never expose secrets.
 
 Treat `agent status`, `show active probes`, `show probe RUN_ID`, `tail probe
-RUN_ID`, and `worker inspection help` as inspection requests. The primary uses
-the helper's `list`, `show`, `tail`, and `help` commands and reports the result
-without interrupting the worker. After starting a long-running worker, inspect
-its assigned record before entering an extended wait so its exact command and
-status become visible even without child-to-parent messaging. A PID that is
-invisible from another tool sandbox is not proof of exit; preserve the
-helper's `not-visible-or-exited` distinction. Do not rely on experimental Codex
-features for worker observability.
+RUN_ID`, and `worker inspection help` as inspection requests. Use the helper's
+`list`, `show`, `tail`, or `help` without interrupting the worker. Preserve its
+`not-visible-or-exited` distinction; cross-sandbox PID invisibility does not
+prove exit. Do not rely on experimental Codex features for observability.
 
-When an operation needs approval, make the approval question and any reusable
-command prefix identify the substantive executable, action, and scope. Shell
-setup such as `set -Eeuo pipefail`, environment assignments, or a generic shell
-wrapper is not the operation being approved. Approval of such a prelude never
-authorizes a later command, especially a destructive one; name the exact
-destructive action and target in its own approval request.
+Approval questions and reusable prefixes must name the substantive executable, action, and scope.
+Shell setup, environment assignments, or generic wrappers are not the approved
+operation. Approval of such a prelude never authorizes a later command; name the exact
+destructive action and target separately.
