@@ -488,14 +488,20 @@ targeted verification where necessary. Once delegated, the parent consumes
 that result without repeating its investigation; independent work may continue
 meanwhile. Small targeted work remains local.
 
-Routing is optimized for estimated credits, elapsed time, and accepted evidence
-rather than raw token count. Each delegation defines an exclusive evidence
-boundary and acceptance criteria; the primary stays out of that boundary until
-it consumes the worker summary. A deficient result is corrected by reusing the
-same worker and its retained evidence before starting over. Primary-side tool
-operations should be batched and output-bounded because each additional model
-turn can cost more than the Luna worker it coordinates. Numerical summaries
-must reconcile their components and totals before the primary accepts them.
+Agent routing is explicitly optimized for Codex credit spending, elapsed time,
+and accepted evidence rather than raw token count. Each delegation defines an
+exclusive evidence boundary and acceptance criteria; the primary stays out of
+that boundary until it consumes the worker summary. A deficient result is
+corrected by reusing the same worker and its retained evidence before starting
+over. Related questions
+known initially are sent as one assignment with one compact result; follow-ups
+are reserved for new information or a specific acceptance failure. Primary-side
+tool operations should be batched and output-bounded because each additional
+model turn can cost more than the Luna worker it coordinates. Semantic readers
+validate arguments against each tool schema, apply small symbol-search limits,
+select exact matches before downstream queries, and bound result volume.
+Numerical summaries must reconcile their components and totals before the
+primary accepts them.
 Semantic MCP readiness can be client-local. When substantial semantic work is
 likely, one reader starts the LSP early for the exact root with a bounded
 readiness timeout while the primary continues disjoint work. The same reader

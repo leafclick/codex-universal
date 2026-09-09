@@ -24,12 +24,17 @@ with disjoint work. Consume the summary first and verify only a specific
 uncertain, contradictory, or high-risk claim. If the result is inadequate,
 reuse the same worker with a correction that relies on retained evidence before
 starting a fresh investigation or taking the scope back locally. Batch related
-primary-side reads and checks into as few tool/model turns as practical, bound
-tool output, and prefer one worker with related questions over several
-overlapping workers. Treat semantic MCP readiness as client-local. When a
-session is likely to need substantial semantic work, initialize one reader for
-the exact project root early with one bounded `start_lsp` call while the primary
-continues disjoint work. Reuse that reader and its resident LSP across later
+questions known at dispatch time into one worker assignment with one compact
+final summary; reserve follow-ups for genuinely new information or a specific
+acceptance failure. Batch primary-side reads and checks into as few tool/model
+turns as practical, bound tool output, and prefer one worker with related
+questions over several overlapping workers. Semantic workers must validate
+arguments against the exposed tool schema, set a small result limit for symbol
+search, select the exact match before downstream queries, and prefer an exact
+file position after discovery. Treat semantic MCP readiness as client-local.
+When a session is likely to need substantial semantic work, initialize one
+reader for the exact project root early with one bounded `start_lsp` call while
+the primary continues disjoint work. Reuse that reader and its resident LSP across later
 assignments, including after the reader becomes idle; do not restart it between
 tasks. Do not pay this startup cost for an isolated lookup, and do not retry a
 stalled start in that client. Restart only after concrete evidence that the
