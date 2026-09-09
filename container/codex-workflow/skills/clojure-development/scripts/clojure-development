@@ -267,9 +267,11 @@
                        (.toPath (File. path))
                        (into-array java.nio.file.OpenOption
                                    [StandardOpenOption/CREATE
-                                    StandardOpenOption/WRITE]))
-              lock (.lock channel)]
-    (function)))
+                                    StandardOpenOption/WRITE]))]
+    ;; Closing the channel releases its locks. Avoid closing or releasing the
+    ;; FileLock directly because older and newer SCI allowlists differ here.
+    (let [_lock (.lock channel)]
+      (function))))
 
 (defn with-runtime-locks [function]
   (with-file-lock lifecycle-lock-file
