@@ -410,6 +410,8 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
            package_arg_line < npm_install_line )) ||
             fail "$(basename "$dockerfile") declares $package_arg before the stable toolchain"
     done
+    grep -Fxq 'ARG CODEX_VERSION=0.154.0' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not default to Codex 0.154.0"
     metadata_arg_line="$(
         grep -n '^ARG IMAGE_VERSION=' "$dockerfile" | cut -d: -f1 || true
     )"
@@ -1683,6 +1685,7 @@ build_output="$(
 )"
 assert_not_contains "$build_output" "--build-arg UID="
 assert_not_contains "$build_output" "--build-arg GID="
+assert_contains "$build_output" "--build-arg CODEX_VERSION=0.154.0"
 assert_contains "$build_output" "--build-arg CODEX_ACP_VERSION=latest"
 assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=latest"
 assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"

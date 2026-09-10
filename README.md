@@ -293,7 +293,7 @@ IMAGE_VERSION=1.0.0 TAG_LATEST=0 ./docker-build.sh all
 A specific Codex, ACP adapter, or LSP bridge version can be used:
 
 ```bash
-CODEX_VERSION=latest \
+CODEX_VERSION=0.154.0 \
 CODEX_ACP_VERSION=latest \
 AGENT_LSP_VERSION=latest \
   ./docker-build.sh all

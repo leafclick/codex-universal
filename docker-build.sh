@@ -4,7 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 TARGET="${1:-all}"
-CODEX_VERSION="${CODEX_VERSION:-latest}"
+CODEX_VERSION="${CODEX_VERSION:-0.154.0}"
 CODEX_ACP_VERSION="${CODEX_ACP_VERSION:-latest}"
 AGENT_LSP_VERSION="${AGENT_LSP_VERSION:-latest}"
 IMAGE_SLUG="${IMAGE_SLUG:-${IMAGE_PREFIX:-}}"
@@ -23,7 +23,7 @@ Environment:
   IMAGE_SLUG=SLUG             Image repository slug; defaults from GitHub origin
   IMAGE_VERSION=VERSION       Docker tag; defaults from Git tag lineage or branch
   TAG_LATEST=1                Also update the local latest alias
-  CODEX_VERSION=latest        @openai/codex npm version
+  CODEX_VERSION=0.154.0       @openai/codex npm version
   CODEX_ACP_VERSION=latest    @agentclientprotocol/codex-acp npm version
   AGENT_LSP_VERSION=latest    @blackwell-systems/agent-lsp npm version
   PULL=1                     Set to 0 to omit docker build --pull
