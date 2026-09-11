@@ -908,12 +908,15 @@ Before running the complete suite:
 - install the synchronization dependencies documented in [Codex state synchronization](docs/codex-sync.md#install-required-software);
 - stop all running containers whose names begin with `codex-`, because the synchronization safety checks intentionally refuse to run while a Codex session is active.
 
-The suite checks these prerequisites before executing its tests. It then checks shell syntax and security invariants, verifies launcher and build arguments without starting Docker, and exercises the snapshot push/pull state machine with temporary data.
+The suite checks these prerequisites before executing its tests. It then checks shell syntax and security invariants, verifies launcher and build arguments without starting Docker, and exercises the snapshot push/pull state machine with temporary data. Host-side launcher and synchronization checks do not require Babashka.
 
 If Docker is available, the suite also checks each generic or CUDA image that
 is already present locally. Both checks verify the non-root user, required
 commands, Codex policy components, and a real Bubblewrap namespace using the
-installed AppArmor policy and repository seccomp policy. The CUDA check additionally starts the
+installed AppArmor policy and repository seccomp policy. The Clojure helper,
+process supervisor, Unix transport, bounded decoder, and one-off lifecycle
+fixtures run here with the image's pinned Babashka rather than an arbitrary
+host installation. The CUDA check additionally starts the
 container with `--gpus all` and verifies `nvcc`, CUDA headers, and
 `nvidia-smi`. It therefore requires the NVIDIA driver and Container Toolkit
 described in [CUDA host setup](#cuda-host-setup).
@@ -977,7 +980,8 @@ Project-level CUDA workloads remain the responsibility of the project using
 the image.
 
 Set `CODEX_TEST_SKIP_CUDA=1` to omit the CUDA image check on a host without an
-NVIDIA runtime. Set `CODEX_TEST_SKIP_IMAGE=1` to omit all real-image checks.
+NVIDIA runtime. Set `CODEX_TEST_SKIP_IMAGE=1` to omit all real-image checks,
+including the Clojure-helper runtime fixtures.
 
 ## CUDA host setup
 

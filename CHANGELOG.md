@@ -7,6 +7,11 @@ This change log follows the conventions of
 
 ## [Unreleased]
 
+### Fixed
+
+- Run Clojure-helper runtime smoke fixtures with the image's pinned Babashka
+  instead of an arbitrary host installation.
+
 ## [0.6.0] - 2026-09-11
 
 ### Breaking

@@ -37,7 +37,9 @@ started with networking disabled, an arbitrary non-root identity, and a
 read-only root filesystem. It does not pull or build images.
 
 The no-image run still covers syntax, whitespace, launcher-argument, and
-static profile checks, but cannot prove image contents or runtime hardening.
+static profile checks, but cannot prove image contents, Clojure-helper runtime
+behavior, or runtime hardening. Clojure-helper lifecycle checks deliberately
+use the pinned Babashka inside each tested image instead of a host installation.
 Real-image coverage applies only to profiles that are already local. Use
 `CODEX_TEST_SKIP_IMAGE=1` when intentionally making the no-image boundary
 explicit.

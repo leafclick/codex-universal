@@ -64,8 +64,10 @@ repository root during development and before handoff:
 
 The suite always performs syntax, whitespace, launcher-argument, and static
 profile checks. Without a locally available Docker image and daemon, those
-checks do not exercise image contents or runtime hardening; real-image
-coverage is limited to the profiles that are already local. Set
+checks do not exercise image contents, the Clojure-helper runtime, or runtime
+hardening. Clojure-helper lifecycle checks use the pinned Babashka inside each
+tested image rather than a host installation; real-image coverage is limited
+to the profiles that are already local. Set
 `CODEX_TEST_SKIP_IMAGE=1` to make that no-image boundary explicit.
 
 When changing a Dockerfile, build the affected image on a Docker host and rerun the suite so its real-image checks execute. When changing shared image behavior, validate both profiles when practical.
