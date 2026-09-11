@@ -30,6 +30,9 @@ Environment:
 
 Compatibility:
   IMAGE_PREFIX and TAG remain aliases for IMAGE_SLUG and IMAGE_VERSION.
+
+Build provenance is always derived from Git. Run this script from its Git
+checkout even when IMAGE_SLUG and IMAGE_VERSION are set explicitly.
 EOF2
 }
 
@@ -77,9 +80,9 @@ git_describe_slug() {
 
 resolve_git_metadata() {
     command -v git >/dev/null 2>&1 ||
-        die "git is required when IMAGE_VERSION is not set"
+        die "git is required to derive immutable image provenance"
     git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
-        die "IMAGE_VERSION is required outside a Git checkout"
+        die "docker-build.sh must run from a Git checkout to derive immutable image provenance"
 
     GIT_REVISION="$(git -C "$SCRIPT_DIR" rev-parse --verify HEAD)"
 

@@ -192,9 +192,16 @@ load_latest_metadata() {
     local max_hash=""
     local found=false
     local state_file generation hash
+    local restore_nullglob=false
 
-    shopt -s nullglob
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=true
+    fi
     local files=("$SYNC_DIR"/codex-g*.tar.zst.state)
+    if $restore_nullglob; then
+        shopt -u nullglob
+    fi
 
     ((${#files[@]})) || return 1
 
@@ -257,13 +264,21 @@ select_snapshot() {
     local matched=false
     local valid=false
     local state_file generation hash
+    local restore_nullglob=false
 
     SELECTED_ARCHIVE=""
     SELECTED_HASH=""
 
-    shopt -s nullglob
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=true
+    fi
+    local files=("$SYNC_DIR"/codex-g*.tar.zst.state)
+    if $restore_nullglob; then
+        shopt -u nullglob
+    fi
 
-    for state_file in "$SYNC_DIR"/codex-g*.tar.zst.state; do
+    for state_file in "${files[@]}"; do
         generation="$(state_value "$state_file" generation)"
         hash="$(state_value "$state_file" sha256)"
 
@@ -310,9 +325,16 @@ select_or_die() {
 
 list_snapshots() {
     local state_file generation hash created host archive status
+    local restore_nullglob=false
 
-    shopt -s nullglob
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=true
+    fi
     local files=("$SYNC_DIR"/codex-g*.tar.zst.state)
+    if $restore_nullglob; then
+        shopt -u nullglob
+    fi
 
     if ((${#files[@]} == 0)); then
         echo "No Codex snapshots found in $SYNC_DIR"

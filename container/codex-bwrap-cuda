@@ -80,7 +80,15 @@ rewrite_tokens rewritten final
 
 cuda_failure_hint_enabled() {
     case "${CODEX_CUDA_FAILURE_HINT:-auto}" in
-        auto|'') return 0 ;;
+        auto|'')
+            [[ ! -t 1 && ! -t 2 ]] || return 1
+            local nvidia_device=""
+            for nvidia_device in /dev/nvidia*; do
+                [[ -c "$nvidia_device" || -d "$nvidia_device" ]] && return 0
+            done
+            return 1
+            ;;
+        on|1|true|yes) return 0 ;;
         off|0|false|no) return 1 ;;
         *)
             echo "Invalid CODEX_CUDA_FAILURE_HINT=${CODEX_CUDA_FAILURE_HINT}" >&2
@@ -120,23 +128,38 @@ EOF
 }
 
 run_bwrap_with_cuda_failure_hint() {
+    local capture_dir=""
+    local stdout_fifo=""
+    local stderr_fifo=""
     local stdout_log=""
     local stderr_log=""
+    local stdout_reader_pid=""
+    local stderr_reader_pid=""
     local status=0
     local combined=""
 
-    if ! stdout_log="$(mktemp -t codex-bwrap-stdout.XXXXXX 2>/dev/null)"; then
+    if ! capture_dir="$(mktemp -d -t codex-bwrap-capture.XXXXXX 2>/dev/null)"; then
         exec "$real_bwrap" "${final[@]}"
     fi
-    if ! stderr_log="$(mktemp -t codex-bwrap-stderr.XXXXXX 2>/dev/null)"; then
-        rm -f -- "$stdout_log" || true
+    stdout_fifo="$capture_dir/stdout.fifo"
+    stderr_fifo="$capture_dir/stderr.fifo"
+    stdout_log="$capture_dir/stdout.tail"
+    stderr_log="$capture_dir/stderr.tail"
+    if ! mkfifo -m 0600 -- "$stdout_fifo" "$stderr_fifo"; then
+        rm -rf -- "$capture_dir" || true
         exec "$real_bwrap" "${final[@]}"
     fi
+
+    (tee /dev/fd/3 < "$stdout_fifo" | tail -c 65536 > "$stdout_log") 3>&1 &
+    stdout_reader_pid=$!
+    (tee /dev/fd/3 < "$stderr_fifo" | tail -c 65536 > "$stderr_log") 3>&2 &
+    stderr_reader_pid=$!
+
     set +e
-    "$real_bwrap" "${final[@]}" \
-        > >(tee >(tail -c 65536 > "$stdout_log")) \
-        2> >(tee >(tail -c 65536 > "$stderr_log") >&2)
+    "$real_bwrap" "${final[@]}" > "$stdout_fifo" 2> "$stderr_fifo"
     status=$?
+    wait "$stdout_reader_pid"
+    wait "$stderr_reader_pid"
     set -e
 
     if ((status != 0)) && cuda_failure_hint_enabled; then
@@ -153,7 +176,7 @@ run_bwrap_with_cuda_failure_hint() {
         fi
     fi
 
-    rm -f -- "$stdout_log" "$stderr_log" || true
+    rm -rf -- "$capture_dir" || true
     return "$status"
 }
 

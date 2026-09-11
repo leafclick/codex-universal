@@ -19,7 +19,7 @@ IDEA_MCP_PORT="${CODEX_IDEA_MCP_PORT:-64342}"
 IDEA_MCP_PATH="${CODEX_IDEA_MCP_PATH:-/stream}"
 WORKFLOW_ENABLED="${CODEX_UNIVERSAL_WORKFLOW:-1}"
 HOST_UID="$EUID"
-HOST_GID="${GROUPS[0]}"
+HOST_GID="$(id -g)"
 IDEA_MCP_ALLOWED_TOOLS='[
     "analyze_calls",
     "get_file_problems",
@@ -54,8 +54,6 @@ CLOJURE_LSP_MCP_ALLOWED_TOOLS='[
     "get_diagnostics",
     "get_completions",
     "get_signature_help",
-    "suggest_fixes",
-    "execute_command",
     "format_document",
     "prepare_rename",
     "rename_symbol",
@@ -77,8 +75,8 @@ Usage:
 
   run-codex --init [--profile generic|cuda] [--clojure-mcp auto|on|off] [PROJECT [PATH]]
   run-codex --rebind PROJECT [PATH]
-  run-codex --set-profile PROJECT generic|cuda
-  run-codex --set-clojure-mcp PROJECT auto|on|off
+  run-codex PROJECT --set profile generic|cuda
+  run-codex PROJECT --set clojure-mcp auto|on|off
   run-codex --doctor [PROJECT]
   run-codex --list
 
@@ -104,18 +102,26 @@ Examples:
   run-codex cortex --codex-option no-alt-screen
   run-codex --idea cortex
   run-codex --doctor cortex
-  run-codex --set-profile cortex generic
-  run-codex --set-clojure-mcp cortex auto
+  run-codex cortex --set profile generic
+  run-codex cortex --set clojure-mcp auto
 
 Environment:
   CODEX_IMAGE_SLUG=leafclick/codex-universal
+  CODEX_IMAGE_PREFIX=SLUG  Compatibility alias for CODEX_IMAGE_SLUG
   CODEX_IMAGE_TAG=latest
+  CODEX_DEFAULT_PROFILE=generic
+  CODEX_CONTAINER_HOME=/home/codex
+  CODEX_WORKSPACE_ROOT=/workspace
+  CODEX_LOCK_FILE=~/.cache/codex-handoff.lock
   CODEX_APPARMOR_PROFILE=codex-universal
   CODEX_SECCOMP_PROFILE=~/.config/run-codex/security/codex-bwrap.json
   CODEX_CLOJURE_LSP_MCP=VALUE  Override project setting: auto, on/off, or 1/0
   CODEX_IDEA_MCP=1         Enable the private IntelliJ HTTP relay in IDEA mode
   CODEX_IDEA_MCP_PORT=64342
   CODEX_IDEA_MCP_PATH=/stream
+  CODEX_UNIVERSAL_WORKFLOW=0|1|uninstall
+  CODEX_GIT_USER_NAME=NAME
+  CODEX_GIT_USER_EMAIL=EMAIL
 USAGE
 }
 
@@ -648,8 +654,12 @@ find_name_for_path() {
     local root="$1"
     local matched=""
     local file
+    local restore_nullglob=false
 
-    shopt -s nullglob
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=true
+    fi
     for file in "$PROJECTS_DIR"/*; do
         [[ -f "$file" ]] || continue
         read_project_config "$file"
@@ -660,6 +670,9 @@ find_name_for_path() {
             matched="$(basename "$file")"
         fi
     done
+    if $restore_nullglob; then
+        shopt -u nullglob
+    fi
 
     printf '%s\n' "$matched"
 }
@@ -809,11 +822,11 @@ init_project() {
             echo "  Clojure MCP: $CONFIG_CLOJURE_MCP" >&2
             if $profile_explicit && [[ "$CONFIG_PROFILE" != "$profile" ]]; then
                 echo "Change its profile with:" >&2
-                echo "  run-codex --set-profile '$name' '$profile'" >&2
+                echo "  run-codex '$name' --set profile '$profile'" >&2
             fi
             if $clojure_mcp_explicit && [[ "$CONFIG_CLOJURE_MCP" != "$clojure_mcp" ]]; then
                 echo "Change its Clojure MCP setting with:" >&2
-                echo "  run-codex --set-clojure-mcp '$name' '$clojure_mcp'" >&2
+                echo "  run-codex '$name' --set clojure-mcp '$clojure_mcp'" >&2
             fi
             exit 1
         fi
@@ -908,14 +921,33 @@ set_clojure_mcp() {
     echo "Project '$name' now uses Clojure MCP setting '$clojure_mcp'."
 }
 
+set_project_value() {
+    local name="$1"
+    local key="$2"
+    local value="$3"
+
+    case "$key" in
+        profile) set_profile "$name" "$value" ;;
+        clojure-mcp) set_clojure_mcp "$name" "$value" ;;
+        *) die "Unknown project setting '$key'. Supported settings: profile, clojure-mcp" ;;
+    esac
+}
+
 list_projects() {
     mkdir -p "$PROJECTS_DIR"
 
     printf '%-20s %-10s %-12s %-10s %s\n' \
         "PROJECT" "PROFILE" "CLOJURE-MCP" "STATUS" "PATH"
 
-    shopt -s nullglob
+    local restore_nullglob=false
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=true
+    fi
     local files=("$PROJECTS_DIR"/*)
+    if $restore_nullglob; then
+        shopt -u nullglob
+    fi
 
     if ((${#files[@]} == 0)); then
         echo "(no projects configured)"
@@ -1482,18 +1514,6 @@ case "${1:-}" in
         rebind_project "$1" "${2:-$PWD}"
         exit 0
         ;;
-    --set-profile)
-        shift
-        (($# == 2)) || die "Usage: run-codex --set-profile PROJECT generic|cuda"
-        set_profile "$1" "$2"
-        exit 0
-        ;;
-    --set-clojure-mcp)
-        shift
-        (($# == 2)) || die "Usage: run-codex --set-clojure-mcp PROJECT auto|on|off"
-        set_clojure_mcp "$1" "$2"
-        exit 0
-        ;;
     --doctor)
         DOCTOR_MODE=true
         shift
@@ -1507,6 +1527,12 @@ case "${1:-}" in
         PROJECT="$1"
         ;;
     *)
+        if (($# >= 2)) && [[ "$2" == --set ]]; then
+            (($# == 4)) ||
+                die "Usage: run-codex PROJECT --set profile|clojure-mcp VALUE"
+            set_project_value "$1" "$3" "$4"
+            exit 0
+        fi
         parse_launch_args "$@"
         ;;
 esac
@@ -1556,6 +1582,17 @@ IMAGE="$(profile_image "$PROFILE")"
 resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
 resolve_codex_image_options "$WORKSPACE_ROOT/$PROJECT"
 
+# Shared lock: multiple Codex projects may run simultaneously, while
+# codex-push/codex-pull take this same lock exclusively. Acquire it before any
+# session-state read so a pull cannot replace the database during resolution.
+need flock
+mkdir -p -- "$(dirname "$LOCK_FILE")"
+exec 9>"$LOCK_FILE"
+if ! flock -sn 9; then
+    echo "Waiting for Codex state handoff lock: $LOCK_FILE" >&2
+    flock -s 9
+fi
+
 if $SESSION_LIST_MODE || $RESUME_QUERY_SET; then
     load_project_sessions "$WORKSPACE_ROOT/$PROJECT"
     if $SESSION_LIST_MODE; then
@@ -1584,7 +1621,6 @@ if [[ -z "$GIT_USER_NAME" || -z "$GIT_USER_EMAIL" ]]; then
 fi
 
 need docker
-need flock
 
 docker info >/dev/null 2>&1 || die "Docker daemon is not available"
 
@@ -1616,7 +1652,7 @@ if ! sandbox_probe_output="$(run_sandbox_probe "$IMAGE" 2>&1)"; then
     exit 1
 fi
 
-mkdir -p "$HOME/.codex" "$HOME/.m2" "$(dirname "$LOCK_FILE")" "$CONFIG_ROOT/runtime"
+mkdir -p "$HOME/.codex" "$HOME/.m2" "$CONFIG_ROOT/runtime"
 
 CONTAINER_BASE_NAME="codex-$PROJECT"
 CONTAINER_NAME="$CONTAINER_BASE_NAME"
@@ -1683,11 +1719,6 @@ else
         die "Project '$PROJECT' already has a running Codex container"
     fi
 fi
-
-# Shared lock: multiple Codex projects may run simultaneously, while
-# codex-push/codex-pull take this same lock exclusively.
-exec 9>"$LOCK_FILE"
-flock -s 9
 
 # Multiple IDEA chats for one project may run concurrently. A terminal session
 # remains mutually exclusive with all IDEA chats for that project.

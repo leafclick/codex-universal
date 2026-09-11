@@ -268,6 +268,10 @@ The synchronization commands run on the host. Installing a utility such as `zstd
 
 ## Building
 
+Builds must run from a Git checkout so every image receives Git-derived
+revision and source metadata. Explicit `IMAGE_SLUG` and `IMAGE_VERSION` values
+do not remove that provenance requirement.
+
 Build both images:
 
 ```bash
@@ -401,17 +405,21 @@ private PID namespace and an empty `/proc`. It can update the working tree and
 its caches, but `.git` and `.codex` remain read-only; Codex prompts before
 invoking MCP tools declared as write-capable. This preserves the same outer
 boundary as ordinary Codex commands without exposing other container
-processes through procfs. The bridge derives the selected image JDK's library
+processes through procfs. The allowlist excludes broad command execution and
+quick-fix entry points whose apply semantics are not locally established;
+scoped edit and refactoring tools remain subject to user review. The bridge
+derives the selected image JDK's library
 directories and carries required inherited native-library paths into that
 boundary, so Clojure CLI classpath discovery remains usable despite the empty
 `/proc`. A child seccomp filter also prevents nested user namespaces from
-remounting writable parents around protected `.git` or `.codex` paths. Set a
+remounting writable parents around protected `.git` or `.codex` paths and
+denies `setns` after Bubblewrap finishes namespace setup. Set a
 persistent per-project override with:
 
 ```bash
-run-codex --set-clojure-mcp my-project on
-run-codex --set-clojure-mcp my-project off
-run-codex --set-clojure-mcp my-project auto
+run-codex my-project --set clojure-mcp on
+run-codex my-project --set clojure-mcp off
+run-codex my-project --set clojure-mcp auto
 ```
 
 The `auto` setting is the default. It is useful for mixed repositories and
@@ -980,8 +988,13 @@ user-approved elevation.
 
 When a sandboxed command exits non-zero and its output matches a known CUDA
 driver/runtime initialization failure, the CUDA wrapper appends a best-effort
-note suggesting retry with user-approved elevation. This detection does not
-replace the documented requirement to elevate real CUDA runtime workloads.
+note suggesting retry with user-approved elevation. Set
+`CODEX_CUDA_FAILURE_HINT=off` to disable the diagnostic, or `on` to force it;
+`true`, `yes`, `1`, `false`, `no`, and `0` are accepted equivalents. Automatic
+mode captures only non-interactive output when NVIDIA devices are present and
+waits for bounded readers before scanning the final 64 KiB. This detection
+does not replace the documented requirement to elevate real CUDA runtime
+workloads.
 
 ## Installing commands
 
@@ -1150,13 +1163,13 @@ live `~/.codex` state.
 Enable CUDA:
 
 ```bash
-run-codex --set-profile my-project cuda
+run-codex my-project --set profile cuda
 ```
 
 Switch back to the generic image:
 
 ```bash
-run-codex --set-profile my-project generic
+run-codex my-project --set profile generic
 ```
 
 The project configuration stores a logical profile rather than a concrete Docker image name.
@@ -1168,14 +1181,14 @@ This keeps project configuration independent of image naming, tags, architecture
 Use automatic project detection, which is the default:
 
 ```bash
-run-codex --set-clojure-mcp my-project auto
+run-codex my-project --set clojure-mcp auto
 ```
 
 Or force the terminal bridge on or off:
 
 ```bash
-run-codex --set-clojure-mcp my-project on
-run-codex --set-clojure-mcp my-project off
+run-codex my-project --set clojure-mcp on
+run-codex my-project --set clojure-mcp off
 ```
 
 The setting affects terminal mode. IDEA mode continues to use IntelliJ's

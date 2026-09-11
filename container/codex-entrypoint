@@ -104,7 +104,7 @@ start_clojure_repl_service() {
     # starting a JVM it cannot reach. This is a diagnostic, not authorization.
     CODEX_CLOJURE_SERVICE_NETNS="$(readlink /proc/self/ns/net 2>/dev/null || true)"
     export CODEX_CLOJURE_SERVICE_NETNS
-    supervisor="${CODEX_UNIVERSAL_WORKFLOW_SOURCE:-/usr/local/share/codex-universal/workflow}/skills/clojure-development/scripts/clojure-process-supervisor"
+    supervisor="/usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-process-supervisor"
     [[ -x "$supervisor" ]] || {
         echo "Clojure REPL service executable is unavailable: $supervisor" >&2
         exit 1

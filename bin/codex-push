@@ -153,9 +153,16 @@ load_latest_remote() {
     local best_hash=""
     local best_file=""
     local found=false
+    local restore_nullglob=false
 
-    shopt -s nullglob
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=true
+    fi
     local files=("$SYNC_DIR"/codex-g*.tar.zst.state)
+    if $restore_nullglob; then
+        shopt -u nullglob
+    fi
 
     for state_file in "${files[@]}"; do
         local generation
@@ -259,7 +266,7 @@ report_running_codex_containers() {
 }
 
 #
-# Lock against codex-pull and run-codex.sh.
+# Lock against codex-pull and run-codex.
 #
 if report_running_codex_containers; then
     die "Stop the listed Codex session(s) before pushing"

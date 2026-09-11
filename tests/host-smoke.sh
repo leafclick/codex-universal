@@ -99,6 +99,12 @@ for script in \
     "$ROOT/container/install-clojure-tools"; do
     bash -n "$script"
 done
+for script in "$ROOT/bin/run-codex" "$ROOT/bin/codex-push" "$ROOT/bin/codex-pull"; do
+    nullglob_enable_count="$(grep -c 'shopt -s nullglob' "$script" || true)"
+    nullglob_restore_count="$(grep -c 'shopt -u nullglob' "$script" || true)"
+    [[ "$nullglob_enable_count" == "$nullglob_restore_count" ]] ||
+        fail "$(basename "$script") leaks nullglob shell state"
+done
 
 workflow_source="$TEST_ROOT/workflow-source"
 workflow_home="$TEST_ROOT/workflow-home"
@@ -108,9 +114,20 @@ workflow_install=(
     env
     "HOME=$workflow_home"
     "CODEX_HOME=$workflow_home/codex-state"
+    "CODEX_UNIVERSAL_WORKFLOW_TEST_SOURCE=1"
     "CODEX_UNIVERSAL_WORKFLOW_SOURCE=$workflow_source"
     "$ROOT/container/codex-universal-workflow-install"
 )
+if env HOME="$workflow_home" CODEX_HOME="$workflow_home/rejected-state" \
+    CODEX_UNIVERSAL_WORKFLOW_SOURCE="$workflow_source" \
+    "$ROOT/container/codex-universal-workflow-install" \
+    > "$workflow_home/rejected-source.out" 2>&1; then
+    fail "workflow installer accepted a source override without its test boundary"
+fi
+grep -Fq 'restricted to test fixtures' "$workflow_home/rejected-source.out" ||
+    fail "workflow source override rejection was not useful"
+[[ ! -e "$workflow_home/rejected-state" ]] ||
+    fail "rejected workflow source override modified CODEX_HOME"
 CODEX_UNIVERSAL_WORKFLOW=0 "${workflow_install[@]}"
 CODEX_UNIVERSAL_WORKFLOW=0 "${workflow_install[@]}"
 test ! -e "$workflow_home/codex-state" ||
@@ -163,6 +180,7 @@ upgrade_install=(
     env
     "HOME=$upgrade_home"
     "CODEX_HOME=$upgrade_home/codex-state"
+    "CODEX_UNIVERSAL_WORKFLOW_TEST_SOURCE=1"
     "CODEX_UNIVERSAL_WORKFLOW_SOURCE=$upgrade_source"
     "$ROOT/container/codex-universal-workflow-install"
 )
@@ -189,6 +207,7 @@ global_agents='user-owned global guidance'
 mkdir -p -- "$global_home" "$global_codex_home"
 printf '%s\n' "$global_agents" > "$global_codex_home/AGENTS.md"
 env HOME="$global_home" CODEX_HOME="$global_codex_home" \
+    CODEX_UNIVERSAL_WORKFLOW_TEST_SOURCE=1 \
     CODEX_UNIVERSAL_WORKFLOW_SOURCE="$workflow_source" \
     "$ROOT/container/codex-universal-workflow-install"
 grep -Fxq "$global_agents" "$global_codex_home/AGENTS.md" ||
@@ -202,6 +221,7 @@ concurrent_install=(
     env
     "HOME=$concurrent_home"
     "CODEX_HOME=$concurrent_home/codex-state"
+    "CODEX_UNIVERSAL_WORKFLOW_TEST_SOURCE=1"
     "CODEX_UNIVERSAL_WORKFLOW_SOURCE=$workflow_source"
     "$ROOT/container/codex-universal-workflow-install"
 )
@@ -364,6 +384,11 @@ grep -Fq -- '\( -name .git -o -name .codex \) -prune -print0' \
 grep -q '^profile codex-universal ' \
     "$ROOT/security/apparmor/codex-universal" ||
     fail "outer AppArmor profile is missing"
+grep -Fq 'HOST_GID="$(id -g)"' "$ROOT/bin/run-codex" ||
+    fail "launcher does not use the host primary group"
+if grep -Fq 'GROUPS[0]' "$ROOT/bin/run-codex"; then
+    fail "launcher still assumes the first supplementary-group entry is primary"
+fi
 grep -Fq "enforce\\)( |$)'" \
     "$ROOT/bin/setup-codex-host-security" ||
     fail "host security setup does not require AppArmor enforce mode"
@@ -571,6 +596,9 @@ if command -v gcc >/dev/null 2>&1; then
         "$nested_userns_filter" python3 -c \
             'import threading; t=threading.Thread(target=lambda: None); t.start(); t.join()' ||
             fail "nested-userns filter blocked ordinary runtime threads"
+        "$nested_userns_filter" python3 -c \
+            'import ctypes, errno; libc=ctypes.CDLL(None, use_errno=True); result=libc.setns(-1, 0); assert result == -1 and ctypes.get_errno() == errno.EPERM' ||
+            fail "nested-userns filter did not deny setns"
     fi
 fi
 grep -Fq '127.0.0.1' "$workflow_skill/scripts/clojure-development" ||
@@ -578,6 +606,10 @@ grep -Fq '127.0.0.1' "$workflow_skill/scripts/clojure-development" ||
 grep -Fq 'clojure:/usr/local/bin/codex-lsp-message-proxy' \
     "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure MCP wrapper does not route the server through its message proxy"
+if grep -Eq '^[[:space:]]+"(execute_command|suggest_fixes)",' \
+    "$ROOT/bin/run-codex"; then
+    fail "Clojure LSP allowlist exposes broad or semantically ambiguous tools"
+fi
 [[ -x "$ROOT/container/codex-lsp-message-proxy" ]] ||
     fail "LSP message proxy is not executable"
 if command -v python3 >/dev/null 2>&1; then
@@ -673,7 +705,9 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
             --control "$namespace_fixture/control.fifo" \
             --project-root "$namespace_project" \
             --state-root "$namespace_fixture" \
-            --namespace-scoped &
+            --namespace-scoped \
+            > "$namespace_fixture/service.out" \
+            2> "$namespace_fixture/service.err" &
         namespace_service_pid=$!
         namespace_service_pgid="$namespace_service_pid"
         for _ in {1..100}; do
@@ -759,9 +793,12 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     printf '%s\n' \
         "{:runtimes {:only {:kind :lein :repl [\"python3\" \"$fake_nrepl\"]}}}" \
         > "$config_fixture/.codex/clojure-development.edn"
-    CODEX_PROJECT_ROOT="$config_fixture" \
+    if ! CODEX_PROJECT_ROOT="$config_fixture" \
         CODEX_CLOJURE_STATE_DIR="$config_state" \
-        bb "$helper" repl-start > "$config_fixture/start.out"
+        bb "$helper" repl-start > "$config_fixture/start.out"; then
+        tail -c 4096 -- "$config_state/repl.log" >&2 || true
+        fail "single-runtime REPL process failed during startup"
+    fi
     grep -Fq ':runtime :only' "$config_fixture/start.out" &&
         grep -Fq ':status :running' "$config_fixture/start.out" ||
         fail "single-runtime REPL startup without a default failed"
@@ -992,6 +1029,10 @@ grep -Fq 'CODEX_CUDA_FAILURE_HINT' "$ROOT/container/codex-bwrap-cuda" ||
     fail "CUDA Bubblewrap shim has no failure hint control"
 grep -Fq 'tail -c 65536' "$ROOT/container/codex-bwrap-cuda" ||
     fail "CUDA Bubblewrap shim does not bound failure scanning"
+grep -Fq 'mkfifo -m 0600' "$ROOT/container/codex-bwrap-cuda" &&
+    grep -Fq 'wait "$stdout_reader_pid"' "$ROOT/container/codex-bwrap-cuda" &&
+    grep -Fq 'wait "$stderr_reader_pid"' "$ROOT/container/codex-bwrap-cuda" ||
+    fail "CUDA Bubblewrap shim does not wait for diagnostic capture"
 
 fake_bwrap="$TEST_ROOT/fake-bwrap"
 signature_file="$TEST_ROOT/cuda-failure-signatures"
@@ -1008,6 +1049,7 @@ printf '%s\n' \
     > "$fake_bwrap"
 chmod 755 "$fake_bwrap"
 if hint_output="$(
+    CODEX_CUDA_FAILURE_HINT=on \
     CODEX_BWRAP_REAL="$fake_bwrap" \
         CODEX_CUDA_FAILURE_SIGNATURES="$signature_file" \
         "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/false 2>&1
@@ -1032,6 +1074,11 @@ if CODEX_CUDA_FAILURE_HINT=off CODEX_BWRAP_REAL="$fake_bwrap" \
     "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/false >/dev/null 2>&1; then
     fail "CUDA Bubblewrap shim masked the disabled-hint command failure"
 fi
+if ! CODEX_CUDA_FAILURE_HINT=true CODEX_BWRAP_REAL="$no_gpu_bwrap" \
+    "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/true \
+    >/dev/null 2>&1; then
+    fail "CUDA Bubblewrap shim rejected a truthy failure-hint mode"
+fi
 no_mktemp_bin="$TEST_ROOT/no-mktemp-bin"
 mkdir -p "$no_mktemp_bin"
 printf '%s\n' \
@@ -1041,7 +1088,8 @@ printf '%s\n' \
 chmod 755 "$no_mktemp_bin/mktemp"
 set +e
 no_mktemp_output="$(
-    PATH="$no_mktemp_bin:$PATH" CODEX_BWRAP_REAL="$fake_bwrap" \
+    PATH="$no_mktemp_bin:$PATH" CODEX_CUDA_FAILURE_HINT=on \
+        CODEX_BWRAP_REAL="$fake_bwrap" \
         "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/false 2>&1
 )"
 no_mktemp_status=$?
@@ -1064,11 +1112,64 @@ fi
 grep -Fq 'TCP4-LISTEN:${relay_port},bind=127.0.0.1' \
     "$ROOT/container/codex-acp-entrypoint" ||
     fail "ACP entrypoint does not restrict its MCP relay to container loopback"
+grep -Fq 'setpriv --pdeathsig TERM -- socat' \
+    "$ROOT/container/codex-acp-entrypoint" ||
+    fail "container-side IntelliJ relay is not tied to ACP lifetime"
+grep -Fq -- '-iTCP:"$relay_port" -sTCP:LISTEN' \
+    "$ROOT/container/codex-acp-entrypoint" ||
+    fail "ACP entrypoint does not wait for the IntelliJ relay listener"
+if grep -Fq 'sleep 0.05' "$ROOT/container/codex-acp-entrypoint"; then
+    fail "ACP entrypoint still relies on a fixed relay startup sleep"
+fi
 grep -Fq 'setpriv --pdeathsig TERM --' "$ROOT/bin/run-codex" ||
     fail "IDEA relay is not tied to the launcher lifetime"
 grep -Fq '8>&- 9>&- &' "$ROOT/bin/run-codex" ||
     fail "IDEA relay inherits launcher lock descriptors"
 pass "shell syntax and static security invariants"
+
+if command -v python3 >/dev/null 2>&1; then
+    relay_failure_fixture="$TEST_ROOT/acp-relay-delayed-failure"
+    relay_failure_bin="$relay_failure_fixture/bin"
+    relay_failure_socket="$relay_failure_fixture/idea.sock"
+    relay_failure_marker="$relay_failure_fixture/acp-started"
+    mkdir -p -- "$relay_failure_bin"
+    python3 - "$relay_failure_socket" <<'PY'
+import socket
+import sys
+
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.bind(sys.argv[1])
+listener.close()
+PY
+    printf '%s\n' '#!/usr/bin/env bash' 'sleep 0.2' 'exit 23' \
+        > "$relay_failure_bin/socat"
+    printf '%s\n' '#!/usr/bin/env bash' 'exit 1' \
+        > "$relay_failure_bin/lsof"
+    printf '%s\n' '#!/usr/bin/env bash' \
+        'touch "$CODEX_TEST_ACP_STARTED"' \
+        > "$relay_failure_bin/codex-acp"
+    chmod 755 "$relay_failure_bin/socat" "$relay_failure_bin/lsof" \
+        "$relay_failure_bin/codex-acp"
+    set +e
+    relay_failure_output="$(
+        env PATH="$relay_failure_bin:$PATH" \
+            CODEX_IDEA_MCP_RELAY_SOCKET="$relay_failure_socket" \
+            CODEX_IDEA_MCP_RELAY_PORT=64342 \
+            CODEX_TEST_ACP_STARTED="$relay_failure_marker" \
+            bash "$ROOT/container/codex-acp-entrypoint" 2>&1
+    )"
+    relay_failure_status=$?
+    set -e
+    (( relay_failure_status != 0 )) ||
+        fail "ACP entrypoint accepted a delayed relay startup failure"
+    assert_contains "$relay_failure_output" \
+        "Failed to start the container-side IntelliJ MCP relay"
+    [[ ! -e "$relay_failure_marker" ]] ||
+        fail "ACP started after its IntelliJ relay failed"
+    pass "delayed IntelliJ relay startup failure"
+else
+    printf 'skip - delayed IntelliJ relay startup failure (python3 unavailable on host)\n'
+fi
 
 # The launcher smoke test uses echo as a Docker frontend. This verifies the
 # complete argument vector without requiring Docker or Codex on the host.
@@ -1124,6 +1225,21 @@ launcher_env=(
 launcher_help="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --help)"
 assert_contains "$launcher_help" \
     "Codex options (terminal mode, repeat --codex-option as needed):"
+assert_contains "$launcher_help" \
+    "run-codex PROJECT --set profile generic|cuda"
+assert_contains "$launcher_help" \
+    "run-codex PROJECT --set clojure-mcp auto|on|off"
+for documented_env in \
+    CODEX_IMAGE_PREFIX \
+    CODEX_DEFAULT_PROFILE \
+    CODEX_CONTAINER_HOME \
+    CODEX_WORKSPACE_ROOT \
+    CODEX_LOCK_FILE \
+    CODEX_UNIVERSAL_WORKFLOW \
+    CODEX_GIT_USER_NAME \
+    CODEX_GIT_USER_EMAIL; do
+    assert_contains "$launcher_help" "$documented_env"
+done
 assert_contains "$launcher_help" "reasoning=minimal|low|medium|high|xhigh"
 assert_contains "$launcher_help" "image=PROJECT_PATH"
 assert_contains "$launcher_help" "run-codex [PROJECT] --sessions"
@@ -1182,6 +1298,46 @@ assert_not_contains "$sessions_output" 'Other project session'
 assert_not_contains "$sessions_output" 'Archived GPU tuning'
 [[ ! -e "$sessions_docker_log" ]] ||
     fail "session listing invoked Docker"
+
+session_handoff_lock="$TEST_ROOT/launcher-home/.cache/codex-handoff.lock"
+session_lock_stdout="$TEST_ROOT/session-lock.out"
+session_lock_stderr="$TEST_ROOT/session-lock.err"
+mkdir -p -- "$(dirname "$session_handoff_lock")"
+exec 7>"$session_handoff_lock"
+flock -x 7
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --sessions \
+    >"$session_lock_stdout" 2>"$session_lock_stderr" 7>&- &
+session_lock_pid=$!
+session_lock_waiting=false
+for _ in {1..100}; do
+    if grep -Fq "Waiting for Codex state handoff lock: $session_handoff_lock" \
+        "$session_lock_stderr"; then
+        session_lock_waiting=true
+        break
+    fi
+    kill -0 "$session_lock_pid" 2>/dev/null || break
+    sleep 0.02
+done
+if ! $session_lock_waiting; then
+    flock -u 7
+    exec 7>&-
+    wait "$session_lock_pid" 2>/dev/null || true
+    fail "session listing did not report handoff lock contention"
+fi
+kill -0 "$session_lock_pid" 2>/dev/null || {
+    flock -u 7
+    exec 7>&-
+    fail "session listing exited while the handoff lock was held"
+}
+sqlite3 "$session_db" <<'SQL'
+INSERT INTO threads VALUES
+    ('66666666-6666-4666-8666-666666666666', 1788956000, '/workspace/smoke-project', 'Created while handoff locked', 0);
+SQL
+flock -u 7
+exec 7>&-
+wait "$session_lock_pid" || fail "session listing failed after handoff lock release"
+assert_contains "$(<"$session_lock_stdout")" 'Created while handoff locked'
+pass "session reads wait for the shared state handoff lock"
 
 ambiguous_docker_log="$TEST_ROOT/ambiguous-sessions-docker-argv.log"
 if "${launcher_env[@]}" "CODEX_TEST_DOCKER_ARGV_LOG=$ambiguous_docker_log" \
@@ -1485,25 +1641,49 @@ assert_contains "$plain_output" \
     "Clojure MCP: disabled (no Clojure project signals detected)"
 
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
-    --set-clojure-mcp plain-project on >/dev/null
+    plain-project --set clojure-mcp on >/dev/null
 plain_forced_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" plain-project --new)"
 assert_contains "$plain_forced_output" "mcp_servers.clojure_lsp.enabled=true"
 assert_contains "$plain_forced_output" "Clojure MCP: enabled (project setting: on)"
 
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
-    --set-profile plain-project cuda >/dev/null
+    plain-project --set profile cuda >/dev/null
 plain_config="$TEST_ROOT/launcher-config/run-codex/projects/plain-project"
 grep -Fxq 'profile=cuda' "$plain_config" &&
     grep -Fxq 'clojure_mcp=on' "$plain_config" ||
-    fail "--set-profile did not preserve the Clojure MCP setting"
+    fail "project profile setter did not preserve the Clojure MCP setting"
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
-    --set-profile plain-project generic >/dev/null
+    plain-project --set profile generic >/dev/null
 
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
-    --set-clojure-mcp plain-project auto >/dev/null
+    plain-project --set clojure-mcp auto >/dev/null
 grep -Fxq 'clojure_mcp=auto' \
     "$TEST_ROOT/launcher-config/run-codex/projects/plain-project" ||
-    fail "--set-clojure-mcp did not update the project configuration"
+    fail "project Clojure MCP setter did not update the project configuration"
+
+for removed_setter in --set-profile --set-clojure-mcp; do
+    if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+        "$removed_setter" plain-project value >"$TEST_ROOT/removed-setter.out" 2>&1; then
+        fail "removed project setter '$removed_setter' was still accepted"
+    fi
+    grep -Fq "Unknown launch option '$removed_setter'" \
+        "$TEST_ROOT/removed-setter.out" ||
+        fail "removed project setter '$removed_setter' did not fail clearly"
+done
+
+set_error="$TEST_ROOT/project-setter-error.out"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set unknown value >"$set_error" 2>&1; then
+    fail "project setter accepted an unknown setting"
+fi
+grep -Fq "Supported settings: profile, clojure-mcp" "$set_error" ||
+    fail "unknown project setting error does not list supported settings"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set profile >"$set_error" 2>&1; then
+    fail "project setter accepted a missing value"
+fi
+grep -Fq "Usage: run-codex PROJECT --set profile|clojure-mcp VALUE" \
+    "$set_error" || fail "project setter arity error is not useful"
 
 plain_env_output="$(
     "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=1 \
@@ -1752,6 +1932,26 @@ assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:latest"
 pass "portable non-root image build policy"
+
+# Explicit image names do not waive the repository's immutable Git-provenance
+# requirement. Keep the failure clear instead of implying that IMAGE_VERSION
+# alone makes a source tarball build supported.
+mkdir -p -- "$TEST_ROOT/non-git-build"
+cp -- "$ROOT/docker-build.sh" "$ROOT/Dockerfile.generic" \
+    "$TEST_ROOT/non-git-build/"
+set +e
+non_git_build_output="$(
+    env IMAGE_SLUG=codex-host-smoke IMAGE_VERSION=test-version \
+        TAG_LATEST=0 PULL=0 \
+        "$TEST_ROOT/non-git-build/docker-build.sh" generic 2>&1
+)"
+non_git_build_status=$?
+set -e
+(( non_git_build_status != 0 )) ||
+    fail "explicit image metadata unexpectedly allowed a non-Git build"
+assert_contains "$non_git_build_output" \
+    "must run from a Git checkout to derive immutable image provenance"
+pass "explicit image metadata preserves Git provenance requirement"
 
 # A local checkout without an origin remote must still derive a version and
 # use the documented fallback image slug without tripping Bash nounset mode.

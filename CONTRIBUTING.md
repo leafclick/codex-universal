@@ -22,7 +22,8 @@ See [AGENTS.md](AGENTS.md) for the detailed repository invariants used by Codex 
 
 ## Testing
 
-Run the host suite from the repository root:
+The canonical validation command is the host suite, run from the repository
+root:
 
 ```bash
 ./tests/host-smoke.sh
@@ -34,6 +35,12 @@ using temporary directories. When Docker and the default generic or CUDA
 images are available, it validates each already-local image in a container
 started with networking disabled, an arbitrary non-root identity, and a
 read-only root filesystem. It does not pull or build images.
+
+The no-image run still covers syntax, whitespace, launcher-argument, and
+static profile checks, but cannot prove image contents or runtime hardening.
+Real-image coverage applies only to profiles that are already local. Use
+`CODEX_TEST_SKIP_IMAGE=1` when intentionally making the no-image boundary
+explicit.
 
 Stop all `codex-*` containers before running the complete suite. This is required because the synchronization commands refuse to operate while a Codex session is active. Use `CODEX_TEST_SKIP_SYNC=1` only for a reduced run that intentionally omits synchronization behavior.
 
@@ -49,10 +56,10 @@ The CUDA image check uses `--gpus all` and requires the documented NVIDIA
 driver and Container Toolkit. Set `CODEX_TEST_SKIP_CUDA=1` only when
 intentionally running without that optional profile.
 
-For focused shell changes, also run:
+For a focused change, the host suite remains authoritative; `git diff --check`
+and `git diff --cached --check` are useful additional whitespace checks.
 
 ```bash
-bash -n docker-build.sh bin/run-codex bin/setup-codex-host-security bin/setup-codex-idea bin/codex-push bin/codex-pull container/codex-entrypoint container/codex-acp-entrypoint container/codex-clojure-lsp-mcp tests/host-smoke.sh
 git diff --check
 git diff --cached --check
 ```

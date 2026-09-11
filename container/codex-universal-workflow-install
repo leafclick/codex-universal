@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 umask 077
 
-source_root="${CODEX_UNIVERSAL_WORKFLOW_SOURCE:-/usr/local/share/codex-universal/workflow}"
+default_source_root="/usr/local/share/codex-universal/workflow"
+source_root="${CODEX_UNIVERSAL_WORKFLOW_SOURCE:-$default_source_root}"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
-state_root="$codex_home/codex-universal-workflow"
 workflow_mode="${CODEX_UNIVERSAL_WORKFLOW:-1}"
 
 case "$workflow_mode" in
@@ -13,7 +13,21 @@ case "$workflow_mode" in
     *) echo "CODEX_UNIVERSAL_WORKFLOW must be 0, 1, or uninstall" >&2; exit 2 ;;
 esac
 
+if [[ "$source_root" != "$default_source_root" ]]; then
+    [[ "${CODEX_UNIVERSAL_WORKFLOW_TEST_SOURCE:-0}" == 1 ]] || {
+        echo "CODEX_UNIVERSAL_WORKFLOW_SOURCE is restricted to test fixtures" >&2
+        exit 2
+    }
+    source_root="$(realpath -e -- "$source_root")"
+    codex_home="$(realpath -m -- "$codex_home")"
+    [[ "$source_root" == /tmp/* && "$codex_home" == /tmp/* ]] || {
+        echo "workflow test source and CODEX_HOME must remain under /tmp" >&2
+        exit 2
+    }
+fi
+
 [[ -d "$source_root" ]] || { echo "codex-universal workflow assets are unavailable" >&2; exit 1; }
+state_root="$codex_home/codex-universal-workflow"
 mkdir -p -- "$state_root"
 exec 9>"$state_root/.install.lock"
 flock -w 10 9 || { echo "codex-universal workflow update is busy" >&2; exit 1; }

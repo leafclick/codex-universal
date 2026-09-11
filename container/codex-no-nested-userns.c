@@ -48,6 +48,8 @@ static int install_filter(void) {
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 1, 0),
         BPF_STMT(BPF_RET | BPF_K, DENY_ERRNO(EPERM)),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_setns, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, DENY_ERRNO(EPERM)),
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
     struct sock_fprog program = {

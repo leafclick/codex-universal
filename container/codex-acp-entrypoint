@@ -22,22 +22,41 @@ if [[ -n "${CODEX_IDEA_MCP_RELAY_SOCKET:-}" ]]; then
         echo "Missing container command: socat" >&2
         exit 1
     }
+    command -v lsof >/dev/null 2>&1 || {
+        echo "Missing container command: lsof" >&2
+        exit 1
+    }
+    command -v setpriv >/dev/null 2>&1 || {
+        echo "Missing container command: setpriv" >&2
+        exit 1
+    }
 
     # Codex supports an HTTP MCP URL but not a Unix-socket URL. Expose the
     # per-chat, read-only-mounted host relay only on this container's loopback.
-    socat \
+    setpriv --pdeathsig TERM -- socat \
         "TCP4-LISTEN:${relay_port},bind=127.0.0.1,reuseaddr,fork" \
         "UNIX-CONNECT:${relay_socket}" \
         1>&2 &
     relay_pid=$!
 
-    # Catch immediate configuration or bind failures before starting ACP.
-    sleep 0.05
-    kill -0 "$relay_pid" 2>/dev/null || {
+    relay_ready=false
+    for _ in {1..100}; do
+        if ! kill -0 "$relay_pid" 2>/dev/null; then
+            break
+        fi
+        if lsof -nP -a -p "$relay_pid" \
+            -iTCP:"$relay_port" -sTCP:LISTEN >/dev/null 2>&1; then
+            relay_ready=true
+            break
+        fi
+        sleep 0.02
+    done
+    if ! $relay_ready; then
+        kill -TERM "$relay_pid" 2>/dev/null || true
         wait "$relay_pid" || true
         echo "Failed to start the container-side IntelliJ MCP relay" >&2
         exit 1
-    }
+    fi
 fi
 
 exec codex-acp "$@"

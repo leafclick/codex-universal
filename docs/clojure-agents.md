@@ -87,6 +87,11 @@ semantics. Prefer a committed project alias that already supplies nREPL. If
 the repository has no such alias, adapt the following command to its actual
 development aliases and approved nREPL version:
 
+Use this alternate recipe only when the bundled `clojure-development` skill is
+not installed. It starts an unmanaged nREPL and therefore bypasses the skill's
+process supervisor, loopback verification, managed elevation path, and
+Bubblewrap boundary; do not use it when the skill is available.
+
 ```bash
 clojure -Sdeps '{:deps {nrepl/nrepl {:mvn/version "1.3.1"}}}' \
   -M:<dev-aliases> -m nrepl.cmdline --bind 127.0.0.1 --port 0
