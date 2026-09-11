@@ -18,11 +18,20 @@ rewrite_tokens() {
     while ((index < count)); do
         current="${in_tokens[index]}"
 
-        # Replace Codex's fresh /dev with a bind of Docker's already-filtered
-        # /dev, preserving NVIDIA nodes without adding host devices.
+        # Keep Bubblewrap's minimal device filesystem. When the destination is
+        # /dev, add back only the NVIDIA character devices and capability
+        # directories that Docker exposed to this container.
         if [[ "$current" == "--dev" && $((index + 1)) -lt "$count" ]]; then
             dest="${in_tokens[index + 1]}"
-            out_tokens+=(--dev-bind "$dest" "$dest")
+            out_tokens+=(--dev "$dest")
+            if [[ "$dest" == /dev ]]; then
+                local nvidia_device=""
+                for nvidia_device in /dev/nvidia*; do
+                    if [[ -c "$nvidia_device" || -d "$nvidia_device" ]]; then
+                        out_tokens+=(--dev-bind "$nvidia_device" "$nvidia_device")
+                    fi
+                done
+            fi
             index=$((index + 2))
             continue
         fi

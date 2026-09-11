@@ -8,20 +8,32 @@ import subprocess
 import sys
 import threading
 
+MAX_HEADER_BYTES = 64 * 1024
+MAX_BODY_BYTES = 16 * 1024 * 1024
+
 
 def read_frame(stream):
     headers = {}
+    header_bytes = 0
     while True:
-        line = stream.readline()
+        line = stream.readline(MAX_HEADER_BYTES - header_bytes + 1)
         if not line:
             return None
+        header_bytes += len(line)
+        if header_bytes > MAX_HEADER_BYTES:
+            raise ValueError("LSP headers too large")
         if line in (b"\r\n", b"\n"):
             break
         name, separator, value = line.decode("ascii").partition(":")
         if not separator:
             raise ValueError("malformed LSP header")
         headers[name.lower()] = value.strip()
-    length = int(headers["content-length"])
+    try:
+        length = int(headers["content-length"])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("invalid LSP content length") from exc
+    if length < 0 or length > MAX_BODY_BYTES:
+        raise ValueError("LSP body too large")
     body = stream.read(length)
     if len(body) != length:
         raise EOFError("short LSP body")
@@ -80,7 +92,7 @@ def main():
                 except (json.JSONDecodeError, AttributeError):
                     pass
                 write_frame(child.stdin, body)
-        except (BrokenPipeError, EOFError, OSError, ValueError):
+        except (BrokenPipeError, EOFError, OSError, ValueError, UnicodeError):
             pass
         finally:
             try:
@@ -142,7 +154,7 @@ def main():
                             }
                             body = json.dumps(message, separators=(",", ":")).encode()
             write_frame(sys.stdout.buffer, body)
-    except (BrokenPipeError, EOFError, OSError, ValueError):
+    except (BrokenPipeError, EOFError, OSError, ValueError, UnicodeError):
         pass
     finally:
         if child.poll() is None:

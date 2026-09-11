@@ -202,7 +202,8 @@ COPY --chmod=0644 container/requirements.toml /etc/codex/requirements.toml
 RUN install -d -o root -g root -m 0755 /usr/local/share/codex-universal
 COPY --chmod=0644 container/codex-workflow/ /usr/local/share/codex-universal/workflow/
 RUN find /usr/local/share/codex-universal/workflow -type d -exec chmod 0755 {} + \
-    && chmod 0755 /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/*
+    && chmod 0755 /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/* \
+    && chmod 0755 /usr/local/share/codex-universal/workflow/scripts/*
 COPY --chmod=0755 container/codex-universal-workflow-install /usr/local/bin/codex-universal-workflow-install
 COPY --chmod=0755 container/codex-entrypoint /usr/local/bin/codex-entrypoint
 COPY --chmod=0755 container/codex-acp-entrypoint /usr/local/bin/codex-acp-entrypoint

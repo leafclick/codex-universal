@@ -364,6 +364,9 @@ grep -Fq -- '\( -name .git -o -name .codex \) -prune -print0' \
 grep -q '^profile codex-universal ' \
     "$ROOT/security/apparmor/codex-universal" ||
     fail "outer AppArmor profile is missing"
+grep -Fq "enforce\\)( |$)'" \
+    "$ROOT/bin/setup-codex-host-security" ||
+    fail "host security setup does not require AppArmor enforce mode"
 grep -q '^[[:space:]]*userns,' \
     "$ROOT/security/apparmor/codex-universal" ||
     fail "AppArmor profile does not permit unprivileged user namespaces"
@@ -483,6 +486,8 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") does not make workflow directories traversable"
     grep -q 'workflow/skills/clojure-development/scripts/\*' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not make Clojure skill scripts executable"
+    grep -q 'workflow/scripts/\*' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not make workflow scripts executable"
     if grep -qE '^ARG (UID|GID)=' "$dockerfile"; then
         fail "$(basename "$dockerfile") still bakes the host UID/GID into the image"
     fi
@@ -580,6 +585,24 @@ if command -v python3 >/dev/null 2>&1; then
         "$ROOT/container/codex-lsp-message-proxy" \
         "$ROOT/tests/fixtures/fake-lsp-init-error.py" ||
         fail "LSP message proxy did not expose an initialization-time server error"
+    python3 - "$ROOT/container/codex-lsp-message-proxy" <<'PY' ||
+import subprocess
+import sys
+
+proxy = sys.argv[1]
+malformed = (
+    b"\r\n",
+    b"Content-Length: nope\r\n\r\n",
+    b"Content-Length: 1\xff\r\n\r\n",
+    b"Content-Length: 16777217\r\n\r\n",
+)
+for payload in malformed:
+    result = subprocess.run(
+        [proxy, "/bin/cat"], input=payload, capture_output=True, timeout=2
+    )
+    assert b"Traceback" not in result.stderr, result.stderr
+PY
+        fail "LSP message proxy mishandled malformed bounded frames"
 else
     printf 'skip - LSP message proxy behavior (python3 unavailable on host)\n'
 fi
@@ -962,6 +985,9 @@ grep -q 'container/codex-cuda-failure-signatures /usr/local/share/codex/cuda-fai
     fail "CUDA image does not install failure signatures"
 grep -Fq -- '--dev-bind' "$ROOT/container/codex-bwrap-cuda" ||
     fail "CUDA Bubblewrap shim does not bind GPU devices"
+grep -Fq '[[ -c "$nvidia_device" || -d "$nvidia_device" ]]' \
+    "$ROOT/container/codex-bwrap-cuda" ||
+    fail "CUDA Bubblewrap shim does not require an exposed NVIDIA node"
 grep -Fq 'CODEX_CUDA_FAILURE_HINT' "$ROOT/container/codex-bwrap-cuda" ||
     fail "CUDA Bubblewrap shim has no failure hint control"
 grep -Fq 'tail -c 65536' "$ROOT/container/codex-bwrap-cuda" ||
@@ -988,8 +1014,18 @@ if hint_output="$(
 )"; then
     fail "CUDA Bubblewrap shim masked the wrapped command failure"
 fi
-[[ "$hint_output" == *"--dev-bind"*"/dev"*"/dev"* ]] ||
-    fail "CUDA Bubblewrap shim did not rewrite --dev /dev"
+[[ "$hint_output" == *"--dev"*"/dev"* ]] ||
+    fail "CUDA Bubblewrap shim did not preserve a fresh --dev /dev"
+[[ "$hint_output" != *"--dev-bind"*"/dev"*"/dev"* ]] ||
+    fail "CUDA Bubblewrap shim exposed the complete container /dev"
+no_gpu_bwrap="$TEST_ROOT/no-gpu-bwrap"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$@"' > "$no_gpu_bwrap"
+chmod 755 "$no_gpu_bwrap"
+no_gpu_output="$(CODEX_BWRAP_REAL="$no_gpu_bwrap" \
+    "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/true 2>&1)"
+assert_contains "$no_gpu_output" "--dev"
+assert_contains "$no_gpu_output" "/dev"
+assert_not_contains "$no_gpu_output" "--dev-bind"
 [[ "$hint_output" == *"Retry the same GPU workload"* ]] ||
     fail "CUDA Bubblewrap shim did not append the CUDA failure hint"
 if CODEX_CUDA_FAILURE_HINT=off CODEX_BWRAP_REAL="$fake_bwrap" \
@@ -1229,7 +1265,8 @@ assert_contains "$doctor_output" "image id: sha256:doctor-image"
 assert_contains "$doctor_output" "version:  test-version"
 assert_contains "$doctor_output" "revision: 0123456789abcdef"
 assert_contains "$doctor_output" "PASS  Image declares a fixed non-root user (65532:65532)"
-assert_contains "$doctor_output" "PASS  AppArmor, seccomp, and Bubblewrap sandbox probe"
+# The fake Docker frontend below only records argv; it cannot prove that the
+# host kernel, AppArmor, seccomp, and Bubblewrap actually enforced the probe.
 assert_contains "$doctor_output" \
     "PASS  Portable runtime identity, read-only image, tools, and managed Codex policy"
 assert_contains "$doctor_output" "PASS  Clojure LSP MCP handshake and tool allowlist"
@@ -1237,6 +1274,28 @@ assert_contains "$doctor_output" "Diagnostics passed with 0 warning(s)."
 assert_contains "$doctor_output" "--network none"
 assert_contains "$doctor_output" "--cap-drop=ALL"
 assert_not_contains "$doctor_output" "$TEST_ROOT/repo:"
+
+for unsafe_apparmor_profile in unconfined docker-default arbitrary-profile; do
+    set +e
+    unsafe_doctor_output="$(
+        "${launcher_env[@]}" CODEX_APPARMOR_PROFILE="$unsafe_apparmor_profile" \
+            "$ROOT/bin/run-codex" --doctor smoke-project 2>&1
+    )"
+    unsafe_doctor_status=$?
+    unsafe_launch_output="$(
+        "${launcher_env[@]}" CODEX_APPARMOR_PROFILE="$unsafe_apparmor_profile" \
+            "$ROOT/bin/run-codex" smoke-project --new 2>&1
+    )"
+    unsafe_launch_status=$?
+    set -e
+    (( unsafe_doctor_status != 0 )) ||
+        fail "doctor accepted unsupported AppArmor profile: $unsafe_apparmor_profile"
+    (( unsafe_launch_status != 0 )) ||
+        fail "launcher accepted unsupported AppArmor profile: $unsafe_apparmor_profile"
+    assert_contains "$unsafe_doctor_output" "Unsupported CODEX_APPARMOR_PROFILE"
+    assert_contains "$unsafe_launch_output" "Unsupported CODEX_APPARMOR_PROFILE"
+done
+pass "unsupported AppArmor profile rejection"
 
 if "${launcher_env[@]}" CODEX_TEST_IMAGE_USER=0:0 \
     "$ROOT/bin/run-codex" --doctor smoke-project \
@@ -1271,6 +1330,7 @@ resume_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project)"
 
 for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "--read-only"
+    assert_contains "$output" "--pull=never"
     assert_contains "$output" "--tmpfs /home/codex:rw,exec,nosuid,nodev,uid=$(id -u),gid=$(id -g),mode=0700"
     assert_contains "$output" "--tmpfs /tmp:rw,exec,nosuid,nodev,mode=1777"
     assert_contains "$output" "--cap-drop=ALL"
@@ -1786,11 +1846,26 @@ pass "unreachable-tag Git branch fallback image version"
 printf '%s\n' dirty > "$tagged_repo/untracked"
 dirty_output="$({
     cd -- "$tagged_repo"
-    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=0 PULL=0 ./docker-build.sh generic
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=1 PULL=0 ./docker-build.sh generic
 })"
 assert_contains "$dirty_output" \
     "-t leafclick/codex-universal-generic:release-1.2.3-dirty"
+assert_not_contains "$dirty_output" \
+    "-t leafclick/codex-universal-generic:latest"
 pass "dirty Git-derived image version suffix"
+
+git -C "$tagged_repo" remote add origin \
+    'https://build-user:build-secret@example.com/acme/codex-universal.git'
+credential_source_output="$({
+    cd -- "$tagged_repo"
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=0 PULL=0 \
+        ./docker-build.sh generic
+})"
+assert_not_contains "$credential_source_output" "build-user"
+assert_not_contains "$credential_source_output" "build-secret"
+assert_contains "$credential_source_output" \
+    "--build-arg IMAGE_SOURCE=https://example.com/acme/codex-universal"
+pass "sanitized Git image source metadata"
 
 if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     SYNC_ROOT="$TEST_ROOT/sync"
@@ -1993,8 +2068,12 @@ smoke_image() {
         [[ "$(stat -c %u /usr/local/bin/codex-entrypoint)" == 0 ]]
         [[ "$(stat -c %u /usr/local/share/npm-global/bin/codex)" == 0 ]]
         [[ "$(stat -c %u /etc/codex/requirements.toml)" == 0 ]]
+        [[ "$(awk '\''$1 == "CapEff:" {print $2}'\'' /proc/self/status)" == 0000000000000000 ]]
+        [[ "$(awk '\''$1 == "NoNewPrivs:" {print $2}'\'' /proc/self/status)" == 1 ]]
+        [[ "$(cat /proc/self/attr/current)" == "codex-universal (enforce)" ]]
         test -x /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-development
         test -x /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-process-supervisor
+        test -x /usr/local/share/codex-universal/workflow/scripts/codex-worker-observe
         test -p "$CODEX_CLOJURE_STATE_DIR/service-control.fifo"
         /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-process-supervisor \
             control "$CODEX_CLOJURE_STATE_DIR/service-control.fifo" neutral status \

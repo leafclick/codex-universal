@@ -106,6 +106,9 @@ resolve_git_metadata() {
     esac
     GIT_SOURCE="${GIT_SOURCE-}"
     GIT_SOURCE="${GIT_SOURCE%.git}"
+    if [[ "$GIT_SOURCE" =~ ^(https?://)[^/@]+@(.+)$ ]]; then
+        GIT_SOURCE="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+    fi
 
     if [[ -z "$IMAGE_SLUG" ]]; then
         if [[ "$GIT_SOURCE" == https://github.com/*/* ]]; then
@@ -188,7 +191,7 @@ build_one() {
         -t "$image"
     )
 
-    if [[ "$TAG_LATEST" == 1 && "$IMAGE_VERSION" != latest ]]; then
+    if [[ "$TAG_LATEST" == 1 && "$IMAGE_VERSION" != latest && "$IMAGE_VERSION" != *-dirty ]]; then
         args+=(-t "${repository}:latest")
     fi
 
@@ -199,7 +202,7 @@ build_one() {
     args+=("$SCRIPT_DIR")
 
     echo "==> Building $image"
-    if [[ "$TAG_LATEST" == 1 && "$IMAGE_VERSION" != latest ]]; then
+    if [[ "$TAG_LATEST" == 1 && "$IMAGE_VERSION" != latest && "$IMAGE_VERSION" != *-dirty ]]; then
         echo "    alias: ${repository}:latest"
     fi
     docker "${args[@]}"

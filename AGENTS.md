@@ -7,7 +7,9 @@ These instructions apply to the entire repository.
 This repository builds non-root Docker environments for OpenAI Codex and provides host-side launch and state-synchronization commands:
 
 - `Dockerfile.generic` and `Dockerfile.cuda` build the runtime images.
-- `docker-build.sh` builds images with the invoking user's numeric UID/GID.
+- `docker-build.sh` builds portable fixed-identity non-root images;
+  `run-codex` replaces that identity with the invoking user's numeric UID/GID
+  when a container starts.
 - `bin/run-codex` manages project registration and starts Codex containers.
 - `bin/setup-codex-host-security` installs the host AppArmor and seccomp policy.
 - `bin/setup-codex-idea` adds registered projects to JetBrains ACP configuration.

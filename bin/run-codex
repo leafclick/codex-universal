@@ -1357,8 +1357,8 @@ run_doctor() {
         doctor_skip "Clojure LSP MCP not selected ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
     fi
 
-    if [[ ! "$APPARMOR_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
-        doctor_fail "Invalid CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE"
+    if [[ "$APPARMOR_PROFILE" != codex-universal ]]; then
+        doctor_fail "Unsupported CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE (expected codex-universal)"
     elif [[ ! -f "$SECCOMP_PROFILE" || ! -r "$SECCOMP_PROFILE" ]]; then
         doctor_fail "Host sandbox policy is not readable: $SECCOMP_PROFILE"
         doctor_note "Run bin/setup-codex-host-security from the codex-universal checkout."
@@ -1588,8 +1588,8 @@ need flock
 
 docker info >/dev/null 2>&1 || die "Docker daemon is not available"
 
-[[ "$APPARMOR_PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
-    die "Invalid CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE"
+[[ "$APPARMOR_PROFILE" == codex-universal ]] ||
+    die "Unsupported CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE (expected codex-universal)"
 [[ -f "$SECCOMP_PROFILE" && -r "$SECCOMP_PROFILE" ]] || {
     echo "ERROR: Codex host sandbox policy is not installed:" >&2
     echo "  $SECCOMP_PROFILE" >&2
@@ -1702,6 +1702,7 @@ docker_args=(
     run
     --rm
     --init
+    --pull=never
     --read-only
     --tmpfs "$HOME_TMPFS_SPEC"
     --tmpfs "$TMP_TMPFS_SPEC"

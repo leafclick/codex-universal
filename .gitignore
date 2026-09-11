@@ -17,6 +17,7 @@ Thumbs.db
 !.env.example
 
 # Logs / temporary files
+.local-fixtures/
 *.log
 *.tmp
 *.bak

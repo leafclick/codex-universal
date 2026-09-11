@@ -223,7 +223,11 @@ leafclick/codex-universal-generic:v1.2.0-2-ga1b2c3d4e5f6
 leafclick/codex-universal-generic:dev-main-a1b2c3d4e5f6-dirty
 ```
 
-By default, the same image is also tagged `latest` as a local convenience alias. The versioned tag is the immutable identity; `latest` is not a separate build and moves whenever a new image is built. Images also carry OCI `version`, `revision`, and `source` labels.
+By default, the same clean image is also tagged `latest` as a local convenience
+alias. Dirty builds receive only their `-dirty` version tag and never move
+`latest`. The versioned tag is the immutable identity; `latest` is not a
+separate build. Images also carry OCI `version`, `revision`, and `source`
+labels; URL credentials are removed from the Git-derived source label.
 
 Both contain the same development environment, including:
 
@@ -290,6 +294,9 @@ Override the Git-derived version or disable the moving `latest` alias:
 IMAGE_VERSION=1.0.0 TAG_LATEST=0 ./docker-build.sh all
 ```
 
+`TAG_LATEST=1` is ignored for Git-derived dirty versions so an uncommitted
+checkout cannot replace the default local image alias.
+
 A specific Codex, ACP adapter, or LSP bridge version can be used:
 
 ```bash
@@ -326,9 +333,10 @@ IMAGE_SLUG=ghcr.io/myorg/codex-universal ./docker-build.sh all
 
 `IMAGE_PREFIX` and `TAG` remain supported as compatibility aliases for `IMAGE_SLUG` and `IMAGE_VERSION`.
 
-`run-codex` uses the `latest` alias unless told otherwise. A pre-built image can
-be pulled once and selected by its immutable tag without rebuilding it for the
-local UID/GID:
+`run-codex` uses the `latest` alias unless told otherwise. It requires the
+selected image to exist locally and never pulls it implicitly. A pre-built
+image can be pulled once and selected by its immutable tag without rebuilding
+it for the local UID/GID:
 
 ```bash
 docker pull ghcr.io/myorg/codex-universal-generic:1.0.0
@@ -774,6 +782,8 @@ set and `no-new-privileges`, so these permissions cannot mount in the initial
 container namespace. Bubblewrap drops its namespaced capabilities before the
 sandboxed command starts. The seccomp policy is Docker-default-derived and
 admits the small set of namespace and mount syscalls required for setup.
+`run-codex` requires the installed `codex-universal` AppArmor profile and
+rejects `unconfined`, `docker-default`, and arbitrary profile overrides.
 
 `run-codex` performs a networkless, read-only Bubblewrap preflight with the
 selected image. It stops with a setup error if either host policy is absent or
@@ -959,13 +969,14 @@ docker run --rm --gpus all \
   bash -lc 'nvcc --version'
 ```
 
-`run-codex` adds `--gpus all` only for projects configured with the `cuda` profile.
-The CUDA image wraps Bubblewrap to preserve Docker-authorized NVIDIA device
-nodes inside Codex's nested sandbox, so visibility/NVML-style tools such as
-`nvidia-smi` may work. Full CUDA driver/runtime initialization can still fail
-in the inner sandbox, commonly with CUDA error 304, because of PID/procfs
-isolation. GPU workloads that require CUDA runtime initialization should be
-rerun with explicit user-approved elevation.
+`run-codex` adds `--gpus all` only for projects configured with the `cuda`
+profile. The CUDA image wraps Bubblewrap with a fresh minimal `/dev`, then adds
+back only the Docker-authorized NVIDIA device nodes needed inside Codex's
+nested sandbox, so visibility/NVML-style tools such as `nvidia-smi` may work.
+Full CUDA driver/runtime initialization can still fail in the inner sandbox,
+commonly with CUDA error 304, because of PID/procfs isolation. GPU workloads
+that require CUDA runtime initialization should be rerun with explicit
+user-approved elevation.
 
 When a sandboxed command exits non-zero and its output matches a known CUDA
 driver/runtime initialization failure, the CUDA wrapper appends a best-effort

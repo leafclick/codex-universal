@@ -69,8 +69,8 @@ if ! sudo test -f "$INSTALLED_APPARMOR" ||
 fi
 sudo "$APPARMOR_PARSER" -r "$INSTALLED_APPARMOR"
 
-sudo grep -q '^codex-universal ' /sys/kernel/security/apparmor/profiles ||
-    die "AppArmor profile was installed but is not loaded"
+sudo grep -Eq '^codex-universal \(enforce\)( |$)' /sys/kernel/security/apparmor/profiles ||
+    die "AppArmor profile was installed but is not enforced"
 
 echo "Codex host sandbox policy is installed:"
 echo "  AppArmor: $INSTALLED_APPARMOR"
