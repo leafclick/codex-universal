@@ -1,0 +1,212 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+CONFIG_FILE="$ROOT/container/clojure-tool-versions.conf"
+SYSTEM_CONFIG_FILE="$ROOT/container/system-tool-versions.conf"
+update_root="$(mktemp -d)"
+trap 'rm -rf -- "$update_root"' EXIT
+install -d -m 0700 "$update_root/gnupg"
+export GNUPGHOME="$update_root/gnupg"
+
+for command_name in curl gpg jq sha256sum; do
+    command -v "$command_name" >/dev/null 2>&1 || {
+        echo "Missing required command: $command_name" >&2
+        exit 1
+    }
+done
+
+fetch_release() {
+    local repository="$1"
+    local target="$2"
+
+    curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        --output "$target" \
+        "https://api.github.com/repos/${repository}/releases/latest"
+}
+
+release_version() {
+    local release_file="$1"
+    local tag
+
+    tag="$(jq -er '.tag_name | select(type == "string" and length > 0)' \
+        "$release_file")"
+    tag="${tag#v}"
+    [[ "$tag" =~ ^[0-9][0-9A-Za-z.+-]*$ ]] || {
+        echo "Invalid release tag: $tag" >&2
+        exit 1
+    }
+    printf '%s\n' "$tag"
+}
+
+asset_sha256() {
+    local release_file="$1"
+    local asset_name="$2"
+    local digest checksum
+
+    digest="$(jq -er --arg name "$asset_name" \
+        '.assets[] | select(.name == $name) | .digest | select(type == "string")' \
+        "$release_file")"
+    checksum="${digest#sha256:}"
+    [[ "$digest" == sha256:* && "$checksum" =~ ^[0-9a-f]{64}$ ]] || {
+        echo "Missing SHA-256 digest for release asset: $asset_name" >&2
+        exit 1
+    }
+    printf '%s\n' "$checksum"
+}
+
+fetch_release clojure/brew-install "$update_root/clojure.json"
+fetch_release technomancy/leiningen "$update_root/lein.json"
+fetch_release borkdude/deps.clj "$update_root/deps.json"
+fetch_release babashka/babashka "$update_root/babashka.json"
+fetch_release weavejester/cljfmt "$update_root/cljfmt.json"
+fetch_release clj-kondo/clj-kondo "$update_root/clj-kondo.json"
+fetch_release clojure-lsp/clojure-lsp "$update_root/clojure-lsp.json"
+
+# Repository majors remain deliberate compatibility choices; the updater only
+# refreshes their public signing-key trust anchors.
+# shellcheck source=../container/system-tool-versions.conf
+source "$SYSTEM_CONFIG_FILE"
+[[ "$NODE_MAJOR" =~ ^[0-9]+$ && "$TEMURIN_MAJOR" =~ ^[0-9]+$ ]] || {
+    echo "Invalid system-runtime major version" >&2
+    exit 1
+}
+curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
+    --output "$update_root/nodesource.key" \
+    https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key
+curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
+    --output "$update_root/adoptium.key" \
+    https://packages.adoptium.net/artifactory/api/gpg/key/public
+nodesource_key_sha256="$(sha256sum "$update_root/nodesource.key" | awk '{print $1}')"
+adoptium_key_sha256="$(sha256sum "$update_root/adoptium.key" | awk '{print $1}')"
+nodesource_key_fingerprint="$(gpg --batch --show-keys --with-colons \
+    "$update_root/nodesource.key" | awk -F: '$1 == "fpr" {print $10; exit}')"
+adoptium_key_fingerprint="$(gpg --batch --show-keys --with-colons \
+    "$update_root/adoptium.key" | awk -F: '$1 == "fpr" {print $10; exit}')"
+for fingerprint in "$nodesource_key_fingerprint" "$adoptium_key_fingerprint"; do
+    [[ "$fingerprint" =~ ^[0-9A-F]{40}$ ]] || {
+        echo "Invalid repository signing-key fingerprint: $fingerprint" >&2
+        exit 1
+    }
+done
+[[ "$nodesource_key_fingerprint" == "$NODESOURCE_KEY_FINGERPRINT" ]] || {
+    echo "NodeSource signing-key fingerprint changed; audit the new key and update the pin manually" >&2
+    exit 1
+}
+[[ "$adoptium_key_fingerprint" == "$ADOPTIUM_KEY_FINGERPRINT" ]] || {
+    echo "Adoptium signing-key fingerprint changed; audit the new key and update the pin manually" >&2
+    exit 1
+}
+
+clojure_version="$(release_version "$update_root/clojure.json")"
+lein_version="$(release_version "$update_root/lein.json")"
+deps_version="$(release_version "$update_root/deps.json")"
+babashka_version="$(release_version "$update_root/babashka.json")"
+cljfmt_version="$(release_version "$update_root/cljfmt.json")"
+clj_kondo_version="$(release_version "$update_root/clj-kondo.json")"
+clojure_lsp_version="$(release_version "$update_root/clojure-lsp.json")"
+
+clojure_installer_sha256="$(
+    asset_sha256 "$update_root/clojure.json" linux-install.sh
+)"
+lein_jar_sha256="$(
+    asset_sha256 "$update_root/lein.json" "leiningen-${lein_version}-standalone.jar"
+)"
+deps_amd64_sha256="$(
+    asset_sha256 "$update_root/deps.json" "deps.clj-${deps_version}-linux-amd64.zip"
+)"
+babashka_amd64_sha256="$(
+    asset_sha256 "$update_root/babashka.json" \
+        "babashka-${babashka_version}-linux-amd64.tar.gz"
+)"
+babashka_arm64_sha256="$(
+    asset_sha256 "$update_root/babashka.json" \
+        "babashka-${babashka_version}-linux-aarch64-static.tar.gz"
+)"
+cljfmt_amd64_sha256="$(
+    asset_sha256 "$update_root/cljfmt.json" \
+        "cljfmt-${cljfmt_version}-linux-amd64.tar.gz"
+)"
+cljfmt_arm64_sha256="$(
+    asset_sha256 "$update_root/cljfmt.json" \
+        "cljfmt-${cljfmt_version}-linux-aarch64.tar.gz"
+)"
+clj_kondo_amd64_sha256="$(
+    asset_sha256 "$update_root/clj-kondo.json" \
+        "clj-kondo-${clj_kondo_version}-linux-amd64.zip"
+)"
+clj_kondo_arm64_sha256="$(
+    asset_sha256 "$update_root/clj-kondo.json" \
+        "clj-kondo-${clj_kondo_version}-linux-aarch64.zip"
+)"
+clojure_lsp_amd64_sha256="$(
+    asset_sha256 "$update_root/clojure-lsp.json" \
+        clojure-lsp-native-linux-amd64.zip
+)"
+clojure_lsp_arm64_sha256="$(
+    asset_sha256 "$update_root/clojure-lsp.json" \
+        clojure-lsp-native-linux-aarch64.zip
+)"
+
+curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
+    --output "$update_root/lein" \
+    "https://raw.githubusercontent.com/technomancy/leiningen/${lein_version}/bin/lein"
+lein_launcher_sha256="$(sha256sum "$update_root/lein" | awk '{print $1}')"
+
+new_config="$update_root/clojure-tool-versions.conf"
+{
+    printf '%s\n' \
+        '# Single source of pinned Clojure tool versions and release checksums.' \
+        '# Refresh with: scripts/update-tool-versions'
+    printf 'CLOJURE_CLI_VERSION=%s\n' "$clojure_version"
+    printf 'CLOJURE_INSTALLER_SHA256=%s\n' "$clojure_installer_sha256"
+    printf 'LEIN_VERSION=%s\n' "$lein_version"
+    printf 'LEIN_LAUNCHER_SHA256=%s\n' "$lein_launcher_sha256"
+    printf 'LEIN_JAR_SHA256=%s\n' "$lein_jar_sha256"
+    printf 'DEPS_CLJ_VERSION=%s\n' "$deps_version"
+    printf 'DEPS_CLJ_AMD64_SHA256=%s\n' "$deps_amd64_sha256"
+    printf 'BABASHKA_VERSION=%s\n' "$babashka_version"
+    printf 'BABASHKA_AMD64_SHA256=%s\n' "$babashka_amd64_sha256"
+    printf 'BABASHKA_ARM64_SHA256=%s\n' "$babashka_arm64_sha256"
+    printf 'CLJFMT_VERSION=%s\n' "$cljfmt_version"
+    printf 'CLJFMT_AMD64_SHA256=%s\n' "$cljfmt_amd64_sha256"
+    printf 'CLJFMT_ARM64_SHA256=%s\n' "$cljfmt_arm64_sha256"
+    printf 'CLJ_KONDO_VERSION=%s\n' "$clj_kondo_version"
+    printf 'CLJ_KONDO_AMD64_SHA256=%s\n' "$clj_kondo_amd64_sha256"
+    printf 'CLJ_KONDO_ARM64_SHA256=%s\n' "$clj_kondo_arm64_sha256"
+    printf 'CLOJURE_LSP_VERSION=%s\n' "$clojure_lsp_version"
+    printf 'CLOJURE_LSP_AMD64_SHA256=%s\n' "$clojure_lsp_amd64_sha256"
+    printf 'CLOJURE_LSP_ARM64_SHA256=%s\n' "$clojure_lsp_arm64_sha256"
+} >"$new_config"
+
+new_system_config="$update_root/system-tool-versions.conf"
+{
+    printf '%s\n' \
+        '# Pinned trust inputs for externally maintained system-runtime repositories.' \
+        '# Refresh with: scripts/update-tool-versions'
+    printf 'NODE_MAJOR=%s\n' "$NODE_MAJOR"
+    printf 'NODESOURCE_KEY_SHA256=%s\n' "$nodesource_key_sha256"
+    printf 'NODESOURCE_KEY_FINGERPRINT=%s\n' "$nodesource_key_fingerprint"
+    printf 'TEMURIN_MAJOR=%s\n' "$TEMURIN_MAJOR"
+    printf 'ADOPTIUM_KEY_SHA256=%s\n' "$adoptium_key_sha256"
+    printf 'ADOPTIUM_KEY_FINGERPRINT=%s\n' "$adoptium_key_fingerprint"
+} >"$new_system_config"
+
+changed=0
+if ! cmp -s "$CONFIG_FILE" "$new_config"; then
+    install -m 0644 "$new_config" "$CONFIG_FILE"
+    echo "Updated $CONFIG_FILE"
+    changed=1
+fi
+if ! cmp -s "$SYSTEM_CONFIG_FILE" "$new_system_config"; then
+    install -m 0644 "$new_system_config" "$SYSTEM_CONFIG_FILE"
+    echo "Updated $SYSTEM_CONFIG_FILE"
+    changed=1
+fi
+if (( changed == 0 )); then
+    echo "Tool pins are already current."
+    exit 0
+fi
+echo "Review the diff, rebuild both image profiles, and run ./tests/host-smoke.sh."

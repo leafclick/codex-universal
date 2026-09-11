@@ -81,10 +81,16 @@ for script in \
     "$ROOT/container/codex-clojure-lsp-mcp" \
     "$ROOT/container/codex-universal-workflow-install" \
     "$ROOT/container/codex-workflow/scripts/codex-worker-observe" \
+    "$ROOT/container/install-clojure-runtimes" \
     "$ROOT/container/install-clojure-tools" \
+    "$ROOT/container/install-system-runtimes" \
+    "$ROOT/scripts/update-tool-versions" \
     "$ROOT/tests/host-smoke-sync.sh"; do
     bash -n "$script"
 done
+bash -n \
+    "$ROOT/container/clojure-tool-versions.conf" \
+    "$ROOT/container/system-tool-versions.conf"
 for script in "$ROOT/bin/run-codex" "$ROOT/bin/codex-push" "$ROOT/bin/codex-pull"; do
     nullglob_enable_count="$(grep -c 'shopt -s nullglob' "$script" || true)"
     nullglob_restore_count="$(grep -c 'shopt -u nullglob' "$script" || true)"
@@ -424,8 +430,14 @@ grep -Fxq '.local-checks' "$ROOT/.dockerignore" ||
 grep -Fxq '.local-fixtures' "$ROOT/.dockerignore" ||
     fail "local integration fixtures are not excluded from the Docker build context"
 for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
-    java_line="$(grep -n '^# Eclipse Temurin ' "$dockerfile" | cut -d: -f1)"
-    clojure_line="$(grep -n '^# Clojure CLI\.' "$dockerfile" | cut -d: -f1)"
+    system_runtime_line="$(
+        grep -n '^RUN /usr/local/src/install-system-runtimes' "$dockerfile" |
+            cut -d: -f1
+    )"
+    clojure_runtime_line="$(
+        grep -n '^RUN /usr/local/src/install-clojure-runtimes' "$dockerfile" |
+            cut -d: -f1
+    )"
     native_tools_line="$(
         grep -n '^RUN /usr/local/src/install-clojure-tools' "$dockerfile" |
             cut -d: -f1
@@ -435,8 +447,8 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         grep -n '^COPY .*container/codex-clojure-lsp-mcp ' "$dockerfile" |
             cut -d: -f1
     )"
-    (( java_line < clojure_line &&
-       clojure_line < native_tools_line &&
+    (( system_runtime_line < clojure_runtime_line &&
+       clojure_runtime_line < native_tools_line &&
        native_tools_line < npm_install_line &&
        npm_install_line < mcp_wrapper_line )) ||
         fail "$(basename "$dockerfile") does not preserve stable toolchain cache ordering"
@@ -450,6 +462,10 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
     done
     grep -Fxq 'ARG CODEX_VERSION=0.154.0' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not default to Codex 0.154.0"
+    grep -Fxq 'ARG CODEX_ACP_VERSION=1.11.0' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not pin codex-acp 1.11.0"
+    grep -Fxq 'ARG AGENT_LSP_VERSION=0.19.1' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not pin agent-lsp 0.19.1"
     metadata_arg_line="$(
         grep -n '^ARG IMAGE_VERSION=' "$dockerfile" | cut -d: -f1 || true
     )"
@@ -469,9 +485,42 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") has no OCI source label"
     grep -Fq 'ENV LEIN_JAR=/opt/clojure/leiningen-standalone.jar' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not expose a shared Leiningen runtime"
-    grep -Fq '&& lein self-install \' "$dockerfile" ||
-        fail "$(basename "$dockerfile") does not preinstall the Leiningen runtime"
+    grep -Fq 'ENV DEPS_CLJ_TOOLS_DIR=/usr/local/lib/clojure' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not reuse the Clojure CLI payload for deps.clj"
 done
+
+for installer in \
+    "$ROOT/container/install-clojure-runtimes" \
+    "$ROOT/container/install-clojure-tools" \
+    "$ROOT/container/install-system-runtimes"; do
+    grep -q 'sha256sum --check --status' "$installer" ||
+        fail "$(basename "$installer") does not verify release checksums"
+    if grep -qE '/(master|stable)/|/releases/latest/' "$installer"; then
+        fail "$(basename "$installer") uses a moving upstream installer input"
+    fi
+done
+for version_var in \
+    CLOJURE_CLI_VERSION LEIN_VERSION DEPS_CLJ_VERSION \
+    BABASHKA_VERSION CLJFMT_VERSION CLJ_KONDO_VERSION CLOJURE_LSP_VERSION; do
+    grep -qE "^${version_var}=[0-9][0-9A-Za-z.+-]*$" \
+        "$ROOT/container/clojure-tool-versions.conf" ||
+        fail "$version_var is not pinned"
+done
+[[ "$(grep -hEc '^[A-Z0-9_]+_SHA256=[0-9a-f]{64}$' \
+    "$ROOT/container/clojure-tool-versions.conf" | awk '{sum += $1} END {print sum}')" == 12 ]] ||
+    fail "Clojure installer checksum pins are incomplete"
+[[ "$(grep -Ec '^[A-Z0-9_]+_KEY_SHA256=[0-9a-f]{64}$' \
+    "$ROOT/container/system-tool-versions.conf")" == 2 ]] ||
+    fail "system-runtime repository key checksums are incomplete"
+[[ "$(grep -Ec '^[A-Z0-9_]+_KEY_FINGERPRINT=[0-9A-F]{40}$' \
+    "$ROOT/container/system-tool-versions.conf")" == 2 ]] ||
+    fail "system-runtime repository key fingerprints are incomplete"
+grep -Fq 'Unexpected Leiningen launcher version metadata' \
+    "$ROOT/container/install-clojure-runtimes" ||
+    fail "Leiningen launcher normalization does not fail on upstream shape drift"
+grep -Fq 'Leiningen runtime version does not match ${LEIN_VERSION}' \
+    "$ROOT/container/install-clojure-runtimes" ||
+    fail "Leiningen installed version is not checked against its pin"
 if grep -R -q 'CODEX_UNSAFE_ALLOW_NO_SANDBOX' \
     "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda" "$ROOT/bin"; then
     fail "unsafe Codex sandbox bypass is present"
@@ -492,6 +541,17 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") does not install managed requirements"
     grep -q 'container/install-clojure-tools /usr/local/src/install-clojure-tools' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install native Clojure tools"
+    grep -q 'container/install-clojure-runtimes /usr/local/src/install-clojure-runtimes' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install pinned Clojure runtimes"
+    grep -q 'container/install-system-runtimes /usr/local/src/install-system-runtimes' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install pinned system-runtime repositories"
+    grep -q 'container/clojure-tool-versions.conf /usr/local/src/clojure-tool-versions.conf' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install Clojure tool pins"
+    grep -q 'container/system-tool-versions.conf /usr/local/src/system-tool-versions.conf' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not install system-runtime trust pins"
+    if grep -Fq 'setup_24.x | bash' "$dockerfile"; then
+        fail "$(basename "$dockerfile") executes the mutable NodeSource installer"
+    fi
     grep -q '@blackwell-systems/agent-lsp@' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install the LSP MCP bridge"
     grep -q 'container/codex-lsp-message-proxy /usr/local/bin/codex-lsp-message-proxy' \
@@ -577,13 +637,19 @@ grep -Fq '\( -name .git -o -name .codex \) -prune -print0' \
     "$ROOT/container/codex-entrypoint" ||
     fail "persistent Clojure service does not protect Git and Codex metadata"
 grep -Fq -- '--unshare-pid' "$ROOT/container/codex-entrypoint" &&
+    grep -Fq -- '--unshare-net' "$ROOT/container/codex-entrypoint" &&
     grep -Fq -- '--tmpfs /proc' "$ROOT/container/codex-entrypoint" &&
     grep -Fq -- '--dir /proc/self' "$ROOT/container/codex-entrypoint" &&
     grep -Fq -- '--symlink "$java_binary" /proc/self/exe' "$ROOT/container/codex-entrypoint" &&
     grep -Fq -- '--namespace-scoped' "$ROOT/container/codex-entrypoint" ||
     fail "persistent Clojure service procfs boundary is incomplete"
-if grep -Fq -- '--unshare-net' "$ROOT/container/codex-entrypoint"; then
-    fail "persistent Clojure service cannot share container loopback"
+grep -Fq 'repl.sock' "$workflow_skill/scripts/clojure-process-supervisor" &&
+    grep -Fq 'StandardProtocolFamily/UNIX' \
+        "$workflow_skill/scripts/clojure-development" ||
+    fail "persistent Clojure service does not use its private Unix transport"
+if grep -Fq 'InetSocketAddress' \
+    "$workflow_skill/scripts/clojure-development"; then
+    fail "Clojure helper still connects directly to TCP nREPL"
 fi
 grep -Fq '/usr/local/bin/codex-no-nested-userns' \
     "$ROOT/container/codex-entrypoint" ||
@@ -622,7 +688,7 @@ if grep -Eq '^[[:space:]]+"(execute_command|suggest_fixes)",' \
 fi
 [[ -x "$ROOT/container/codex-lsp-message-proxy" ]] ||
     fail "LSP message proxy is not executable"
-if command -v python3 >/dev/null 2>&1; then
+if command -v python3 >/dev/null 2>&1 && command -v bwrap >/dev/null 2>&1; then
     python3 "$ROOT/tests/fixtures/check-lsp-message-proxy.py" \
         "$ROOT/container/codex-lsp-message-proxy" \
         "$ROOT/tests/fixtures/fake-lsp-init-error.py" ||
@@ -691,6 +757,7 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     [[ ! -e "$supervisor_fixture/control.fifo" ]] ||
         fail "Clojure process supervisor left a stale control channel"
 
+    helper="$workflow_skill/scripts/clojure-development"
     if command -v bwrap >/dev/null 2>&1; then
         namespace_fixture="$TEST_ROOT/clojure-namespace-state"
         namespace_project="$TEST_ROOT/clojure-namespace-project"
@@ -699,6 +766,7 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
             --unshare-user \
             --unshare-ipc \
             --unshare-pid \
+            --unshare-net \
             --unshare-uts \
             --unshare-cgroup-try \
             --die-with-parent \
@@ -712,7 +780,7 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
             --ro-bind "$namespace_project/.git" "$namespace_project/.git" \
             --chdir "$namespace_project" \
             -- "$process_supervisor" service \
-            --control "$namespace_fixture/control.fifo" \
+            --control "$namespace_fixture/service-control.fifo" \
             --project-root "$namespace_project" \
             --state-root "$namespace_fixture" \
             --namespace-scoped \
@@ -721,27 +789,62 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
         namespace_service_pid=$!
         namespace_service_pgid="$namespace_service_pid"
         for _ in {1..100}; do
-            [[ -p "$namespace_fixture/control.fifo" ]] && break
+            [[ -p "$namespace_fixture/service-control.fifo" ]] && break
             kill -0 "$namespace_service_pid" 2>/dev/null || break
             sleep 0.02
         done
-        if [[ -p "$namespace_fixture/control.fifo" ]]; then
+        if [[ -p "$namespace_fixture/service-control.fifo" ]]; then
             "$process_supervisor" start \
                 --log "$namespace_fixture/repl.log" \
                 --dir "$namespace_project" \
-                "$namespace_fixture/control.fifo" namespace-token \
+                "$namespace_fixture/service-control.fifo" namespace-token \
                 -- bash -c \
                 '[[ "$(readlink /proc/self/exe)" == /bin/sh && ! -e /proc/1/root ]]; setsid bash -c '\''trap "" TERM; sleep 30'\'' & sleep 30' \
                 | grep -Eq '^started [0-9]+$' ||
                 fail "namespace-scoped supervisor lost its minimal proc compatibility boundary"
             "$process_supervisor" control \
-                "$namespace_fixture/control.fifo" namespace-token stop \
+                "$namespace_fixture/service-control.fifo" namespace-token stop \
                 | grep -Fxq 'stopped confirmed' ||
                 fail "namespace-scoped supervisor did not kill a detached descendant"
             "$process_supervisor" control \
-                "$namespace_fixture/control.fifo" namespace-token status \
+                "$namespace_fixture/service-control.fifo" namespace-token status \
                 | grep -Fxq stopped ||
                 fail "namespace-scoped supervisor released incomplete process state"
+
+            mkdir -p -- "$namespace_project/.codex"
+            printf '%s\n' \
+                "{:runtimes {:isolated {:kind :lein :repl [\"python3\" \"$ROOT/tests/fixtures/fake-nrepl.py\" \"--interfaces-file\" \"$namespace_fixture/interfaces.txt\"]}}}" \
+                > "$namespace_project/.codex/clojure-development.edn"
+            CODEX_PROJECT_ROOT="$namespace_project" \
+                CODEX_CLOJURE_STATE_DIR="$namespace_fixture" \
+                bb "$helper" repl-start isolated \
+                > "$namespace_fixture/unix-start.out" ||
+                fail "networkless REPL failed to expose its private Unix transport"
+            grep -Fq ':transport :unix' "$namespace_fixture/unix-start.out" &&
+                grep -Fq ':endpoint-status :reachable' \
+                    "$namespace_fixture/unix-start.out" ||
+                fail "networkless REPL did not report reachable Unix transport"
+            [[ "$(<"$namespace_fixture/interfaces.txt")" == lo ]] ||
+                fail "persistent REPL namespace exposes a non-loopback interface"
+            [[ "$(stat -c %a "$namespace_fixture/repl.sock")" == 600 ]] ||
+                fail "persistent REPL Unix socket is not private"
+            CODEX_PROJECT_ROOT="$namespace_project" \
+                CODEX_CLOJURE_STATE_DIR="$namespace_fixture" \
+                bb "$helper" repl-eval isolated-transport \
+                > "$namespace_fixture/unix-eval.out"
+            grep -Fq ':status :done' "$namespace_fixture/unix-eval.out" &&
+                grep -Fq ':text "isolated-transport"' \
+                    "$namespace_fixture/unix-eval.out" ||
+                fail "Unix transport did not carry nREPL evaluation"
+            CODEX_PROJECT_ROOT="$namespace_project" \
+                CODEX_CLOJURE_STATE_DIR="$namespace_fixture" \
+                bb "$helper" repl-stop \
+                > "$namespace_fixture/unix-stop.out"
+            grep -Fq ':termination :confirmed' \
+                "$namespace_fixture/unix-stop.out" ||
+                fail "networkless REPL did not stop with confirmed termination"
+            [[ ! -e "$namespace_fixture/repl.sock" ]] ||
+                fail "networkless REPL left its Unix socket behind"
             stop_namespace_service
         else
             stop_namespace_service
@@ -751,7 +854,6 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
 
     config_fixture="$TEST_ROOT/clojure-config"
     config_state="$TEST_ROOT/clojure-runtime"
-    helper="$workflow_skill/scripts/clojure-development"
     fake_nrepl="$ROOT/tests/fixtures/fake-nrepl.py"
     mkdir -p -- "$config_fixture/.codex" "$config_fixture/bb-work"
     mkdir -p -- "$config_state"
@@ -818,7 +920,10 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     grep -Fq ':status :done' "$config_fixture/multiple.out" &&
         grep -Fq ':text "\none\n\ncafé"' "$config_fixture/multiple.out" &&
         grep -Fq ':value-count 4' "$config_fixture/multiple.out" ||
-        fail "nREPL evaluation did not preserve separate values"
+        {
+            tail -c 4096 -- "$config_fixture/multiple.out" >&2 || true
+            fail "nREPL evaluation did not preserve separate values"
+        }
     CODEX_PROJECT_ROOT="$config_fixture" \
         CODEX_CLOJURE_STATE_DIR="$config_state" \
         bb "$helper" repl-eval eval-error > "$config_fixture/eval-error.out"
@@ -999,19 +1104,6 @@ if command -v bb >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
     [[ -z "$(find "$config_fixture/unsafe-state" -mindepth 1 -print -quit)" ]] ||
         fail "Clojure helper wrote state through an overlapping symlink"
 
-    printf '%s\n' \
-        "{:runtimes {:wildcard {:kind :lein :repl [\"python3\" \"$fake_nrepl\" \"--host\" \"0.0.0.0\"]}}}" \
-        > "$config_fixture/.codex/clojure-development.edn"
-    if CODEX_PROJECT_ROOT="$config_fixture" \
-        CODEX_CLOJURE_STATE_DIR="$config_state" \
-        bb "$helper" repl-start \
-        > "$config_fixture/wildcard.out" 2>&1; then
-        fail "Clojure helper accepted a wildcard nREPL listener"
-    fi
-    grep -Fq 'not restricted to loopback' "$config_fixture/wildcard.out" ||
-        fail "wildcard listener rejection was not useful"
-    [[ ! -e "$config_state/state.edn" ]] ||
-        fail "failed REPL startup retained stale owned-process state"
     [[ -z "$(find "$config_state" -maxdepth 1 -name 'response-*' -print -quit)" ]] ||
         fail "Clojure REPL service left an orphaned response file"
     kill "$config_service_pid"
@@ -1068,12 +1160,13 @@ if hint_output="$(
 fi
 [[ "$hint_output" == *"--dev"*"/dev"* ]] ||
     fail "CUDA Bubblewrap shim did not preserve a fresh --dev /dev"
-[[ "$hint_output" != *"--dev-bind"*"/dev"*"/dev"* ]] ||
+[[ "$hint_output" != *$'--dev-bind\n/dev\n/dev'* ]] ||
     fail "CUDA Bubblewrap shim exposed the complete container /dev"
 no_gpu_bwrap="$TEST_ROOT/no-gpu-bwrap"
 printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\\n" "$@"' > "$no_gpu_bwrap"
 chmod 755 "$no_gpu_bwrap"
-no_gpu_output="$(CODEX_BWRAP_REAL="$no_gpu_bwrap" \
+no_gpu_output="$(CODEX_TEST_CUDA_NO_DEVICES=1 \
+    CODEX_BWRAP_REAL="$no_gpu_bwrap" \
     "$ROOT/container/codex-bwrap-cuda" --dev /dev -- /bin/true 2>&1)"
 assert_contains "$no_gpu_output" "--dev"
 assert_contains "$no_gpu_output" "/dev"
@@ -1141,6 +1234,7 @@ if command -v python3 >/dev/null 2>&1; then
     relay_failure_fixture="$TEST_ROOT/acp-relay-delayed-failure"
     relay_failure_bin="$relay_failure_fixture/bin"
     relay_failure_socket="$relay_failure_fixture/idea.sock"
+    relay_failure_container_socket=/run/codex-idea-mcp/idea.sock
     relay_failure_marker="$relay_failure_fixture/acp-started"
     mkdir -p -- "$relay_failure_bin"
     python3 - "$relay_failure_socket" <<'PY'
@@ -1163,22 +1257,32 @@ PY
     set +e
     relay_failure_output="$(
         env PATH="$relay_failure_bin:$PATH" \
-            CODEX_IDEA_MCP_RELAY_SOCKET="$relay_failure_socket" \
+            CODEX_IDEA_MCP_RELAY_SOCKET="$relay_failure_container_socket" \
             CODEX_IDEA_MCP_RELAY_PORT=64342 \
-            CODEX_TEST_ACP_STARTED="$relay_failure_marker" \
-            bash "$ROOT/container/codex-acp-entrypoint" 2>&1
+            CODEX_TEST_ACP_STARTED=/run/codex-idea-mcp/acp-started \
+            bwrap \
+            --unshare-user \
+            --unshare-pid \
+            --die-with-parent \
+            --ro-bind / / \
+            --dev /dev \
+            --bind "$relay_failure_fixture" /run/codex-idea-mcp \
+            -- bash "$ROOT/container/codex-acp-entrypoint" 2>&1
     )"
     relay_failure_status=$?
     set -e
     (( relay_failure_status != 0 )) ||
         fail "ACP entrypoint accepted a delayed relay startup failure"
-    assert_contains "$relay_failure_output" \
-        "Failed to start the container-side IntelliJ MCP relay"
+    [[ "$relay_failure_output" == *"Failed to start the container-side IntelliJ MCP relay"* ]] ||
+        {
+            printf '%s\n' "$relay_failure_output" >&2
+            fail "ACP delayed-failure fixture did not reach relay readiness failure"
+        }
     [[ ! -e "$relay_failure_marker" ]] ||
         fail "ACP started after its IntelliJ relay failed"
     pass "delayed IntelliJ relay startup failure"
 else
-    printf 'skip - delayed IntelliJ relay startup failure (python3 unavailable on host)\n'
+    printf 'skip - delayed IntelliJ relay startup failure (python3 or Bubblewrap unavailable on host)\n'
 fi
 
 # The launcher smoke test uses echo as a Docker frontend. This verifies the
@@ -1444,7 +1548,10 @@ assert_contains "$(<"$TEST_ROOT/invalid-image-version.out")" \
     "Invalid image tag '/invalid'"
 
 mkdir -p "$TEST_ROOT/doctor-missing-bin"
-ln -s "$(type -P bash)" "$TEST_ROOT/doctor-missing-bin/bash"
+for bootstrap_command in bash dirname id; do
+    ln -s "$(type -P "$bootstrap_command")" \
+        "$TEST_ROOT/doctor-missing-bin/$bootstrap_command"
+done
 if env \
     "HOME=$TEST_ROOT/doctor-missing-home" \
     "XDG_CONFIG_HOME=$TEST_ROOT/doctor-missing-config" \
@@ -1947,8 +2054,10 @@ test_idea_parent_death_cleanup() (
 test_idea_parent_death_cleanup
 
 mkdir -p "$TEST_ROOT/no-jq-bin"
-ln -s "$(type -P bash)" "$TEST_ROOT/no-jq-bin/bash"
-ln -s "$(type -P dirname)" "$TEST_ROOT/no-jq-bin/dirname"
+for bootstrap_command in bash dirname id; do
+    ln -s "$(type -P "$bootstrap_command")" \
+        "$TEST_ROOT/no-jq-bin/$bootstrap_command"
+done
 if env PATH="$TEST_ROOT/no-jq-bin" \
     "$ROOT/bin/run-codex" --idea smoke-project \
     >"$TEST_ROOT/no-jq.out" 2>"$TEST_ROOT/no-jq.err"; then
@@ -2011,8 +2120,8 @@ build_output="$(
 assert_not_contains "$build_output" "--build-arg UID="
 assert_not_contains "$build_output" "--build-arg GID="
 assert_contains "$build_output" "--build-arg CODEX_VERSION=0.154.0"
-assert_contains "$build_output" "--build-arg CODEX_ACP_VERSION=latest"
-assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=latest"
+assert_contains "$build_output" "--build-arg CODEX_ACP_VERSION=1.11.0"
+assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=0.19.1"
 assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:latest"
@@ -2261,6 +2370,8 @@ smoke_image() {
         [[ ",$root_mount_options," == *,ro,* ]]
         command -v bwrap >/dev/null
         command -v codex >/dev/null
+        command -v node >/dev/null
+        command -v java >/dev/null
         command -v codex-acp >/dev/null
         command -v codex-acp-entrypoint >/dev/null
         command -v agent-lsp >/dev/null
@@ -2271,6 +2382,7 @@ smoke_image() {
         command -v setsid >/dev/null
         command -v bb >/dev/null
         command -v clj >/dev/null
+        command -v deps >/dev/null
         command -v lein >/dev/null
         command -v cljfmt >/dev/null
         command -v clj-kondo >/dev/null
@@ -2280,7 +2392,12 @@ smoke_image() {
         command -v zstd >/dev/null
         [[ "$LEIN_JAR" == /opt/clojure/leiningen-standalone.jar ]]
         [[ -r "$LEIN_JAR" ]]
+        [[ "$DEPS_CLJ_TOOLS_DIR" == /usr/local/lib/clojure ]]
+        clojure -Sdescribe
+        deps -Sdescribe
         lein version
+        node --version
+        java --version
         rlwrap --version
         test -r /etc/codex/requirements.toml
         [[ "$(stat -c %a /etc/codex)" == 755 ]]

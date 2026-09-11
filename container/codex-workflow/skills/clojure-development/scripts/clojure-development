@@ -5,9 +5,11 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str])
-  (:import (java.io DataInputStream File)
-           (java.net InetSocketAddress Socket SocketTimeoutException)
-           (java.nio.channels FileChannel)
+  (:import (java.io File)
+           (java.net SocketTimeoutException StandardProtocolFamily
+                     UnixDomainSocketAddress)
+           (java.nio ByteBuffer)
+           (java.nio.channels FileChannel SelectionKey Selector SocketChannel)
            (java.nio.file CopyOption Files StandardCopyOption StandardOpenOption)
            (java.util UUID)
            (java.util.concurrent TimeUnit)))
@@ -40,6 +42,7 @@
 (def lifecycle-lock-file (str state-root "/lifecycle.lock"))
 (def evaluation-lock-file (str state-root "/eval.lock"))
 (def control-path (str state-root "/service-control.fifo"))
+(def repl-socket-path (str state-root "/repl.sock"))
 (def supervisor-command
   (or (System/getenv "CODEX_CLOJURE_SUPERVISOR")
       (str (fs/parent *file*) "/clojure-process-supervisor")))
@@ -51,68 +54,6 @@
   (binding [*out* *err*]
     (apply println xs))
   (System/exit 2))
-
-(declare fifo?)
-
-(defn namespace-identity [value]
-  (when (and (string? value) (re-matches #"net:\[[0-9]+\]" value))
-    value))
-
-(defn helper-network-namespace []
-  (try (namespace-identity (str (fs/read-link "/proc/self/ns/net")))
-       (catch Exception _ nil)))
-
-(defn network-context []
-  ;; Ask the live service, not an inherited value that may describe an old
-  ;; session. This read-only diagnostic does not establish runtime ownership.
-  (if-not (and (fs/executable? supervisor-command) (fifo? control-path))
-    {:status :service-unavailable}
-    (let [result (process/shell
-                  {:continue true :out :string :err :string}
-                  supervisor-command "control" control-path "-" "context")
-          expected (when (zero? (:exit result))
-                     (some-> (re-matches #"network-context (net:\[[0-9]+\])"
-                                         (str/trim (:out result)))
-                             second namespace-identity))
-          actual (helper-network-namespace)]
-      {:status (cond
-                 (not (zero? (:exit result))) :service-unavailable
-                 (nil? expected) :network-context-unavailable
-                 (nil? actual) :requires-elevation
-                 (not= expected actual) :requires-elevation
-                 :else :matching)
-       :reason (cond
-                 (not (zero? (:exit result))) :context-transport-failure
-                 (nil? expected) :service-identity-unavailable
-                 (nil? actual) :helper-identity-unreadable
-                 (not= expected actual) :different-network-namespaces
-                 :else :same-network-namespace)
-       :context-transport (cond
-                            (zero? (:exit result)) :responded
-                            (= "unavailable Timeout" (str/trim (:out result))) :timeout
-                            :else :unavailable)
-       :service-network-namespace expected
-       :helper-network-namespace actual})))
-
-(defn require-runtime-network! [operation]
-  (let [context (network-context)]
-    (when-not (= :matching (:status context))
-      (println
-       (pr-str
-        (merge context
-               {:operation operation
-                :request-state :not-submitted
-                :runtime-execution-state :not-inspected
-                :project-root (str project-root)
-                :state-root (str state-root)
-                :required-execution-context
-                (if (= :requires-elevation (:status context))
-                  :container-shell :fresh-session-service)
-                :message
-                (if (= :requires-elevation (:status context))
-                  "Repeat this exact helper command with container-shell elevation, preserving workdir and inherited session state. This request was not submitted; earlier runtime execution is unchanged. If identity remains unreadable after elevation, retain the failure for diagnosis."
-                  "Container REPL service is unavailable or cannot identify its network context. Use a fresh session with matching installed components; do not substitute an old namespace marker. This request was not submitted; earlier runtime execution is unchanged.")})))
-      (System/exit (if (= :requires-elevation (:status context)) 3 2)))))
 
 (defn environment-timeout [name default]
   (if-let [raw (System/getenv name)]
@@ -238,9 +179,9 @@
     (die ":validation must be a map"))
   (doseq [[key command] (:validation config)]
     (when-not (and (contains? #{:lint-command
-                               :format-command
-                               :format-fix-command}
-                             key)
+                                :format-command
+                                :format-fix-command}
+                              key)
                    (argv? command))
       (die "Validation" key "must be a supported argv vector"))
     (validate-command-size! (str "Validation " key) command))
@@ -292,14 +233,18 @@
                  [StandardCopyOption/ATOMIC_MOVE
                   StandardCopyOption/REPLACE_EXISTING]))))
 
-(defn supervisor-request [state operation]
-  (process/shell
-   {:continue true :out :string :err :string}
-   supervisor-command
-   "control"
-   (:control-path state)
-   (:control-token state)
-   operation))
+(defn supervisor-request
+  ([state operation]
+   (supervisor-request state operation nil))
+  ([state operation value]
+   (apply process/shell
+          {:continue true :out :string :err :string}
+          (cond-> [supervisor-command
+                   "control"
+                   (:control-path state)
+                   (:control-token state)
+                   operation]
+            value (conj (str value))))))
 
 (defn supervisor-output [result]
   (str/trim (or (:out result) "")))
@@ -310,47 +255,60 @@
     (process/shell {:continue true :out :string :err :string}
                    "test" "-p" (str path)))))
 
-(defn endpoint-open? [port]
+(defn unix-socket? [path]
+  (zero?
+   (:exit
+    (process/shell {:continue true :out :string :err :string}
+                   "test" "-S" (str path)))))
+
+(defn remaining-millis [deadline]
+  (long (Math/ceil (/ (double (- deadline (System/nanoTime))) 1000000.0))))
+
+(defn wait-for-channel! [selector key operation deadline]
+  (.interestOps key operation)
+  (loop []
+    (let [remaining (remaining-millis deadline)]
+      (when-not (pos? remaining)
+        (throw (SocketTimeoutException. "nREPL Unix transport deadline exceeded")))
+      (let [selected (.select selector (long (max 1 remaining)))]
+        (.clear (.selectedKeys selector))
+        (when-not (pos? selected)
+          (recur))))))
+
+(defn open-unix-transport [path deadline]
+  (let [channel (SocketChannel/open StandardProtocolFamily/UNIX)
+        selector (Selector/open)]
+    (try
+      (.configureBlocking channel false)
+      (let [key (.register channel selector SelectionKey/OP_CONNECT)
+            address (UnixDomainSocketAddress/of (str path))]
+        (when-not (.connect channel address)
+          (loop []
+            (wait-for-channel! selector key SelectionKey/OP_CONNECT deadline)
+            (when-not (.finishConnect channel)
+              (recur))))
+        (.interestOps key SelectionKey/OP_READ)
+        {:channel channel
+         :selector selector
+         :key key
+         :read-buffer (doto (ByteBuffer/allocate 8192) (.flip))})
+      (catch Exception error
+        (.close channel)
+        (.close selector)
+        (throw error)))))
+
+(defn close-unix-transport! [transport]
+  (.close ^SocketChannel (:channel transport))
+  (.close ^Selector (:selector transport)))
+
+(defn endpoint-open? [path]
   (try
-    (with-open [socket (Socket.)]
-      (.connect socket (InetSocketAddress. "127.0.0.1" (int port)) 250)
+    (let [transport (open-unix-transport
+                     path (+ (System/nanoTime) 250000000))]
+      (close-unix-transport! transport)
       true)
     (catch Exception _
       false)))
-
-(defn read-lines [path]
-  (let [result (process/shell {:continue true :out :string :err :string}
-                              "cat" (str path))]
-    (when-not (zero? (:exit result))
-      (throw (ex-info "Unable to inspect listener table"
-                      {:path (str path) :error (:err result)})))
-    (str/split-lines (:out result))))
-
-(defn listener-addresses [port]
-  (let [port-hex (format "%04X" (long port))]
-    (->> ["/proc/net/tcp" "/proc/net/tcp6"]
-         (filter fs/exists?)
-         (mapcat #(rest (read-lines %)))
-         (keep
-          (fn [line]
-            (let [fields (str/split (str/trim line) #"\s+")
-                  local (nth fields 1 nil)
-                  state (nth fields 3 nil)
-                  [address local-port] (str/split (or local "") #":" 2)]
-              (when (and (= "0A" state) (= port-hex local-port))
-                address))))
-         set)))
-
-(def loopback-listener-addresses
-  #{"0100007F"
-    "00000000000000000000000001000000"
-    "00000000000000000000000000000001"
-    "0000000000000000FFFF00000100007F"})
-
-(defn loopback-listener? [port]
-  (let [addresses (listener-addresses port)]
-    (and (seq addresses)
-         (every? loopback-listener-addresses addresses))))
 
 (defn command-dir [spec]
   (let [dir (or (:workdir spec) ".")
@@ -406,15 +364,14 @@
           owner-status (supervisor-output reported)]
       (if (and (zero? (:exit reported))
                (str/starts-with? owner-status "running "))
-        (let [context (network-context)]
-          (assoc state
-                 :status (if (= :starting (:phase state)) :starting :running)
-                 :endpoint-status
-                 (if (= :matching (:status context))
-                   (if (and (:port state) (endpoint-open? (:port state)))
-                     :reachable :unreachable)
-                   :not-checked)
-                 :network-context (:status context)))
+        (assoc state
+               :status (if (= :starting (:phase state)) :starting :running)
+               :transport :unix
+               :endpoint-status
+               (if (and (= repl-socket-path (:socket-path state))
+                        (unix-socket? repl-socket-path)
+                        (endpoint-open? repl-socket-path))
+                 :reachable :unreachable))
         (assoc state :status
                (cond
                  (= "stopped" owner-status) :stale
@@ -460,7 +417,6 @@
   (configured-repl! requested)
   (when-let [existing (read-state)]
     (require-runtime-project! existing :repl-start))
-  (require-runtime-network! :repl-start)
   (with-runtime-locks
     (fn []
       (let [[runtime spec] (configured-repl! requested)
@@ -495,6 +451,7 @@
                               :runtime-kind (:kind spec)
                               :runtime runtime
                               :command command
+                              :socket-path repl-socket-path
                               :phase :starting
                               :started-at (System/currentTimeMillis)}
               _ (write-state! starting-state)
@@ -540,18 +497,30 @@
 
                 :else
                 (if-let [port (port-from-log)]
-                  (if (and (endpoint-open? port)
-                           (seq (listener-addresses port)))
-                    (if (loopback-listener? port)
+                  (let [bridged (supervisor-request running-state "bridge" port)
+                        bridge-output (supervisor-output bridged)]
+                    (cond
+                      (and (zero? (:exit bridged))
+                           (= (str "bridged " repl-socket-path) bridge-output)
+                           (unix-socket? repl-socket-path)
+                           (endpoint-open? repl-socket-path))
                       (let [ready-state (assoc running-state
                                                :port port
                                                :phase :running)]
                         (write-state! ready-state)
                         (println (pr-str (status))))
+
+                      (and (< (System/nanoTime) deadline)
+                           (or (= "service-error ConnectionRefusedError"
+                                  bridge-output)
+                               (= "service-error TimeoutError" bridge-output)))
+                      (do (Thread/sleep 50) (recur))
+
+                      :else
                       (failed-start!
                        running-state
-                       "nREPL listener is not restricted to loopback"))
-                    (do (Thread/sleep 50) (recur)))
+                       (str "Container REPL service failed to expose its private Unix transport: "
+                            bridge-output))))
                   (do (Thread/sleep 50) (recur)))))))))))
 
 (defn stop! []
@@ -634,81 +603,102 @@
     (str "l" (apply str (map bencode value)) "e")
     :else (bencode (str value))))
 
-(defn remaining-millis [deadline]
-  (long (Math/ceil (/ (double (- deadline (System/nanoTime))) 1000000.0))))
+(defn read-byte! [transport deadline]
+  (let [^SocketChannel channel (:channel transport)
+        ^Selector selector (:selector transport)
+        key (:key transport)
+        ^ByteBuffer buffer (:read-buffer transport)]
+    (loop []
+      (if (.hasRemaining buffer)
+        (bit-and 0xff (int (.get buffer)))
+        (do
+          (.clear buffer)
+          (let [length (.read channel buffer)]
+            (cond
+              (pos? length) (do (.flip buffer) (recur))
+              (= -1 length) (throw (ex-info "nREPL closed connection" {}))
+              :else (do
+                      (.flip buffer)
+                      (wait-for-channel!
+                       selector key SelectionKey/OP_READ deadline)
+                      (recur)))))))))
 
-(defn read-byte! [stream socket deadline]
-  (let [remaining (remaining-millis deadline)]
-    (when-not (pos? remaining)
-      (throw (SocketTimeoutException. "nREPL evaluation deadline exceeded")))
-    (.setSoTimeout socket (int (min Integer/MAX_VALUE remaining)))
-    (let [value (.read stream)]
-      (when (= -1 value)
-        (throw (ex-info "nREPL closed connection" {})))
-      value)))
-
-(defn read-bytes! [stream socket deadline length]
+(defn read-bytes! [transport deadline length]
   (let [bytes (byte-array length)]
     (dotimes [index length]
       (aset-byte bytes index
-                 (unchecked-byte (read-byte! stream socket deadline))))
+                 (unchecked-byte (read-byte! transport deadline))))
     bytes))
 
 (declare bdecode)
 
-(defn bdecode [stream socket deadline first-byte]
+(defn bdecode [transport deadline first-byte]
   (cond
     (= first-byte (int \i))
-    (let [text (loop [chars [] byte (read-byte! stream socket deadline)]
+    (let [text (loop [chars [] byte (read-byte! transport deadline)]
                  (if (= byte (int \e))
                    (apply str chars)
                    (recur (conj chars (char byte))
-                          (read-byte! stream socket deadline))))]
+                          (read-byte! transport deadline))))]
       (parse-long text))
     (= first-byte (int \l))
-    (loop [values [] byte (read-byte! stream socket deadline)]
+    (loop [values [] byte (read-byte! transport deadline)]
       (if (= byte (int \e))
         values
-        (recur (conj values (bdecode stream socket deadline byte))
-               (read-byte! stream socket deadline))))
+        (recur (conj values (bdecode transport deadline byte))
+               (read-byte! transport deadline))))
     (= first-byte (int \d))
-    (loop [values {} byte (read-byte! stream socket deadline)]
+    (loop [values {} byte (read-byte! transport deadline)]
       (if (= byte (int \e))
         values
-        (let [key (bdecode stream socket deadline byte)
-              value (bdecode stream socket deadline
-                             (read-byte! stream socket deadline))]
+        (let [key (bdecode transport deadline byte)
+              value (bdecode transport deadline
+                             (read-byte! transport deadline))]
           (recur (assoc values key value)
-                 (read-byte! stream socket deadline)))))
+                 (read-byte! transport deadline)))))
     (<= (int \0) first-byte (int \9))
     (let [length-text
           (loop [chars [(char first-byte)]
-                 byte (read-byte! stream socket deadline)]
+                 byte (read-byte! transport deadline)]
             (if (= byte (int \:))
               (apply str chars)
               (recur (conj chars (char byte))
-                     (read-byte! stream socket deadline))))
+                     (read-byte! transport deadline))))
           length (parse-long length-text)]
       (when (> length max-bencode-string-bytes)
         (throw
          (ex-info "nREPL response field exceeds the bounded decoder limit"
                   {:length length :limit max-bencode-string-bytes})))
-      (let [bytes (read-bytes! stream socket deadline length)]
+      (let [bytes (read-bytes! transport deadline length)]
         (String. bytes "UTF-8")))
     :else
-    (throw (ex-info "Invalid bencode token" {:token first-byte}))))
+    (throw (ex-info (str "Invalid bencode token " first-byte)
+                    {:token first-byte}))))
 
-(defn message! [outgoing message]
-  (.write outgoing (.getBytes (bencode message) "UTF-8"))
-  (.flush outgoing))
+(defn message! [transport message deadline]
+  (let [^SocketChannel channel (:channel transport)
+        ^Selector selector (:selector transport)
+        key (:key transport)
+        buffer (ByteBuffer/wrap (.getBytes (bencode message) "UTF-8"))]
+    (try
+      (loop []
+        (when (.hasRemaining buffer)
+          (if (pos? (.write channel buffer))
+            (recur)
+            (do
+              (wait-for-channel!
+               selector key SelectionKey/OP_WRITE deadline)
+              (recur)))))
+      (finally
+        (.interestOps key SelectionKey/OP_READ)))))
 
 (defn done-message? [message]
   (some #{"done"} (get message "status")))
 
-(defn receive-until-done! [incoming socket deadline on-message]
+(defn receive-until-done! [transport deadline on-message]
   (loop []
-    (let [message (bdecode incoming socket deadline
-                           (read-byte! incoming socket deadline))]
+    (let [message (bdecode transport deadline
+                           (read-byte! transport deadline))]
       (on-message message)
       (if (done-message? message)
         message
@@ -771,20 +761,22 @@
     (when (unresolved-evaluation? state)
       (die
        "Previous evaluation has unknown server execution state; stop and restart the REPL before another evaluation"))
+    (when-not (= repl-socket-path (:socket-path state))
+      (die
+       "Active runtime lacks the private Unix transport; stop it and start a fresh REPL in this session"))
     (environment-timeout "CODEX_CLOJURE_EVAL_TIMEOUT_MS" 30000)
     state))
 
 (defn eval! [form]
   (evaluable-state!)
-  (require-runtime-network! :repl-eval)
   (with-file-lock
     evaluation-lock-file
     (fn []
       ;; Never submit using the unlocked preflight snapshot: a competing stop
       ;; or start may have changed it while this invocation waited for the lock.
       (evaluable-state!)
-      (let [{:keys [status port] :as reported-state} (status)
-            state (dissoc reported-state :status :endpoint-status :network-context)]
+      (let [{:keys [status socket-path] :as reported-state} (status)
+            state (dissoc reported-state :status :endpoint-status :transport)]
         (when-not (= :running status)
           (die "No running configured nREPL; start it first"))
         (when (unresolved-evaluation? state)
@@ -809,63 +801,63 @@
                                  :started-at started-at
                                  :form form})
             (try
-              (with-open [socket (Socket.)]
-                (.connect socket
-                          (InetSocketAddress. "127.0.0.1" (int port))
-                          (int (max 1 (remaining-millis deadline))))
-                (let [incoming (DataInputStream. (.getInputStream socket))
-                      outgoing (.getOutputStream socket)
-                      session
-                      (or
-                       (:client-session @current-state)
-                       (let [new-session (atom nil)]
-                         (message! outgoing
-                                   {"op" "clone"
-                                    "id" (str "clone-" started-at)})
-                         (receive-until-done!
-                          incoming socket deadline
-                          (fn [message]
-                            (raw-record! writer {:event :clone-response
-                                                 :message message})
-                            (when-let [session (get message "new-session")]
-                              (reset! new-session session))))
-                         (or @new-session
-                             (throw
-                              (ex-info
-                               "nREPL did not return a client session" {})))))]
-                  (swap! current-state assoc :client-session session)
-                  (write-state! @current-state)
-                  (reset! eval-sent? true)
-                  (swap! current-state assoc
-                         :evaluation {:status :running
-                                      :started-at started-at
-                                      :raw-record raw-file})
-                  (write-state! @current-state)
-                  (message! outgoing
-                            {"op" "eval"
-                             "id" (str "eval-" started-at)
-                             "session" session
-                             "code" form})
-                  (receive-until-done!
-                   incoming socket deadline
-                   (fn [message]
-                     (raw-record! writer {:event :eval-response
-                                          :message message})
-                     (swap! evidence update-evidence message)))
-                  (let [result-status
-                        (if (some evaluation-error-statuses
-                                  (:statuses @evidence))
-                          :evaluation-error
-                          :done)
-                        final-state (-> @current-state
-                                        (dissoc :evaluation)
-                                        (assoc :last-raw raw-file))]
-                    (write-state! final-state)
-                    (println
-                     (pr-str
-                      (merge {:status result-status
-                              :raw-record raw-file}
-                             (evidence-result @evidence)))))))
+              (let [transport (open-unix-transport socket-path deadline)]
+                (try
+                  (let [session
+                        (or
+                         (:client-session @current-state)
+                         (let [new-session (atom nil)]
+                           (message! transport
+                                     {"op" "clone"
+                                      "id" (str "clone-" started-at)}
+                                     deadline)
+                           (receive-until-done!
+                            transport deadline
+                            (fn [message]
+                              (raw-record! writer {:event :clone-response
+                                                   :message message})
+                              (when-let [session (get message "new-session")]
+                                (reset! new-session session))))
+                           (or @new-session
+                               (throw
+                                (ex-info
+                                 "nREPL did not return a client session" {})))))]
+                    (swap! current-state assoc :client-session session)
+                    (write-state! @current-state)
+                    (reset! eval-sent? true)
+                    (swap! current-state assoc
+                           :evaluation {:status :running
+                                        :started-at started-at
+                                        :raw-record raw-file})
+                    (write-state! @current-state)
+                    (message! transport
+                              {"op" "eval"
+                               "id" (str "eval-" started-at)
+                               "session" session
+                               "code" form}
+                              deadline)
+                    (receive-until-done!
+                     transport deadline
+                     (fn [message]
+                       (raw-record! writer {:event :eval-response
+                                            :message message})
+                       (swap! evidence update-evidence message)))
+                    (let [result-status
+                          (if (some evaluation-error-statuses
+                                    (:statuses @evidence))
+                            :evaluation-error
+                            :done)
+                          final-state (-> @current-state
+                                          (dissoc :evaluation)
+                                          (assoc :last-raw raw-file))]
+                      (write-state! final-state)
+                      (println
+                       (pr-str
+                        (merge {:status result-status
+                                :raw-record raw-file}
+                               (evidence-result @evidence))))))
+                  (finally
+                    (close-unix-transport! transport))))
               (catch SocketTimeoutException _
                 (let [unknown? @eval-sent?
                       final-state
@@ -1037,7 +1029,7 @@
     "repl-stop" (if (empty? args) (stop!) (usage))
     "repl-eval" (if (= 1 (count args)) (eval! (first args)) (usage))
     "one-off" (if (<= 1 (count args) 2)
-                  (one-off! (first args) (second args))
-                  (usage))
+                (one-off! (first args) (second args))
+                (usage))
     "config-validate" (if (empty? args) (config-validate!) (usage))
     (usage)))

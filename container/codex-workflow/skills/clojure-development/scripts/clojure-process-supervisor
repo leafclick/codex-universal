@@ -8,14 +8,148 @@ import os
 import re
 import select
 import signal
+import socket
+import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
 
 REQUEST_ID = re.compile(r"^[a-f0-9]{32}$")
 MAX_REQUEST_BYTES = 4096
+
+
+class UnixLoopbackBridge:
+    """Private pathname socket forwarding to nREPL on isolated loopback."""
+
+    def __init__(self, path, port):
+        self.path = path
+        self.port = port
+        self.listener = None
+        self.accept_thread = None
+        self.connection_threads = set()
+        self.connections = set()
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+
+    def start(self):
+        try:
+            mode = os.lstat(self.path).st_mode
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISSOCK(mode):
+                raise ValueError("refusing to replace non-socket bridge path")
+            os.unlink(self.path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(self.path)
+            os.chmod(self.path, 0o600)
+            listener.listen(16)
+            listener.settimeout(0.2)
+        except Exception:
+            listener.close()
+            try:
+                os.unlink(self.path)
+            except FileNotFoundError:
+                pass
+            raise
+        self.listener = listener
+        self.accept_thread = threading.Thread(
+            target=self._accept_loop,
+            name="codex-nrepl-unix-accept",
+            daemon=True,
+        )
+        self.accept_thread.start()
+
+    def _track(self, *connections):
+        with self.lock:
+            self.connections.update(connections)
+
+    def _untrack(self, *connections):
+        with self.lock:
+            self.connections.difference_update(connections)
+
+    def _accept_loop(self):
+        while not self.stopping.is_set():
+            try:
+                client, _ = self.listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.stopping.is_set():
+                    return
+                continue
+            thread = threading.Thread(
+                target=self._proxy,
+                args=(client,),
+                name="codex-nrepl-unix-proxy",
+                daemon=True,
+            )
+            with self.lock:
+                self.connection_threads.add(thread)
+            thread.start()
+
+    def _proxy(self, client):
+        upstream = None
+        try:
+            upstream = socket.create_connection(
+                ("127.0.0.1", self.port), timeout=1.0
+            )
+            upstream.settimeout(None)
+            self._track(client, upstream)
+            peers = {client: upstream, upstream: client}
+            while not self.stopping.is_set():
+                readable, _, _ = select.select(tuple(peers), (), (), 0.2)
+                for source in readable:
+                    data = source.recv(65536)
+                    if not data:
+                        return
+                    peers[source].sendall(data)
+        except OSError:
+            return
+        finally:
+            sockets = tuple(item for item in (client, upstream) if item is not None)
+            self._untrack(*sockets)
+            for connection in sockets:
+                try:
+                    connection.close()
+                except OSError:
+                    pass
+            with self.lock:
+                self.connection_threads.discard(threading.current_thread())
+
+    def close(self):
+        self.stopping.set()
+        if self.listener is not None:
+            try:
+                self.listener.close()
+            except OSError:
+                pass
+        with self.lock:
+            connections = tuple(self.connections)
+            threads = tuple(self.connection_threads)
+        for connection in connections:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+        if self.accept_thread is not None:
+            self.accept_thread.join(timeout=1)
+        for thread in threads:
+            thread.join(timeout=1)
+        try:
+            mode = os.lstat(self.path).st_mode
+            if stat.S_ISSOCK(mode):
+                os.unlink(self.path)
+        except FileNotFoundError:
+            pass
 
 
 def group_alive(group_id):
@@ -96,6 +230,7 @@ def request(control_path, token, operation, payload=None):
                 print(result)
                 if (result.startswith("running ")
                         or result.startswith("started ")
+                        or result.startswith("bridged ")
                         or result.startswith("network-context ")
                         or result in ("stopped", "stopped confirmed")):
                     return 0
@@ -267,6 +402,7 @@ def serve(control_path, project_root, state_root, namespace_scoped):
     os.mkfifo(control_path, 0o600)
     control_fd = os.open(control_path, os.O_RDWR | os.O_NONBLOCK)
     process = None
+    bridge = None
     owner_token = None
     cleanup_unresolved = False
     stop_service = False
@@ -281,6 +417,9 @@ def serve(control_path, project_root, state_root, namespace_scoped):
     try:
         while not stop_service:
             if process is not None and process.poll() is not None:
+                if bridge is not None:
+                    bridge.close()
+                    bridge = None
                 if cleanup_unresolved:
                     if not (namespace_has_runtime_processes()
                             if namespace_scoped else group_alive(process.pid)):
@@ -353,12 +492,35 @@ def serve(control_path, project_root, state_root, namespace_scoped):
                         response = "stopped"
                     elif supplied_token != owner_token:
                         response = "ownership-mismatch"
+                    elif operation == "bridge":
+                        port = command.get("port")
+                        if (cleanup_unresolved
+                                or not isinstance(port, int)
+                                or isinstance(port, bool)
+                                or not 1 <= port <= 65535):
+                            response = "invalid-bridge"
+                        else:
+                            if bridge is not None:
+                                bridge.close()
+                            socket_path = os.path.join(state_root, "repl.sock")
+                            if len(os.fsencode(socket_path)) >= 108:
+                                raise ValueError("Unix bridge path is too long")
+                            with socket.create_connection(
+                                ("127.0.0.1", port), timeout=0.25
+                            ):
+                                pass
+                            bridge = UnixLoopbackBridge(socket_path, port)
+                            bridge.start()
+                            response = f"bridged {socket_path}"
                     elif operation == "status":
                         if cleanup_unresolved:
                             response = "termination-timeout"
                         else:
                             response = f"running {process.pid}"
                     elif operation == "stop":
+                        if bridge is not None:
+                            bridge.close()
+                            bridge = None
                         if terminate_process_tree(process, namespace_scoped):
                             process = None
                             owner_token = None
@@ -379,6 +541,8 @@ def serve(control_path, project_root, state_root, namespace_scoped):
                         pass
     finally:
         os.close(control_fd)
+        if bridge is not None:
+            bridge.close()
         if process is not None:
             terminate_process_tree(process, namespace_scoped)
         try:
@@ -399,7 +563,10 @@ def main():
     control_parser = subparsers.add_parser("control")
     control_parser.add_argument("path")
     control_parser.add_argument("token")
-    control_parser.add_argument("operation", choices=("status", "stop", "context"))
+    control_parser.add_argument(
+        "operation", choices=("status", "stop", "context", "bridge")
+    )
+    control_parser.add_argument("value", nargs="?")
     start_parser = subparsers.add_parser("start")
     start_parser.add_argument("path")
     start_parser.add_argument("token")
@@ -419,7 +586,16 @@ def main():
             args.namespace_scoped,
         )
     if args.mode == "control":
-        return request(args.path, args.token, args.operation)
+        payload = None
+        if args.operation == "bridge":
+            try:
+                port = int(args.value)
+            except (TypeError, ValueError):
+                parser.error("bridge requires a numeric port")
+            payload = {"port": port}
+        elif args.value is not None:
+            parser.error(f"{args.operation} does not accept a value")
+        return request(args.path, args.token, args.operation, payload)
     if args.mode == "one-off":
         command = args.command
         if command and command[0] == "--":

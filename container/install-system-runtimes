@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=system-tool-versions.conf
+source "$script_dir/system-tool-versions.conf"
+
+install_root="$(mktemp -d)"
+trap 'rm -rf -- "$install_root"' EXIT
+install -d -m 0700 "$install_root/gnupg"
+export GNUPGHOME="$install_root/gnupg"
+
+download_verified() {
+    local url="$1"
+    local checksum="$2"
+    local target="$3"
+
+    curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
+        --output "$target" "$url"
+    printf '%s  %s\n' "$checksum" "$target" | sha256sum --check --status || {
+        echo "Checksum verification failed for $url" >&2
+        exit 1
+    }
+}
+
+verify_primary_fingerprint() {
+    local key_file="$1"
+    local expected="$2"
+    local actual
+
+    actual="$(gpg --batch --show-keys --with-colons "$key_file" |
+        awk -F: '$1 == "fpr" {print $10; exit}')"
+    [[ "$actual" == "$expected" ]] || {
+        echo "Signing-key fingerprint mismatch for $key_file" >&2
+        exit 1
+    }
+}
+
+download_verified \
+    https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+    "$NODESOURCE_KEY_SHA256" "$install_root/nodesource.key"
+verify_primary_fingerprint \
+    "$install_root/nodesource.key" "$NODESOURCE_KEY_FINGERPRINT"
+install -d -m 0755 /usr/share/keyrings
+gpg --batch --yes --dearmor \
+    --output /usr/share/keyrings/nodesource.gpg "$install_root/nodesource.key"
+chmod 0644 /usr/share/keyrings/nodesource.gpg
+{
+    printf '%s\n' \
+        'Types: deb' \
+        "URIs: https://deb.nodesource.com/node_${NODE_MAJOR}.x" \
+        'Suites: nodistro' \
+        'Components: main' \
+        "Architectures: $(dpkg --print-architecture)" \
+        'Signed-By: /usr/share/keyrings/nodesource.gpg'
+} >/etc/apt/sources.list.d/nodesource.sources
+
+download_verified \
+    https://packages.adoptium.net/artifactory/api/gpg/key/public \
+    "$ADOPTIUM_KEY_SHA256" "$install_root/adoptium.key"
+verify_primary_fingerprint \
+    "$install_root/adoptium.key" "$ADOPTIUM_KEY_FINGERPRINT"
+install -d -m 0755 /etc/apt/keyrings
+gpg --batch --yes --dearmor \
+    --output /etc/apt/keyrings/adoptium.gpg "$install_root/adoptium.key"
+chmod 0644 /etc/apt/keyrings/adoptium.gpg
+# shellcheck source=/dev/null
+source /etc/os-release
+[[ "${VERSION_CODENAME:-}" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || {
+    echo "Invalid Ubuntu VERSION_CODENAME: ${VERSION_CODENAME:-}" >&2
+    exit 1
+}
+printf 'deb [signed-by=/etc/apt/keyrings/adoptium.gpg] %s %s main\n' \
+    https://packages.adoptium.net/artifactory/deb "$VERSION_CODENAME" \
+    >/etc/apt/sources.list.d/adoptium.list
+
+apt-get update
+apt-get install -y --no-install-recommends \
+    nodejs "temurin-${TEMURIN_MAJOR}-jdk"
+rm -rf -- /var/lib/apt/lists/*
+
+node --version
+java --version

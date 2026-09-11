@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=clojure-tool-versions.conf
+source "$script_dir/clojure-tool-versions.conf"
+
+install_root="$(mktemp -d)"
+trap 'rm -rf -- "$install_root"' EXIT
+
+download_verified() {
+    local url="$1"
+    local checksum="$2"
+    local target="$3"
+
+    curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
+        --output "$target" "$url"
+    printf '%s  %s\n' "$checksum" "$target" | sha256sum --check --status || {
+        echo "Checksum verification failed for $url" >&2
+        exit 1
+    }
+}
+
+clojure_dir="$install_root/clojure"
+mkdir -p -- "$clojure_dir"
+clojure_installer="$clojure_dir/linux-install.sh"
+download_verified \
+    "https://github.com/clojure/brew-install/releases/download/${CLOJURE_CLI_VERSION}/linux-install.sh" \
+    "$CLOJURE_INSTALLER_SHA256" \
+    "$clojure_installer"
+# Keep the existing IPv4-only build behavior after authenticating the script.
+sed -i 's/curl /curl -4 /g' "$clojure_installer"
+chmod 0755 "$clojure_installer"
+(
+    cd -- "$clojure_dir"
+    "$clojure_installer"
+)
+
+lein_launcher="$install_root/lein"
+export LEIN_JAR="${LEIN_JAR:-/opt/clojure/leiningen-standalone.jar}"
+download_verified \
+    "https://raw.githubusercontent.com/technomancy/leiningen/${LEIN_VERSION}/bin/lein" \
+    "$LEIN_LAUNCHER_SHA256" \
+    "$lein_launcher"
+# Leiningen 2.13.0's authenticated tag shipped a launcher whose embedded
+# version remained 2.12.1-SNAPSHOT. Normalize that metadata only after the
+# upstream launcher checksum has passed, and fail if its expected shape moves.
+[[ "$(grep -c '^export LEIN_VERSION=' "$lein_launcher")" == 1 ]] || {
+    echo "Unexpected Leiningen launcher version metadata" >&2
+    exit 1
+}
+sed -i \
+    "s/^export LEIN_VERSION=.*/export LEIN_VERSION=\"${LEIN_VERSION}\"/" \
+    "$lein_launcher"
+download_verified \
+    "https://github.com/technomancy/leiningen/releases/download/${LEIN_VERSION}/leiningen-${LEIN_VERSION}-standalone.jar" \
+    "$LEIN_JAR_SHA256" \
+    "$install_root/leiningen-standalone.jar"
+install -m 0755 "$lein_launcher" /usr/local/bin/lein
+install -d -m 0755 /opt/clojure
+install -m 0644 "$install_root/leiningen-standalone.jar" "$LEIN_JAR"
+ln -sfn /usr/local/bin/lein /opt/clojure/lein
+
+case "$(dpkg --print-architecture)" in
+    amd64) ;;
+    *)
+        echo "deps.clj ${DEPS_CLJ_VERSION} has no supported native asset for this image architecture" >&2
+        exit 1
+        ;;
+esac
+deps_archive="deps.clj-${DEPS_CLJ_VERSION}-linux-amd64.zip"
+download_verified \
+    "https://github.com/borkdude/deps.clj/releases/download/v${DEPS_CLJ_VERSION}/${deps_archive}" \
+    "$DEPS_CLJ_AMD64_SHA256" \
+    "$install_root/$deps_archive"
+unzip -qq "$install_root/$deps_archive" -d "$install_root/deps-clj"
+install -m 0755 "$install_root/deps-clj/deps" /usr/local/bin/deps
+
+clojure -Sdescribe
+lein_version_output="$(lein version)"
+printf '%s\n' "$lein_version_output"
+[[ "$lein_version_output" == "Leiningen ${LEIN_VERSION} "* ]] || {
+    echo "Leiningen runtime version does not match ${LEIN_VERSION}" >&2
+    exit 1
+}
+DEPS_CLJ_TOOLS_DIR=/usr/local/lib/clojure deps -Sdescribe

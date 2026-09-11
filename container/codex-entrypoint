@@ -99,11 +99,6 @@ start_clojure_repl_service() {
 
     control_path="$state_root/service-control.fifo"
     service_log="$state_root/service.log"
-    # The service shares container loopback; individual Codex tool sandboxes
-    # may have their own network namespace. Let the helper detect that before
-    # starting a JVM it cannot reach. This is a diagnostic, not authorization.
-    CODEX_CLOJURE_SERVICE_NETNS="$(readlink /proc/self/ns/net 2>/dev/null || true)"
-    export CODEX_CLOJURE_SERVICE_NETNS
     supervisor="/usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-process-supervisor"
     [[ -x "$supervisor" ]] || {
         echo "Clojure REPL service executable is unavailable: $supervisor" >&2
@@ -126,6 +121,7 @@ start_clojure_repl_service() {
         --unshare-user
         --unshare-ipc
         --unshare-pid
+        --unshare-net
         --unshare-uts
         --unshare-cgroup-try
         --die-with-parent
@@ -141,9 +137,8 @@ start_clojure_repl_service() {
         # Clojure backends work without exposing any outer process metadata.
         --dir /proc/self
         --symlink "$java_binary" /proc/self/exe
-        # Docker already gives the container a network namespace with only
-        # loopback. Sharing it lets Codex probes reach nREPL without restoring
-        # any external network access.
+        # The configured nREPL remains on private loopback. The supervisor
+        # exposes it only through a mode-0600 pathname socket in state_root.
         --bind /tmp /tmp
         --bind "$home_root" "$home_root"
         --bind "$project_root" "$project_root"

@@ -89,7 +89,7 @@ development aliases and approved nREPL version:
 
 Use this alternate recipe only when the bundled `clojure-development` skill is
 not installed. It starts an unmanaged nREPL and therefore bypasses the skill's
-process supervisor, loopback verification, managed elevation path, and
+process supervisor, private Unix transport, networkless namespace, and
 Bubblewrap boundary; do not use it when the skill is available.
 
 ```bash

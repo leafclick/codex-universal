@@ -1,30 +1,76 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Use each project's supported installer so the image gets the upstream native
-# executable rather than a JVM wrapper. The installers select amd64/aarch64 and
-# the latest stable release for the current platform.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=clojure-tool-versions.conf
+source "$script_dir/clojure-tool-versions.conf"
+
 install_root="$(mktemp -d)"
 trap 'rm -rf -- "$install_root"' EXIT
 
-download_and_run() {
-    local name="$1"
-    local url="$2"
-    local installer="$install_root/$name"
+download_verified() {
+    local url="$1"
+    local checksum="$2"
+    local target="$3"
 
-    curl -4 -fsSL -o "$installer" "$url"
-    chmod 0755 "$installer"
-    "$installer"
+    curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
+        --output "$target" "$url"
+    printf '%s  %s\n' "$checksum" "$target" | sha256sum --check --status || {
+        echo "Checksum verification failed for $url" >&2
+        exit 1
+    }
 }
 
-download_and_run babashka \
-    https://raw.githubusercontent.com/babashka/babashka/master/install
-download_and_run cljfmt \
-    https://raw.githubusercontent.com/weavejester/cljfmt/master/install.sh
-download_and_run clj-kondo \
-    https://raw.githubusercontent.com/clj-kondo/clj-kondo/master/script/install-clj-kondo
-download_and_run clojure-lsp \
-    https://raw.githubusercontent.com/clojure-lsp/clojure-lsp/master/install
+case "$(dpkg --print-architecture)" in
+    amd64)
+        babashka_archive="babashka-${BABASHKA_VERSION}-linux-amd64.tar.gz"
+        babashka_checksum="$BABASHKA_AMD64_SHA256"
+        cljfmt_archive="cljfmt-${CLJFMT_VERSION}-linux-amd64.tar.gz"
+        cljfmt_checksum="$CLJFMT_AMD64_SHA256"
+        clj_kondo_archive="clj-kondo-${CLJ_KONDO_VERSION}-linux-amd64.zip"
+        clj_kondo_checksum="$CLJ_KONDO_AMD64_SHA256"
+        clojure_lsp_archive=clojure-lsp-native-linux-amd64.zip
+        clojure_lsp_checksum="$CLOJURE_LSP_AMD64_SHA256"
+        ;;
+    arm64)
+        babashka_archive="babashka-${BABASHKA_VERSION}-linux-aarch64-static.tar.gz"
+        babashka_checksum="$BABASHKA_ARM64_SHA256"
+        cljfmt_archive="cljfmt-${CLJFMT_VERSION}-linux-aarch64.tar.gz"
+        cljfmt_checksum="$CLJFMT_ARM64_SHA256"
+        clj_kondo_archive="clj-kondo-${CLJ_KONDO_VERSION}-linux-aarch64.zip"
+        clj_kondo_checksum="$CLJ_KONDO_ARM64_SHA256"
+        clojure_lsp_archive=clojure-lsp-native-linux-aarch64.zip
+        clojure_lsp_checksum="$CLOJURE_LSP_ARM64_SHA256"
+        ;;
+    *)
+        echo "Unsupported architecture: $(dpkg --print-architecture)" >&2
+        exit 1
+        ;;
+esac
+
+download_verified \
+    "https://github.com/babashka/babashka/releases/download/v${BABASHKA_VERSION}/${babashka_archive}" \
+    "$babashka_checksum" "$install_root/$babashka_archive"
+tar -xzf "$install_root/$babashka_archive" -C "$install_root"
+install -m 0755 "$install_root/bb" /usr/local/bin/bb
+
+download_verified \
+    "https://github.com/weavejester/cljfmt/releases/download/${CLJFMT_VERSION}/${cljfmt_archive}" \
+    "$cljfmt_checksum" "$install_root/$cljfmt_archive"
+tar -xzf "$install_root/$cljfmt_archive" -C "$install_root"
+install -m 0755 "$install_root/cljfmt" /usr/local/bin/cljfmt
+
+download_verified \
+    "https://github.com/clj-kondo/clj-kondo/releases/download/v${CLJ_KONDO_VERSION}/${clj_kondo_archive}" \
+    "$clj_kondo_checksum" "$install_root/$clj_kondo_archive"
+unzip -qq "$install_root/$clj_kondo_archive" -d "$install_root/clj-kondo"
+install -m 0755 "$install_root/clj-kondo/clj-kondo" /usr/local/bin/clj-kondo
+
+download_verified \
+    "https://github.com/clojure-lsp/clojure-lsp/releases/download/${CLOJURE_LSP_VERSION}/${clojure_lsp_archive}" \
+    "$clojure_lsp_checksum" "$install_root/$clojure_lsp_archive"
+unzip -qq "$install_root/$clojure_lsp_archive" -d "$install_root/clojure-lsp"
+install -m 0755 "$install_root/clojure-lsp/clojure-lsp" /usr/local/bin/clojure-lsp
 
 # Fail the image build if an installer returned success without leaving a
 # runnable native tool behind.

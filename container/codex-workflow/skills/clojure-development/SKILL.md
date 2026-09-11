@@ -26,9 +26,10 @@ the proposal format.
 Resolve `scripts/clojure-development` from this skill's installed directory,
 independently of the project working directory. Use it for `repl-start [runtime]`, `repl-status`,
 `repl-eval FORM`, `repl-stop`, and the explicit `one-off FORM [runtime]`
-operation. It stores session data outside the checkout, verifies the actual
-nREPL listener is loopback-only, serializes lifecycle and evaluations, bounds
-display output, and reports a timeout as unknown execution state while
+operation. It stores session data outside the checkout, keeps the configured
+nREPL on loopback inside a networkless namespace, connects through a private
+pathname Unix socket, serializes lifecycle and evaluations, bounds display
+output, and reports a timeout as unknown execution state while
 preserving partial and raw evidence. Stop and restart after unknown execution
 state; never retry it blindly. A REPL is executable state, not a read-only
 action.
@@ -36,22 +37,14 @@ The container entrypoint supplies the inherited private state directory and a
 session-owned process service so the REPL survives separate tool-command
 sandboxes. That service runs inside a nested Bubblewrap boundary with writable
 working tree and caches, read-only `.git` and `.codex`, and no view of outer
-container processes. Its inherited filter also denies nested user namespaces.
-Do not invent a shared fallback or launch an unsandboxed owner outside that
-environment. If the helper reports `:requires-elevation`, request execution of
-the same absolute helper command in the container shell, preserving the
-project workdir and inherited `CODEX_CLOJURE_STATE_DIR`. Name the helper action,
-project, and container-loopback purpose in the approval request. This reuses
-the session service; do not reconstruct entrypoint/Bubblewrap commands or
-create another service. If your agent context cannot request approval, return
-the exact command, workdir, inherited-state requirement and approval purpose
-to the parent; the parent may request it and return its result. A rejection is
-not authorization to try another path. If neither context can obtain approval,
-retain the concrete failure and stop the affected runtime task.
+container processes or external networks. Its inherited filter also denies
+nested user namespaces. Do not invent a shared fallback or launch an
+unsandboxed owner outside that environment. A runtime state created before the
+private Unix transport is unsupported: stop it cleanly and start a fresh REPL
+instead of falling back to direct TCP or reconstructing the service.
 `repl-status` reports process ownership separately from endpoint reachability;
-an unchecked endpoint is not a dead runtime. `repl-stop` uses the control FIFO.
-One-off Babashka does not use this TCP preflight. A rejected request was not
-submitted; it says nothing about earlier in-flight or unknown evaluation state.
+an unreachable endpoint is not by itself a dead runtime. `repl-stop` uses the
+control FIFO. One-off Babashka does not use the persistent Unix transport.
 
 There is one active persistent runtime per chat. Share it only within one
 parent-coordinated experiment; use task-specific Clojure namespaces for probes.

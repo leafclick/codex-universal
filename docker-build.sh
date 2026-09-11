@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 TARGET="${1:-all}"
 CODEX_VERSION="${CODEX_VERSION:-0.154.0}"
-CODEX_ACP_VERSION="${CODEX_ACP_VERSION:-latest}"
-AGENT_LSP_VERSION="${AGENT_LSP_VERSION:-latest}"
+CODEX_ACP_VERSION="${CODEX_ACP_VERSION:-1.11.0}"
+AGENT_LSP_VERSION="${AGENT_LSP_VERSION:-0.19.1}"
 IMAGE_SLUG="${IMAGE_SLUG:-${IMAGE_PREFIX:-}}"
 IMAGE_VERSION="${IMAGE_VERSION:-${TAG:-}}"
 TAG_LATEST="${TAG_LATEST:-1}"
@@ -25,8 +25,8 @@ Environment:
   IMAGE_VERSION=VERSION       Docker tag; defaults from Git tag lineage or branch
   TAG_LATEST=1                Also update the local latest alias
   CODEX_VERSION=0.154.0       @openai/codex npm version
-  CODEX_ACP_VERSION=latest    @agentclientprotocol/codex-acp npm version
-  AGENT_LSP_VERSION=latest    @blackwell-systems/agent-lsp npm version
+  CODEX_ACP_VERSION=1.11.0    @agentclientprotocol/codex-acp npm version
+  AGENT_LSP_VERSION=0.19.1    @blackwell-systems/agent-lsp npm version
   PULL=1                     Set to 0 to omit docker build --pull
 
 Compatibility:

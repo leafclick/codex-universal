@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression checks for the helper's container-shell network preflight."""
+"""Regression checks for the helper's private Unix transport."""
 
 import argparse
 import errno
@@ -16,7 +16,7 @@ import unittest
 
 class NetworkContextChecks(unittest.TestCase):
     def setUp(self):
-        self.work = Path(tempfile.mkdtemp(prefix="codex-network-context-"))
+        self.work = Path(tempfile.mkdtemp(prefix="codex-unix-transport-"))
         self.project = self.work / "project"
         self.state = self.work / "state"
         (self.project / ".codex").mkdir(parents=True)
@@ -36,12 +36,25 @@ class NetworkContextChecks(unittest.TestCase):
         self.supervisor = self.work / "context-supervisor.py"
         self.supervisor.write_text(
             "#!/usr/bin/env python3\n"
-            "import os, sys\n"
+            "import os, socket, sys\n"
             "with open(os.environ['CODEX_CONTEXT_OPERATIONS'], 'a', encoding='utf-8') as stream:\n"
             "    stream.write((sys.argv[-1] if sys.argv[1] == 'control' else sys.argv[1]) + '\\n')\n"
             "operation = sys.argv[-1] if sys.argv[1] == 'control' else sys.argv[1]\n"
-            "if operation == 'context':\n"
-            "    print(os.environ['CODEX_LIVE_NETWORK_CONTEXT'])\n"
+            "if operation == 'start':\n"
+            "    with open(os.environ['CODEX_CLOJURE_STATE_DIR'] + '/repl.log', 'a', encoding='utf-8') as stream:\n"
+            "        stream.write('nREPL server started on port 41234\\n')\n"
+            "if operation == 'bridge':\n"
+            "    path = sys.argv[-1]\n"
+            "    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "    try:\n"
+            "        os.unlink(path)\n"
+            "    except FileNotFoundError:\n"
+            "        pass\n"
+            "    sock.bind(path)\n"
+            "    sock.listen(1)\n"
+            "    print('bridged ' + path)\n"
+            "elif operation == 'context':\n"
+            "    print('private-unix')\n"
             "elif operation == 'status':\n"
             "    print(os.environ.get('CODEX_STATUS_RESPONSE', 'stopped'))\n"
             "else:\n"
@@ -120,21 +133,7 @@ class NetworkContextChecks(unittest.TestCase):
             "repl-start", extra={"CODEX_CLOJURE_SUPERVISOR": str(self.work / "missing")}
         )
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(":service-unavailable", result.stdout)
-        self.assertIn(":not-submitted", result.stdout)
-        self.assertIn("fresh-session-service", result.stdout)
-
-    def test_invalid_live_identity_returns_actionable_exit_two(self):
-        self.supervisor.write_text(self.supervisor.read_text(encoding="utf-8").replace(
-            "print(os.environ['CODEX_LIVE_NETWORK_CONTEXT'])", "print('not-a-network-context')"),
-            encoding="utf-8")
-        result = self.run_helper(
-            "repl-start", extra={"CODEX_CLOJURE_SUPERVISOR": str(self.supervisor),
-                                  "CODEX_LIVE_NETWORK_CONTEXT": "not-a-network-context",
-                                  "CODEX_CONTEXT_OPERATIONS": str(self.operations)})
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(":network-context-unavailable", result.stdout)
-        self.assertIn(":not-submitted", result.stdout)
+        self.assertIn("Clojure process supervisor is unavailable", result.stderr)
 
     def test_mismatched_eval_preserves_unknown_state_and_sends_no_request(self):
         original = (
@@ -154,29 +153,25 @@ class NetworkContextChecks(unittest.TestCase):
         self.assertEqual((self.state / "state.edn").read_bytes(), original)
         self.assertFalse(self.operations.exists())
 
-    def test_live_context_ignores_stale_missing_and_malformed_env(self):
-        namespace = os.readlink("/proc/self/ns/net")
+    def test_legacy_running_state_without_socket_is_rejected(self):
         (self.state / "state.edn").write_text(
-            '{:phase :running :project-root "' + str(self.project) +
+            '{:phase :running :port 41234 :project-root "' + str(self.project) +
             '" :directory "' + str(self.project) + '" :runtime-kind :deps '
-            ':runtime :dev :command ["/bin/false" "--bind" "127.0.0.1" "--port" "0"]}\n',
+            ':runtime :dev :command ["/bin/false" "--bind" "127.0.0.1" "--port" "0"] '
+            ':control-path "' + str(self.control) + '" :control-token "owner-token"}\n',
             encoding="utf-8")
-        for inherited in ("net:[999999]", "", "malformed"):
-            with self.subTest(inherited=inherited):
-                result = self.run_helper(
-                    "repl-eval", "(+ 1 2)", network=inherited,
-                    extra={"CODEX_CLOJURE_SUPERVISOR": str(self.supervisor),
-                           "CODEX_LIVE_NETWORK_CONTEXT": "network-context " + namespace,
-                           "CODEX_CONTEXT_OPERATIONS": str(self.operations)})
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertIn("No running configured nREPL; start it first", result.stderr)
-                self.assertNotIn(":requires-elevation", result.stdout)
-        self.assertEqual(self.operations.read_text(encoding="utf-8").splitlines(),
-                         ["context", "status", "context", "status", "context", "status"])
+        result = self.run_helper(
+            "repl-eval", "(+ 1 2)",
+            extra={"CODEX_CLOJURE_SUPERVISOR": str(self.supervisor),
+                   "CODEX_CONTEXT_OPERATIONS": str(self.operations)})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("private Unix transport", result.stderr)
+        self.assertFalse(self.operations.exists())
 
     def test_running_status_reports_ownership_without_claiming_endpoint_health(self):
-        port = 41234
-        state = ('{:phase :running :port ' + str(port) + ' :project-root "' +
+        socket_path = self.state / "repl.sock"
+        state = ('{:phase :running :socket-path "' + str(socket_path) +
+                 '" :project-root "' +
                  str(self.project) + '" :directory "' + str(self.project) +
                  '" :runtime-kind :deps :runtime :dev :command ["/bin/false" '
                  '"--bind" "127.0.0.1" "--port" "0"] :control-path "' +
@@ -184,56 +179,11 @@ class NetworkContextChecks(unittest.TestCase):
         (self.state / "state.edn").write_text(state, encoding="utf-8")
         common = {"CODEX_CLOJURE_SUPERVISOR": str(self.supervisor),
                   "CODEX_STATUS_RESPONSE": "running 1234",
-                  "CODEX_LIVE_NETWORK_CONTEXT": "network-context net:[999999]",
                   "CODEX_CONTEXT_OPERATIONS": str(self.operations)}
-        result = self.run_helper("repl-status", network="net:[different]", extra=common)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(":status :running", result.stdout)
-        self.assertIn(":endpoint-status :not-checked", result.stdout)
-        result = self.run_helper("repl-status", network=os.readlink("/proc/self/ns/net"),
-                                 extra=dict(common, CODEX_LIVE_NETWORK_CONTEXT=
-                                            "network-context " + os.readlink("/proc/self/ns/net")))
+        result = self.run_helper("repl-status", extra=common)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(":status :running", result.stdout)
         self.assertIn(":endpoint-status :unreachable", result.stdout)
-
-    def test_matching_namespace_reaches_ordinary_validation(self):
-        namespace = os.readlink("/proc/self/ns/net")
-        result = self.run_helper("repl-start", network=namespace,
-                                 extra={"CODEX_CLOJURE_SUPERVISOR": str(self.supervisor),
-                                        "CODEX_LIVE_NETWORK_CONTEXT": "network-context " + namespace,
-                                        "CODEX_CONTEXT_OPERATIONS": str(self.operations)})
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("Container REPL service rejected startup", result.stderr)
-        self.assertNotIn(":requires-elevation", result.stdout)
-        self.assertEqual(self.operations.read_text(encoding="utf-8").splitlines(),
-                         ["context", "start", "status"])
-
-    def test_unreadable_helper_namespace_requests_supported_elevation(self):
-        namespace = os.readlink("/proc/self/ns/net")
-        (self.state / "state.edn").write_text(
-            '{:phase :running :project-root "' + str(self.project) +
-            '" :directory "' + str(self.project) + '" :runtime-kind :deps '
-            ':runtime :dev :command ["/bin/false" "--bind" "127.0.0.1" "--port" "0"] '
-            ':control-path "' + str(self.control) + '" :control-token "owner-token"}\n',
-            encoding="utf-8")
-        env = os.environ.copy()
-        env.update({"CODEX_PROJECT_ROOT": str(self.project),
-                    "CODEX_CLOJURE_STATE_DIR": str(self.state),
-                    "CODEX_CLOJURE_SUPERVISOR": str(self.supervisor),
-                    "CODEX_LIVE_NETWORK_CONTEXT": "network-context " + namespace,
-                    "CODEX_CONTEXT_OPERATIONS": str(self.operations)})
-        expression = ("(binding [*command-line-args* [\"repl-eval\" \"(+ 1 2)\"]] "
-                      "(with-redefs [babashka.fs/read-link "
-                      "(fn [_] (throw (Exception. \"denied\")))] "
-                      f"(load-file {json.dumps(self.helper)})))")
-        result = subprocess.run(
-            [self.bb, "-e", expression],
-            cwd=self.project, env=env, text=True, capture_output=True,
-            check=False, timeout=10)
-        self.assert_requires_elevation_without_side_effects(result, empty=False)
-        self.assertIn(":helper-identity-unreadable", result.stdout)
-        self.assertEqual(self.operations.read_text(encoding="utf-8").splitlines(), ["context"])
 
     def test_one_off_runs_without_service_and_preserves_stdio(self):
         result = self.run_helper(
@@ -289,10 +239,6 @@ class NetworkContextChecks(unittest.TestCase):
         config.write_text(config.read_text(encoding="utf-8").replace(
             '["/bin/false" "--bind" "127.0.0.1" "--port" "0"]', inert_edn), encoding="utf-8")
         source_supervisor = self.start_source_service()
-        context = subprocess.run(
-            [str(source_supervisor), "control", str(self.control), "-", "context"],
-            text=True, capture_output=True, check=False, timeout=5)
-        self.assertEqual(context.stdout.strip(), "network-context " + os.readlink("/proc/self/ns/net"))
         start = subprocess.run(
             [str(source_supervisor), "start", "--log", str(self.state / "repl.log"),
              "--dir", str(self.project), str(self.control), "owner-token", "--",
@@ -320,11 +266,6 @@ class NetworkContextChecks(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(":termination :confirmed", result.stdout)
         self.assertFalse((self.state / "state.edn").exists())
-        for _ in range(100):
-            if not Path("/proc", str(pid)).exists():
-                break
-            time.sleep(0.02)
-        self.assertFalse(Path("/proc", str(pid)).exists())
 
     def test_local_eval_rejects_no_state_or_invalid_config_without_context(self):
         for invalid_config in (False, True):
@@ -348,31 +289,6 @@ class NetworkContextChecks(unittest.TestCase):
                 self.assertEqual([path.name for path in state_files],
                                  ["state.edn"] if invalid_config else [])
 
-    def test_eval_rechecks_state_after_context_preflight(self):
-        state = ('{:phase :running :port 41234 :project-root "' + str(self.project) +
-                 '" :directory "' + str(self.project) + '" :runtime-kind :deps '
-                 ':runtime :dev :command ["/bin/false" "--bind" "127.0.0.1" "--port" "0"] '
-                 ':control-path "' + str(self.control) + '" :control-token "owner-token"}\n')
-        (self.state / "state.edn").write_text(state, encoding="utf-8")
-        self.supervisor.write_text(
-            "#!/usr/bin/env python3\n"
-            "import os, sys\n"
-            "operation = sys.argv[-1] if sys.argv[1] == 'control' else sys.argv[1]\n"
-            "open(os.environ['CODEX_CONTEXT_OPERATIONS'], 'a').write(operation + '\\n')\n"
-            "if operation == 'context':\n"
-            "    os.unlink(os.environ['CODEX_CLOJURE_STATE_DIR'] + '/state.edn')\n"
-            "    print('network-context ' + os.readlink('/proc/self/ns/net'))\n"
-            "elif operation == 'status': print('running 1234')\n"
-            "else: print('stopped')\n", encoding="utf-8")
-        self.supervisor.chmod(0o755)
-        result = self.run_helper(
-            "repl-eval", "(+ 1 2)",
-            extra={"CODEX_CLOJURE_SUPERVISOR": str(self.supervisor),
-                   "CODEX_CONTEXT_OPERATIONS": str(self.operations)})
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("No running configured nREPL", result.stdout + result.stderr)
-        self.assertFalse((self.state / "state.edn").exists())
-
     def test_malformed_start_config_is_rejected_before_context(self):
         (self.project / ".codex" / "clojure-development.edn").write_text(
             "{:runtimes invalid}", encoding="utf-8")
@@ -384,25 +300,6 @@ class NetworkContextChecks(unittest.TestCase):
         self.assertEqual([path.name for path in self.state.iterdir()
                           if path.name != "service-control.fifo"], [])
 
-    def test_start_rechecks_recipe_after_context_preflight(self):
-        self.supervisor.write_text(
-            "#!/usr/bin/env python3\n"
-            "import os, sys\n"
-            "operation = sys.argv[-1] if sys.argv[1] == 'control' else sys.argv[1]\n"
-            "open(os.environ['CODEX_CONTEXT_OPERATIONS'], 'a').write(operation + '\\n')\n"
-            "if operation == 'context':\n"
-            "    open(os.environ['CODEX_PROJECT_ROOT'] + '/.codex/clojure-development.edn', 'w').write('{:runtimes invalid}')\n"
-            "    print('network-context ' + os.readlink('/proc/self/ns/net'))\n"
-            "else: print('stopped')\n", encoding="utf-8")
-        self.supervisor.chmod(0o755)
-        result = self.run_helper(
-            "repl-start", extra={"CODEX_CLOJURE_SUPERVISOR": str(self.supervisor),
-                                  "CODEX_LIVE_NETWORK_CONTEXT": "network-context " + os.readlink("/proc/self/ns/net"),
-                                  "CODEX_CONTEXT_OPERATIONS": str(self.operations)})
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertFalse((self.state / "state.edn").exists())
-        self.assertEqual(self.operations.read_text(encoding="utf-8").splitlines(), ["context"])
-
     def test_unresponsive_stale_fifo_obeys_existing_request_deadline(self):
         reader = self.work / "fifo-reader.py"
         reader.write_text(
@@ -413,7 +310,8 @@ class NetworkContextChecks(unittest.TestCase):
         self.control.unlink()
         os.mkfifo(self.control)
         (self.state / "state.edn").write_text(
-            '{:phase :running :project-root "' + str(self.project) +
+            '{:phase :running :socket-path "' + str(self.state / "repl.sock") +
+            '" :project-root "' + str(self.project) +
             '" :directory "' + str(self.project) + '" :runtime-kind :deps '
             ':runtime :dev :command ["/bin/false" "--bind" "127.0.0.1" "--port" "0"] '
             ':control-path "' + str(self.control) + '" :control-token "owner-token"}\n',
@@ -426,9 +324,7 @@ class NetworkContextChecks(unittest.TestCase):
                 Path(self.helper).with_name("clojure-process-supervisor"))})
         elapsed = time.monotonic() - started
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(":service-unavailable", result.stdout)
-        self.assertIn(":context-transport :timeout", result.stdout)
-        self.assertIn(":not-submitted", result.stdout)
+        self.assertIn("No running configured nREPL", result.stdout + result.stderr)
         self.assertGreaterEqual(elapsed, 4)
         self.assertLess(elapsed, 8)
 

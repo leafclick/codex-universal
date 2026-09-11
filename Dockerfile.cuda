@@ -135,10 +135,13 @@ RUN groupadd --gid 65532 codex \
         --no-create-home \
         codex
 
-# Node.js 24.
-RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
+# Node.js and Eclipse Temurin JDK. Repository keys are checksum- and
+# fingerprint-verified before apt trusts them; no downloaded installer runs.
+COPY --chmod=0644 container/system-tool-versions.conf /usr/local/src/system-tool-versions.conf
+COPY --chmod=0755 container/install-system-runtimes /usr/local/src/install-system-runtimes
+RUN /usr/local/src/install-system-runtimes \
+    && rm -f /usr/local/src/install-system-runtimes \
+       /usr/local/src/system-tool-versions.conf
 
 # Installed tools are root-owned and immutable at runtime.
 RUN install -d -o root -g root -m 0755 /usr/local/share/npm-global
@@ -146,55 +149,27 @@ RUN install -d -o root -g root -m 0755 /usr/local/share/npm-global
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=${PATH}:/usr/local/share/npm-global/bin
 
-# Eclipse Temurin 25 JDK.
-RUN install -d -m 0755 /etc/apt/keyrings \
-    && wget -qO- https://packages.adoptium.net/artifactory/api/gpg/key/public \
-       | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb $(. /etc/os-release && echo "${VERSION_CODENAME}") main" \
-       > /etc/apt/sources.list.d/adoptium.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends temurin-25-jdk \
-    && rm -rf /var/lib/apt/lists/*
-
-# Clojure CLI. Force IPv4 for the installer because some Docker/DNS setups
-# have unreliable IPv6 connectivity.
-RUN cd /tmp \
-    && curl -4 -fsSL -o linux-install.sh \
-       https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh \
-    && sed -i 's/curl /curl -4 /g' linux-install.sh \
-    && chmod +x linux-install.sh \
-    && ./linux-install.sh \
-    && rm -f linux-install.sh
-
-# Leiningen.
+# Clojure CLI, Leiningen, and native deps.clj. Versions and checksums live in
+# one shared config so routine updates stay straightforward.
 ENV LEIN_JAR=/opt/clojure/leiningen-standalone.jar
-RUN cd /tmp \
-    && wget -q https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
-    && chmod +x lein \
-    && mv lein /usr/local/bin/lein \
-    && mkdir -p /opt/clojure \
-    && ln -s /usr/local/bin/lein /opt/clojure/lein \
-    && lein self-install \
-    && chmod 0644 "$LEIN_JAR" \
-    && lein version
-
-# deps.clj.
-RUN cd /tmp \
-    && wget -q https://raw.githubusercontent.com/borkdude/deps.clj/master/install \
-    && bash ./install \
-    && rm -f install
+ENV DEPS_CLJ_TOOLS_DIR=/usr/local/lib/clojure
+COPY --chmod=0644 container/clojure-tool-versions.conf /usr/local/src/clojure-tool-versions.conf
+COPY --chmod=0755 container/install-clojure-runtimes /usr/local/src/install-clojure-runtimes
+RUN /usr/local/src/install-clojure-runtimes \
+    && rm -f /usr/local/src/install-clojure-runtimes
 
 # Native Clojure developer tools. Keep this shared installer identical in the
 # generic and CUDA images.
 COPY --chmod=0755 container/install-clojure-tools /usr/local/src/install-clojure-tools
 RUN /usr/local/src/install-clojure-tools \
-    && rm -f /usr/local/src/install-clojure-tools
+    && rm -f /usr/local/src/install-clojure-tools \
+       /usr/local/src/clojure-tool-versions.conf
 
 # Keep frequently changing agent packages and integration files after the
 # stable Java and Clojure runtime layers so their updates preserve that cache.
 ARG CODEX_VERSION=0.154.0
-ARG CODEX_ACP_VERSION=latest
-ARG AGENT_LSP_VERSION=latest
+ARG CODEX_ACP_VERSION=1.11.0
+ARG AGENT_LSP_VERSION=0.19.1
 RUN npm install -g \
         "@openai/codex@${CODEX_VERSION}" \
         "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \

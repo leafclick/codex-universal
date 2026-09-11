@@ -2,6 +2,7 @@
 """Small local-only nREPL fixture for host smoke tests."""
 
 import argparse
+from pathlib import Path
 import socket
 import threading
 import time
@@ -116,7 +117,11 @@ def handle(connection):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--interfaces-file")
     args = parser.parse_args()
+    if args.interfaces_file:
+        interfaces = ",".join(sorted(name for _, name in socket.if_nameindex()))
+        Path(args.interfaces_file).write_text(interfaces + "\n", encoding="ascii")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((args.host, 0))

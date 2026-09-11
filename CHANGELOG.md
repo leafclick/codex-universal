@@ -7,6 +7,8 @@ This change log follows the conventions of
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-11
+
 ### Breaking
 
 - Replaced the leading project-setting commands with
@@ -24,6 +26,15 @@ This change log follows the conventions of
 
 ### Changed
 
+- Pinned the default Codex ACP and agent-lsp package versions.
+- Pinned and checksum-verified the Clojure CLI, Leiningen, deps.clj, Babashka,
+  cljfmt, clj-kondo, and clojure-lsp release inputs in one small config.
+- Replaced the mutable NodeSource installer with a signed apt repository and
+  pinned the NodeSource and Adoptium repository-key hashes and fingerprints.
+- Added one updater for audited Clojure release pins and system-repository trust
+  inputs; signing-key identity changes still require manual review.
+- Configured native deps.clj to reuse the image's preinstalled Clojure tools
+  payload instead of downloading it on first use.
 - Dirty image inputs now receive identifiable `-dirty` versions and visibly
   warn when updating the convenient `latest` alias.
 - Split launcher diagnostics, snapshot tests, and IntelliJ documentation into
@@ -31,6 +42,10 @@ This change log follows the conventions of
 
 ### Fixed
 
+- Normalized stale version metadata in the authenticated Leiningen 2.13.0
+  launcher and made image builds reject a runtime-version mismatch.
+- Isolated persistent Clojure REPLs from external networks while preserving
+  managed access through a private Unix socket.
 - Hardened runtime boundaries around AppArmor enforcement, image pulling,
   NVIDIA devices, nested namespace entry, workflow replacement, OCI source
   metadata, and LSP message parsing.

@@ -315,8 +315,8 @@ A specific Codex, ACP adapter, or LSP bridge version can be used:
 
 ```bash
 CODEX_VERSION=0.154.0 \
-CODEX_ACP_VERSION=latest \
-AGENT_LSP_VERSION=latest \
+CODEX_ACP_VERSION=1.11.0 \
+AGENT_LSP_VERSION=0.19.1 \
   ./docker-build.sh all
 ```
 
@@ -324,12 +324,34 @@ AGENT_LSP_VERSION=latest \
 used by the optional IntelliJ integration. `AGENT_LSP_VERSION` selects the
 `agent-lsp` MCP bridge used for Clojure semantic navigation.
 
-For a release build, set all three package versions explicitly instead of using
-`latest`. The Git-derived image tag records the source revision and build
+To update an agent package, first build both profiles with the candidate
+version supplied explicitly, run `./tests/host-smoke.sh` with those local
+images selected, and verify the installed package versions. Then update the
+matching defaults in both Dockerfiles and `docker-build.sh` together. Keep the
+previous image's immutable version tag available for rollback; do not replace
+a pin with `latest`.
+
+Refresh all audited remote-tool inputs with:
+
+```bash
+./scripts/update-tool-versions
+```
+
+The updater writes `container/clojure-tool-versions.conf` and
+`container/system-tool-versions.conf`. It selects the latest stable Clojure
+releases and their published SHA-256 digests, refreshes the NodeSource and
+Adoptium key-file hashes, and leaves the deliberately selected Node and Java
+major versions unchanged. A signing-key fingerprint change stops the update
+for manual audit. Review the small config diff, then rebuild both profiles and
+run the smoke suite. The configs can also be edited directly when a specific
+version is wanted.
+
+All three agent packages have versioned defaults and can be overridden
+explicitly. The Git-derived image tag records the source revision and build
 configuration, but builds are not byte-for-byte reproducible: Ubuntu package
-repositories and several upstream installer channels are resolved at build
-time. Do not overwrite a published version tag, and use the registry digest
-when an exact image artifact must be selected.
+repositories and some non-Clojure package channels are resolved at build time.
+Do not overwrite a published version tag, and use the registry digest when an
+exact image artifact must be selected.
 
 Stable system, Java, and core Clojure layers precede the native Clojure tools,
 versioned Codex/ACP/LSP packages, and copied integration files. Updating an
@@ -379,25 +401,30 @@ per-container tmpfs mounts.
 
 ## Clojure command-line tooling
 
-Both image profiles install the latest stable native releases of:
+Both image profiles install checksum-verified, pinned native releases of:
 
 - `bb` (Babashka)
 - `cljfmt`
 - `clj-kondo`
 - `clojure-lsp`
 
-They also install `rlwrap`, so the Clojure CLI's interactive `clj` wrapper has
-line editing and command history available out of the box. Leiningen's
-standalone runtime is preinstalled in the immutable image and exposed through
-`LEIN_JAR`; non-root containers can therefore run a configured Leiningen
-project while the container network is disabled, without bootstrapping files
-into the mounted user home.
+They also install pinned Clojure CLI, Leiningen, native deps.clj, and `rlwrap`.
+The current versions and SHA-256 values are in
+`container/clojure-tool-versions.conf`.
+The Clojure CLI's interactive `clj` wrapper therefore has line editing and
+command history available out of the box. Leiningen's standalone runtime is
+preinstalled in the immutable image and exposed through `LEIN_JAR`; non-root
+containers can run a configured Leiningen project while the container network
+is disabled, without bootstrapping files into the mounted user home.
+`DEPS_CLJ_TOOLS_DIR` points deps.clj at the same preinstalled Clojure tools
+payload, preserving its fast native startup without a first-use download.
 
-The build uses each project's supported installer, which selects the native
-binary for the image architecture. `cljfmt` is the standalone GraalVM native
-executable, so `cljfmt check` and `cljfmt fix` do not launch `clj`. Each tool
-uses its upstream defaults and still discovers project-local configuration such
-as `bb.edn`, `.cljfmt.edn`, `.clj-kondo/config.edn`, and `.lsp/config.edn`.
+The build downloads immutable release assets and checks every Clojure-tool
+download against a pinned SHA-256 value. `cljfmt` is the standalone GraalVM
+native executable, so `cljfmt check` and `cljfmt fix` do not launch `clj`.
+Each tool uses its upstream defaults and still discovers project-local
+configuration such as `bb.edn`, `.cljfmt.edn`, `.clj-kondo/config.edn`, and
+`.lsp/config.edn`.
 
 In terminal mode, `run-codex` enables a container-local `clojure_lsp` MCP
 server automatically for Clojure projects. Auto-detection looks for a root
@@ -675,31 +702,21 @@ image JVM so native runtimes such as oneMKL can locate their internal loaders;
 no process tree, descriptors, environment, or root paths are exposed. An
 inherited seccomp filter rejects nested user namespaces that could remount a
 writable parent around those protected paths. The service never publishes an
-nREPL port or uses a host JVM. The launcher permits loopback binding solely for
-this container-local use; external network access remains disabled. Run its helper as
+nREPL port or uses a host JVM. Its network namespace contains only loopback;
+the supervisor exposes nREPL to the helper through a private mode-`0600`
+pathname Unix socket in the per-chat state directory. Run its helper as
 `~/.codex/skills/clojure-development/scripts/clojure-development repl-start
 <runtime>`, `repl-status`, `repl-eval '(+ 1 2)'`, and `repl-stop`. Evaluations
 are serialized. A timeout means execution may continue and must not be
 blindly retried.
 
-Individual Codex tool sandboxes may have separate loopback namespaces. The
-entrypoint records the session service's network namespace; the helper queries
-the live service's read-only context instead of trusting a caller's possibly
-stale environment marker. It returns
-`:requires-elevation` before startup or evaluation when its current namespace
-differs. Request container-shell elevation for the same absolute helper command
-and project working directory, keeping the inherited `CODEX_CLOJURE_STATE_DIR`.
-This uses the existing sandboxed runtime owner and container-only loopback;
-it does not require another entrypoint, a custom Bubblewrap command, or a new
-service per call. Status and stop use the shared control channel and remain
-available in the inner sandbox. Status separates owned-process liveness from
-TCP reachability. An unavailable namespace identity is reported explicitly;
-no match is inferred from missing or unreadable data. Preflight rejection means
-this request was not submitted, not that earlier evaluation stopped. Babashka
-one-off execution does not use the TCP preflight. The namespace preflight is
-diagnostic and does not itself grant permission to run an elevated command.
-If a worker cannot surface approval, it returns the exact helper command,
-workdir and scope to the parent for approval and execution.
+Individual Codex tool sandboxes may have separate network namespaces without
+affecting the persistent REPL. Status and evaluation connect through the shared
+Unix socket; lifecycle ownership remains on the control FIFO. Status separates
+owned-process liveness from Unix-endpoint reachability. State created by an old
+TCP-only helper is rejected for evaluation and must be stopped and restarted;
+the helper never silently falls back to direct TCP. Babashka one-off execution
+does not use the persistent Unix transport.
 
 One persistent runtime is supported per chat. Share it among agents working on
 the same parent-coordinated experiment; serialize independent runtime tasks.
@@ -732,8 +749,9 @@ development profile and a one-off Babashka runtime:
 `deps` preserves its selected `-M`, `-X`, or legacy `-A` semantics; the helper
 does not translate them. Leiningen preserves its selected profiles and
 `repl-options`; a Leiningen recipe is valid only when those project settings
-select loopback and an ephemeral port, which the helper also verifies from the
-actual listener. Babashka probes use the explicit `one-off FORM [runtime]`
+select loopback and an ephemeral port. The enclosing networkless namespace is
+the runtime enforcement boundary. Babashka probes use the explicit
+`one-off FORM [runtime]`
 operation; output and overall runtime are bounded, and timeout or normal
 leader exit cleans up the complete process group before termination is
 reported as confirmed. Persistent nREPL is for retained state and is not

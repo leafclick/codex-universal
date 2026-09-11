@@ -6,6 +6,20 @@ real_bwrap="${CODEX_BWRAP_REAL:-/usr/bin/bwrap.real}"
     echo "Missing system Bubblewrap: $real_bwrap" >&2
     exit 127
 }
+test_no_devices="${CODEX_TEST_CUDA_NO_DEVICES:-0}"
+case "$test_no_devices" in
+    0|'') ;;
+    1)
+        [[ "$real_bwrap" != /usr/bin/bwrap.real ]] || {
+            echo "CODEX_TEST_CUDA_NO_DEVICES requires a test Bubblewrap override" >&2
+            exit 2
+        }
+        ;;
+    *)
+        echo "Invalid CODEX_TEST_CUDA_NO_DEVICES=$test_no_devices" >&2
+        exit 2
+        ;;
+esac
 
 rewrite_tokens() {
     local -n in_tokens="$1"
@@ -24,7 +38,7 @@ rewrite_tokens() {
         if [[ "$current" == "--dev" && $((index + 1)) -lt "$count" ]]; then
             dest="${in_tokens[index + 1]}"
             out_tokens+=(--dev "$dest")
-            if [[ "$dest" == /dev ]]; then
+            if [[ "$dest" == /dev && "$test_no_devices" != 1 ]]; then
                 local nvidia_device=""
                 for nvidia_device in /dev/nvidia*; do
                     if [[ -c "$nvidia_device" || -d "$nvidia_device" ]]; then
@@ -82,6 +96,7 @@ cuda_failure_hint_enabled() {
     case "${CODEX_CUDA_FAILURE_HINT:-auto}" in
         auto|'')
             [[ ! -t 1 && ! -t 2 ]] || return 1
+            [[ "$test_no_devices" != 1 ]] || return 1
             local nvidia_device=""
             for nvidia_device in /dev/nvidia*; do
                 [[ -c "$nvidia_device" || -d "$nvidia_device" ]] && return 0

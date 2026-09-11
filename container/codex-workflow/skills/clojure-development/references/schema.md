@@ -29,11 +29,11 @@ rejected so a misspelled runtime cannot silently select a different profile.
 `--port 0` exactly once as option/value pairs; duplicate or conflicting values
 are rejected. Leiningen uses its own selected profiles and `:repl-options`;
 provide that exact project recipe, configured for host `127.0.0.1` and port
-`0`, rather than translating Clojure CLI options. For every persistent kind,
-startup verifies the observed listener addresses are loopback-only and records
-process ownership before waiting for readiness. The entrypoint-owned service
-retains that process across helper commands inside a nested sandbox that keeps
-`.git` and `.codex` read-only.
+`0`, rather than translating Clojure CLI options. The TCP listener exists only
+on loopback inside the service's networkless namespace. The supervisor exposes
+it through a private mode-`0600` pathname Unix socket, records process ownership,
+and retains the process across helper commands inside a nested sandbox that
+keeps `.git` and `.codex` read-only.
 `:workdir` is optional and relative to the project root. `:one-off` is only for
 Babashka and is an argv prefix to which a form is appended. Select a non-default
 Babashka runtime explicitly with `one-off FORM runtime`; it runs in `:workdir`
@@ -45,7 +45,8 @@ One-off completion covers the whole process group: surviving descendants are
 terminated before the helper reports termination as confirmed.
 
 The helper validates this shape before launch. It rejects shell-string
-commands, unknown runtime references, non-loopback REPLs, and malformed
+commands, unknown runtime references, conflicting non-loopback endpoint
+options in Clojure CLI recipes, and malformed
 entries. To keep each atomic process-service request within the FIFO transport,
 the EDN representation of an argv vector may not exceed 2048 UTF-8 bytes.
 Project examples must remain project-local; no bundled project
