@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+# Shared snapshot metadata validation for codex-push and codex-pull.
+# Callers provide the required awk, basename, tr, and sha256sum commands.
+
+state_value() {
+    local file="$1"
+    local key="$2"
+
+    awk -F= -v key="$key" '
+        $1 == key {
+            sub(/^[^=]*=/, "")
+            print
+            exit
+        }
+    ' "$file"
+}
+
+valid_hash() {
+    [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+SNAPSHOT_GENERATION=""
+SNAPSHOT_HASH=""
+SNAPSHOT_ARCHIVE=""
+SNAPSHOT_ARCHIVE_PATH=""
+
+snapshot_metadata_is_valid() {
+    local state_file="$1"
+    local format generation hash archive
+
+    format="$(state_value "$state_file" format)"
+    generation="$(state_value "$state_file" generation)"
+    hash="$(state_value "$state_file" sha256)"
+    archive="$(state_value "$state_file" archive)"
+
+    [[ "$format" == 1 ]] || return 1
+    [[ "$generation" =~ ^[0-9]+$ ]] || return 1
+    ((10#$generation > 0)) || return 1
+    valid_hash "$hash" || return 1
+    [[ -n "$archive" && "$archive" != */* ]] || return 1
+    [[ "$(basename "$state_file")" == "$archive.state" ]] || return 1
+
+    SNAPSHOT_GENERATION=$((10#$generation))
+    SNAPSHOT_HASH="$hash"
+    SNAPSHOT_ARCHIVE="$archive"
+    return 0
+}
+
+snapshot_archive_is_valid() {
+    local state_file="$1"
+    local sync_dir="$2"
+    local archive_path checksum_path expected actual
+
+    snapshot_metadata_is_valid "$state_file" || return 1
+
+    archive_path="$sync_dir/$SNAPSHOT_ARCHIVE"
+    checksum_path="$archive_path.sha256"
+    [[ -f "$archive_path" && -f "$checksum_path" ]] || return 1
+
+    expected="$(tr -d '[:space:]' < "$checksum_path")"
+    valid_hash "$expected" || return 1
+
+    actual="$(sha256sum "$archive_path" | awk '{print $1}')"
+    [[ "$actual" == "$expected" ]] || return 1
+
+    SNAPSHOT_ARCHIVE_PATH="$archive_path"
+    return 0
+}

@@ -8,14 +8,42 @@ LOCK_FILE="${CODEX_LOCK_FILE:-$HOME/.cache/codex-handoff.lock}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-handoff"
 BASE_FILE="$STATE_DIR/base.state"
 
+usage() {
+    cat <<'USAGE'
+Usage:
+  codex-push
+
+Publish the current Codex state as the next synchronized snapshot.
+USAGE
+}
+
 die() {
     echo "ERROR: $*" >&2
     exit 1
 }
 
-for cmd in tar zstd sha256sum sqlite3 lsof flock awk find hostname realpath dirname; do
+case "${1:-}" in
+    '')
+        (($# == 0)) || die "Unexpected arguments"
+        ;;
+    -h|--help)
+        (($# == 1)) || die "--help takes no arguments"
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        die "Unknown option or argument: $1"
+        ;;
+esac
+
+for cmd in tar zstd sha256sum sqlite3 lsof flock awk find hostname realpath dirname basename tr; do
     command -v "$cmd" >/dev/null || die "Missing command: $cmd"
 done
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=bin/codex-sync-lib
+source "$SCRIPT_DIR/codex-sync-lib"
 
 normalize_path() {
     local variable="$1"
@@ -57,23 +85,6 @@ validate_paths
 mkdir -p "$SYNC_DIR" "$STATE_DIR" "$(dirname "$LOCK_FILE")"
 
 [[ -d "$CODEX_DIR" ]] || die "$CODEX_DIR does not exist"
-
-state_value() {
-    local file="$1"
-    local key="$2"
-
-    awk -F= -v key="$key" '
-        $1 == key {
-            sub(/^[^=]*=/, "")
-            print
-            exit
-        }
-    ' "$file"
-}
-
-valid_hash() {
-    [[ "$1" =~ ^[0-9a-f]{64}$ ]]
-}
 
 state_hash_dir() {
     local dir="$1"
@@ -200,38 +211,8 @@ load_latest_remote() {
 verify_remote_snapshot() {
     local state_file="$1"
 
-    local archive_name
-    local archive_path
-    local checksum_path
-    local expected
-    local actual
-
-    archive_name="$(state_value "$state_file" archive)"
-
-    [[ -n "$archive_name" ]] ||
-        die "Remote state file has no archive field: $state_file"
-
-    [[ "$archive_name" != */* ]] ||
-        die "Invalid archive name in $state_file"
-
-    archive_path="$SYNC_DIR/$archive_name"
-    checksum_path="$archive_path.sha256"
-
-    [[ -f "$archive_path" ]] ||
-        die "Remote generation is incomplete: missing $archive_name"
-
-    [[ -f "$checksum_path" ]] ||
-        die "Remote generation is incomplete: missing $archive_name.sha256"
-
-    expected="$(tr -d '[:space:]' < "$checksum_path")"
-
-    valid_hash "$expected" ||
-        die "Invalid archive checksum file: $checksum_path"
-
-    actual="$(sha256sum "$archive_path" | awk '{print $1}')"
-
-    [[ "$actual" == "$expected" ]] ||
-        die "Remote archive checksum failed: $archive_name"
+    snapshot_archive_is_valid "$state_file" "$SYNC_DIR" ||
+        die "Remote snapshot metadata, archive, or checksum is invalid: $state_file"
 }
 
 publish_file() {
@@ -311,7 +292,7 @@ else
 fi
 
 #
-# Read Seafile state.
+# Read synchronized snapshot state.
 #
 if load_latest_remote; then
     HAVE_REMOTE=true
@@ -332,7 +313,7 @@ if $HAVE_BASE; then
         #
         # Important bootstrap/recovery case:
         #
-        # We have a valid local baseline but Seafile is empty.
+        # We have a valid local baseline but the sync directory is empty.
         # If the local state still matches the baseline, we can safely
         # recreate that same generation remotely.
         #
@@ -368,7 +349,7 @@ if $HAVE_BASE; then
             die "DIVERGENCE: remote generation $REMOTE_GEN differs from local baseline."
 
         if [[ "$LOCAL_HASH" == "$BASE_HASH" ]]; then
-            echo "No changes. Codex state already matches Seafile generation $REMOTE_GEN."
+            echo "No changes. Codex state already matches synchronized generation $REMOTE_GEN."
             exit 0
         fi
 
@@ -386,7 +367,7 @@ else
             write_base "$REMOTE_GEN" "$REMOTE_HASH"
 
             echo "No changes."
-            echo "Adopted Seafile generation $REMOTE_GEN as local baseline."
+            echo "Adopted synchronized generation $REMOTE_GEN as local baseline."
             exit 0
         fi
 
@@ -443,7 +424,7 @@ archive=$archive_name
 EOF
 
 #
-# Check that Seafile state did not change while we were creating
+# Check that synchronized state did not change while we were creating
 # the snapshot.
 #
 OLD_REMOTE_GEN="${REMOTE_GEN:-}"
@@ -508,7 +489,7 @@ sync \
 
 #
 # Update local baseline only after the complete snapshot has been
-# published locally into the Seafile directory.
+# published locally into the sync directory.
 #
 write_base "$NEXT_GEN" "$LOCAL_HASH"
 
@@ -521,4 +502,4 @@ fi
 
 echo "  $archive_name"
 echo
-echo "Wait for Seafile to report synchronized before switching machines."
+echo "Wait for your sync provider to report synchronized before switching machines."

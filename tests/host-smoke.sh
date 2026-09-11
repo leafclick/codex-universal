@@ -63,23 +63,6 @@ for command in bash git grep jq realpath setpriv flock; do
     need "$command"
 done
 
-if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
-    for command in awk find flock hostname lsof sha256sum sqlite3 tar zstd; do
-        need "$command"
-    done
-
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        running_codex="$(
-            docker ps --format '{{.Names}}' 2>/dev/null |
-                grep '^codex-' || true
-        )"
-        if [[ -n "$running_codex" ]]; then
-            printf '%s\n' "$running_codex" >&2
-            fail "stop Codex containers before snapshot tests, or set CODEX_TEST_SKIP_SYNC=1"
-        fi
-    fi
-fi
-
 git -C "$ROOT" diff --check
 git -C "$ROOT" diff --cached --check
 
@@ -88,15 +71,18 @@ for script in \
     "$ROOT/bin/run-codex" \
     "$ROOT/bin/setup-codex-host-security" \
     "$ROOT/bin/setup-codex-idea" \
+    "$ROOT/bin/run-codex-doctor.bash" \
     "$ROOT/bin/codex-push" \
     "$ROOT/bin/codex-pull" \
+    "$ROOT/bin/codex-sync-lib" \
     "$ROOT/container/codex-entrypoint" \
     "$ROOT/container/codex-acp-entrypoint" \
     "$ROOT/container/codex-bwrap-cuda" \
     "$ROOT/container/codex-clojure-lsp-mcp" \
     "$ROOT/container/codex-universal-workflow-install" \
     "$ROOT/container/codex-workflow/scripts/codex-worker-observe" \
-    "$ROOT/container/install-clojure-tools"; do
+    "$ROOT/container/install-clojure-tools" \
+    "$ROOT/tests/host-smoke-sync.sh"; do
     bash -n "$script"
 done
 for script in "$ROOT/bin/run-codex" "$ROOT/bin/codex-push" "$ROOT/bin/codex-pull"; do
@@ -389,6 +375,30 @@ grep -Fq 'HOST_GID="$(id -g)"' "$ROOT/bin/run-codex" ||
 if grep -Fq 'GROUPS[0]' "$ROOT/bin/run-codex"; then
     fail "launcher still assumes the first supplementary-group entry is primary"
 fi
+grep -Fq 'source "$doctor_module"' "$ROOT/bin/run-codex" ||
+    fail "launcher does not load its doctor companion module"
+if grep -Eq '^run_doctor\(\)' "$ROOT/bin/run-codex"; then
+    fail "launcher still embeds the extracted doctor implementation"
+fi
+grep -Eq '^run_doctor\(\)' "$ROOT/bin/run-codex-doctor.bash" ||
+    fail "doctor companion module lacks run_doctor"
+grep -Fq '"$ROOT/tests/host-smoke-sync.sh"' "$ROOT/tests/host-smoke.sh" ||
+    fail "host smoke driver does not invoke the focused snapshot suite"
+grep -Fq 'IntelliJ IDEA integration guide](docs/intellij.md)' "$ROOT/README.md" ||
+    fail "README does not link to the extracted IntelliJ guide"
+if grep -Eq 'Seafile generation|Wait for Seafile' "$ROOT/bin/codex-push"; then
+    fail "codex-push still emits provider-specific success text"
+fi
+grep -Fq 'Wait for your sync provider to report synchronized' \
+    "$ROOT/bin/codex-push" ||
+    fail "codex-push lacks provider-neutral synchronization guidance"
+grep -Fq 'Snapshot listing is intentionally lock-free' \
+    "$ROOT/docs/codex-sync.md" ||
+    fail "snapshot documentation omits the lock-free listing contract"
+grep -Fq 'appear temporarily as' "$ROOT/docs/codex-sync.md" ||
+    fail "snapshot documentation omits transient invalid listing guidance"
+grep -Fq 'install -m 600 bin/codex-sync-lib' "$ROOT/docs/codex-sync.md" ||
+    fail "snapshot documentation does not install the shared validation module"
 grep -Fq "enforce\\)( |$)'" \
     "$ROOT/bin/setup-codex-host-security" ||
     fail "host security setup does not require AppArmor enforce mode"
@@ -1208,6 +1218,12 @@ chmod 755 "$TEST_ROOT/fake-bin/socat"
 git -C "$TEST_ROOT/repo" init -q
 printf '%s\n' '{:paths ["src"]}' > "$TEST_ROOT/repo/deps.edn"
 printf '%s\n' 'not-a-real-png' > "$TEST_ROOT/repo/prompt-image.png"
+git -C "$TEST_ROOT/repo" add deps.edn prompt-image.png
+git -C "$TEST_ROOT/repo" \
+    -c user.name=host-smoke -c user.email=host-smoke.invalid \
+    commit -qm 'host smoke fixture'
+git -C "$TEST_ROOT/repo" worktree add -q -b smoke-linked \
+    "$TEST_ROOT/repo-linked"
 
 launcher_env=(
     env
@@ -1244,6 +1260,15 @@ assert_contains "$launcher_help" "reasoning=minimal|low|medium|high|xhigh"
 assert_contains "$launcher_help" "image=PROJECT_PATH"
 assert_contains "$launcher_help" "run-codex [PROJECT] --sessions"
 assert_contains "$launcher_help" "run-codex [PROJECT] --resume QUERY"
+assert_contains "$launcher_help" "--image-version VERSION"
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    --init linked-project "$TEST_ROOT/repo-linked" \
+    >"$TEST_ROOT/linked-worktree.out" 2>&1; then
+    fail "launcher registered a linked Git worktree"
+fi
+assert_contains "$(<"$TEST_ROOT/linked-worktree.out")" \
+    "Git worktrees/submodules with a .git pointer file are not supported yet"
 
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     --init --profile generic smoke-project "$TEST_ROOT/repo" >/dev/null
@@ -1298,6 +1323,13 @@ assert_not_contains "$sessions_output" 'Other project session'
 assert_not_contains "$sessions_output" 'Archived GPU tuning'
 [[ ! -e "$sessions_docker_log" ]] ||
     fail "session listing invoked Docker"
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --sessions \
+    --image-version immutable-test >"$TEST_ROOT/session-image-version.out" 2>&1; then
+    fail "session listing accepted an image-version launch option"
+fi
+assert_contains "$(<"$TEST_ROOT/session-image-version.out")" \
+    "--sessions cannot be combined with launch options"
 
 session_handoff_lock="$TEST_ROOT/launcher-home/.cache/codex-handoff.lock"
 session_lock_stdout="$TEST_ROOT/session-lock.out"
@@ -1392,6 +1424,25 @@ grep -Fxq -- '11111111-1111-4111-8111-111111111111' \
     "$exact_uuid_docker_log" ||
     fail "exact session UUID was not passed to Codex"
 
+tagged_launch_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new \
+        --image-version=immutable-test
+)"
+assert_contains "$tagged_launch_output" \
+    "example/codex-universal-generic:immutable-test"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new \
+    --image-version first --image-version second >"$TEST_ROOT/duplicate-image-version.out" 2>&1; then
+    fail "launcher accepted duplicate image versions"
+fi
+assert_contains "$(<"$TEST_ROOT/duplicate-image-version.out")" \
+    "--image-version may be specified only once"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new \
+    --image-version '/invalid' >"$TEST_ROOT/invalid-image-version.out" 2>&1; then
+    fail "launcher accepted an invalid image version"
+fi
+assert_contains "$(<"$TEST_ROOT/invalid-image-version.out")" \
+    "Invalid image tag '/invalid'"
+
 mkdir -p "$TEST_ROOT/doctor-missing-bin"
 ln -s "$(type -P bash)" "$TEST_ROOT/doctor-missing-bin/bash"
 if env \
@@ -1430,6 +1481,28 @@ assert_contains "$doctor_output" "Diagnostics passed with 0 warning(s)."
 assert_contains "$doctor_output" "--network none"
 assert_contains "$doctor_output" "--cap-drop=ALL"
 assert_not_contains "$doctor_output" "$TEST_ROOT/repo:"
+
+installed_launcher_dir="$TEST_ROOT/installed-launcher"
+mkdir -p "$installed_launcher_dir"
+install -m 755 "$ROOT/bin/run-codex" "$installed_launcher_dir/run-codex"
+install -m 644 "$ROOT/bin/run-codex-doctor.bash" \
+    "$installed_launcher_dir/run-codex-doctor.bash"
+installed_doctor_output="$(
+    "${launcher_env[@]}" "$installed_launcher_dir/run-codex" \
+        --doctor smoke-project
+)"
+assert_contains "$installed_doctor_output" \
+    "PASS  Project 'smoke-project' resolves to $TEST_ROOT/repo (generic)"
+
+missing_module_dir="$TEST_ROOT/missing-doctor-module"
+mkdir -p "$missing_module_dir"
+install -m 755 "$ROOT/bin/run-codex" "$missing_module_dir/run-codex"
+if "${launcher_env[@]}" "$missing_module_dir/run-codex" \
+    --doctor smoke-project >"$missing_module_dir/output" 2>&1; then
+    fail "installed launcher accepted a missing doctor companion module"
+fi
+assert_contains "$(<"$missing_module_dir/output")" "Missing doctor module:"
+pass "launcher doctor companion installation"
 
 for unsafe_apparmor_profile in unconfined docker-default arbitrary-profile; do
     set +e
@@ -1915,13 +1988,25 @@ jq -e \
 pass "JetBrains ACP configuration"
 
 # Verify that one build is portable instead of capturing the builder's UID/GID.
+# Use a clean fixture checkout so the explicit-version assertion is independent
+# of the development worktree's dirty state.
+portable_build_repo="$TEST_ROOT/portable-build"
+mkdir -p -- "$portable_build_repo"
+cp -- "$ROOT/docker-build.sh" "$ROOT/Dockerfile.generic" "$portable_build_repo/"
+git -C "$portable_build_repo" init -q
+git -C "$portable_build_repo" add docker-build.sh Dockerfile.generic
+git -C "$portable_build_repo" \
+    -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid \
+    -c commit.gpgSign=false \
+    commit -q -m initial
 build_output="$(
     "${launcher_env[@]}" \
         IMAGE_SLUG=codex-host-smoke \
         IMAGE_VERSION=test-version \
         TAG_LATEST=1 \
         PULL=0 \
-        "$ROOT/docker-build.sh" generic
+        "$portable_build_repo/docker-build.sh" generic
 )"
 assert_not_contains "$build_output" "--build-arg UID="
 assert_not_contains "$build_output" "--build-arg GID="
@@ -2043,16 +2128,48 @@ assert_contains "$fallback_output" \
     "-t leafclick/codex-universal-generic:dev-feature-smoke-$fallback_sha"
 pass "unreachable-tag Git branch fallback image version"
 
-printf '%s\n' dirty > "$tagged_repo/untracked"
+mkdir -p -- "$tagged_repo/container"
+printf '%s\n' dirty > "$tagged_repo/container/untracked"
 dirty_output="$({
     cd -- "$tagged_repo"
-    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=1 PULL=0 ./docker-build.sh generic
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=1 PULL=0 \
+        ./docker-build.sh generic 2>&1
 })"
 assert_contains "$dirty_output" \
     "-t leafclick/codex-universal-generic:release-1.2.3-dirty"
-assert_not_contains "$dirty_output" \
+assert_contains "$dirty_output" \
     "-t leafclick/codex-universal-generic:latest"
+assert_contains "$dirty_output" \
+    "dirty image inputs are updating leafclick/codex-universal-generic:latest; use TAG_LATEST=0 to retain the existing alias"
 pass "dirty Git-derived image version suffix"
+
+explicit_dirty_output="$({
+    cd -- "$tagged_repo"
+    env PATH="$TEST_ROOT/fake-bin:$PATH" IMAGE_VERSION=manual-version \
+        TAG_LATEST=1 PULL=0 ./docker-build.sh generic 2>&1
+})"
+assert_contains "$explicit_dirty_output" \
+    "-t leafclick/codex-universal-generic:manual-version-dirty"
+assert_contains "$explicit_dirty_output" \
+    "-t leafclick/codex-universal-generic:latest"
+assert_contains "$explicit_dirty_output" \
+    "dirty image inputs are updating leafclick/codex-universal-generic:latest; use TAG_LATEST=0 to retain the existing alias"
+pass "explicit dirty image version and latest warning"
+
+rm -f -- "$tagged_repo/container/untracked"
+rmdir -- "$tagged_repo/container"
+printf '%s\n' review-only > "$tagged_repo/review.md"
+unrelated_dirty_output="$({
+    cd -- "$tagged_repo"
+    env PATH="$TEST_ROOT/fake-bin:$PATH" TAG_LATEST=1 PULL=0 \
+        ./docker-build.sh generic 2>&1
+})"
+assert_contains "$unrelated_dirty_output" \
+    "-t leafclick/codex-universal-generic:release-1.2.3"
+assert_contains "$unrelated_dirty_output" \
+    "-t leafclick/codex-universal-generic:latest"
+assert_not_contains "$unrelated_dirty_output" "-dirty"
+pass "unrelated untracked file does not dirty image inputs"
 
 git -C "$tagged_repo" remote add origin \
     'https://build-user:build-secret@example.com/acme/codex-universal.git'
@@ -2067,105 +2184,7 @@ assert_contains "$credential_source_output" \
     "--build-arg IMAGE_SOURCE=https://example.com/acme/codex-universal"
 pass "sanitized Git image source metadata"
 
-if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
-    SYNC_ROOT="$TEST_ROOT/sync"
-    LOCK_FILE="$TEST_ROOT/codex-handoff.lock"
-    mkdir -p "$SYNC_ROOT"
-
-    run_machine() {
-        local machine="$1"
-        shift
-
-        env \
-            "HOME=$TEST_ROOT/$machine/home" \
-            "CODEX_DIR=$TEST_ROOT/$machine/live" \
-            "CODEX_SYNC_DIR=$SYNC_ROOT" \
-            "CODEX_LOCK_FILE=$LOCK_FILE" \
-            "XDG_STATE_HOME=$TEST_ROOT/$machine/state" \
-            "$@"
-    }
-
-    mkdir -p "$TEST_ROOT/a/live" "$TEST_ROOT/a/home"
-    printf 'generation one\n' > "$TEST_ROOT/a/live/payload"
-    sqlite3 "$TEST_ROOT/a/live/state.sqlite" \
-        'CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ("ok");'
-
-    if env \
-        "HOME=$TEST_ROOT/a/home" \
-        "CODEX_DIR=$TEST_ROOT/a/live" \
-        'CODEX_SYNC_DIR=relative/sync' \
-        "CODEX_LOCK_FILE=$LOCK_FILE" \
-        "XDG_STATE_HOME=$TEST_ROOT/a/state" \
-        "$ROOT/bin/codex-push" >/dev/null 2>&1; then
-        fail "snapshot push accepted a relative synchronization path"
-    fi
-    if env \
-        "HOME=$TEST_ROOT/a/home" \
-        "CODEX_DIR=$TEST_ROOT/a/live" \
-        "CODEX_SYNC_DIR=$TEST_ROOT/a/live/snapshots" \
-        "CODEX_LOCK_FILE=$LOCK_FILE" \
-        "XDG_STATE_HOME=$TEST_ROOT/a/state" \
-        "$ROOT/bin/codex-pull" --list >/dev/null 2>&1; then
-        fail "snapshot pull accepted overlapping live and synchronized state"
-    fi
-
-    mkdir -p "$TEST_ROOT/offender-bin"
-    printf '%s\n' \
-        '#!/usr/bin/env bash' \
-        'if [[ "${1:-}" == ps ]]; then' \
-        '    printf "%s\\n" codex-first codex-second' \
-        'fi' \
-        > "$TEST_ROOT/offender-bin/docker"
-    chmod 755 "$TEST_ROOT/offender-bin/docker"
-    if PATH="$TEST_ROOT/offender-bin:$PATH" \
-        run_machine a "$ROOT/bin/codex-push" \
-        >"$TEST_ROOT/offenders.log" 2>&1; then
-        fail "snapshot push ignored running Codex containers"
-    fi
-    grep -Fxq '  codex-first' "$TEST_ROOT/offenders.log" &&
-        grep -Fxq '  codex-second' "$TEST_ROOT/offenders.log" ||
-        fail "snapshot push did not report every running Codex container"
-
-    run_machine a "$ROOT/bin/codex-push" >/dev/null
-    no_change="$(run_machine a "$ROOT/bin/codex-push")"
-    assert_contains "$no_change" "No changes"
-
-    mkdir -p "$TEST_ROOT/b/live" "$TEST_ROOT/b/home"
-    printf 'replace me\n' > "$TEST_ROOT/b/live/payload"
-    run_machine b "$ROOT/bin/codex-pull" --force 1 >/dev/null
-    [[ "$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')" == \
-       "$(sha256sum "$TEST_ROOT/b/live/payload" | awk '{print $1}')" ]] ||
-        fail "forced pull did not restore generation 1"
-
-    printf 'generation two\n' > "$TEST_ROOT/a/live/payload"
-    run_machine a "$ROOT/bin/codex-push" >/dev/null
-    run_machine b "$ROOT/bin/codex-pull" >/dev/null
-    [[ "$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')" == \
-       "$(sha256sum "$TEST_ROOT/b/live/payload" | awk '{print $1}')" ]] ||
-        fail "forward pull did not restore generation 2"
-
-    printf 'local divergence\n' > "$TEST_ROOT/b/live/payload"
-    printf 'generation three\n' > "$TEST_ROOT/a/live/payload"
-    run_machine a "$ROOT/bin/codex-push" >/dev/null
-    if run_machine b "$ROOT/bin/codex-pull" \
-        >"$TEST_ROOT/divergence.log" 2>&1; then
-        fail "divergent pull unexpectedly succeeded"
-    fi
-    grep -q 'DIVERGENCE' "$TEST_ROOT/divergence.log" ||
-        fail "divergent pull did not report divergence"
-
-    run_machine b "$ROOT/bin/codex-pull" --force 1 >/dev/null
-    run_machine b "$ROOT/bin/codex-push" >/dev/null
-    grep -R -q '^generation=4$' "$SYNC_ROOT"/*.state ||
-        fail "recovery did not publish a new generation"
-
-    snapshot_list="$(run_machine b "$ROOT/bin/codex-pull" --list)"
-    [[ "$snapshot_list" == *"OK"* ]] ||
-        fail "snapshot listing did not report valid archives: $snapshot_list"
-    pass "snapshot push, pull, divergence, and recovery"
-else
-    printf 'skip - snapshot integration (CODEX_TEST_SKIP_SYNC=1)\n'
-fi
+"$ROOT/tests/host-smoke-sync.sh"
 
 # If built images and a Docker daemon are present, inspect the real containers.
 # The host does not need Codex installed; Codex is invoked only in the images.

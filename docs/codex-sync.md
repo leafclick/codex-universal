@@ -72,7 +72,11 @@ Install the commands into the user executable path if this has not already been 
 mkdir -p ~/.local/bin
 install -m 700 bin/codex-push ~/.local/bin/codex-push
 install -m 700 bin/codex-pull ~/.local/bin/codex-pull
+install -m 600 bin/codex-sync-lib ~/.local/bin/codex-sync-lib
 ```
+
+Keep `codex-sync-lib` beside both commands. It is their shared validation
+module, not a standalone command.
 
 ## Configure the snapshot directory
 
@@ -171,6 +175,12 @@ List recovery points and their archive status:
 ```bash
 codex-pull --list
 ```
+
+Snapshot listing is intentionally lock-free and does not wait for a local push
+or pull. While a sync provider is still transferring an archive, checksum, or
+state marker, an in-flight generation can therefore appear temporarily as
+`INVALID`. Wait for synchronization to finish and run `codex-pull --list`
+again before treating that result as corruption or selecting a recovery point.
 
 Restore a known-good generation:
 

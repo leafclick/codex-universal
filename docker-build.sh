@@ -14,6 +14,7 @@ PULL="${PULL:-1}"
 
 GIT_REVISION=""
 GIT_SOURCE=""
+BUILD_INPUTS_DIRTY=false
 
 usage() {
     cat <<EOF2
@@ -139,9 +140,12 @@ resolve_git_metadata() {
             fi
         fi
 
-        if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=normal)" ]]; then
-            IMAGE_VERSION="${IMAGE_VERSION}-dirty"
-        fi
+    fi
+
+    if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=normal -- \
+        .dockerignore Dockerfile.generic Dockerfile.cuda docker-build.sh container)" ]]; then
+        BUILD_INPUTS_DIRTY=true
+        [[ "$IMAGE_VERSION" == *-dirty ]] || IMAGE_VERSION="${IMAGE_VERSION}-dirty"
     fi
 }
 
@@ -194,7 +198,7 @@ build_one() {
         -t "$image"
     )
 
-    if [[ "$TAG_LATEST" == 1 && "$IMAGE_VERSION" != latest && "$IMAGE_VERSION" != *-dirty ]]; then
+    if [[ "$TAG_LATEST" == 1 && "$IMAGE_VERSION" != latest ]]; then
         args+=(-t "${repository}:latest")
     fi
 
@@ -205,8 +209,11 @@ build_one() {
     args+=("$SCRIPT_DIR")
 
     echo "==> Building $image"
-    if [[ "$TAG_LATEST" == 1 && "$IMAGE_VERSION" != latest && "$IMAGE_VERSION" != *-dirty ]]; then
+    if [[ "$TAG_LATEST" == 1 && "$IMAGE_VERSION" != latest ]]; then
         echo "    alias: ${repository}:latest"
+        if $BUILD_INPUTS_DIRTY; then
+            echo "    WARNING: dirty image inputs are updating ${repository}:latest; use TAG_LATEST=0 to retain the existing alias" >&2
+        fi
     fi
     docker "${args[@]}"
     echo

@@ -66,6 +66,10 @@ for cmd in sha256sum awk sort tr basename realpath dirname; do
     need "$cmd"
 done
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=bin/codex-sync-lib
+source "$SCRIPT_DIR/codex-sync-lib"
+
 normalize_path() {
     local variable="$1"
     local value="${!variable}"
@@ -104,23 +108,6 @@ validate_paths() {
 
 validate_paths
 mkdir -p "$SYNC_DIR" "$STATE_DIR" "$(dirname "$LOCK_FILE")"
-
-state_value() {
-    local file="$1"
-    local key="$2"
-
-    awk -F= -v key="$key" '
-        $1 == key {
-            sub(/^[^=]*=/, "")
-            print
-            exit
-        }
-    ' "$file"
-}
-
-valid_hash() {
-    [[ "$1" =~ ^[0-9a-f]{64}$ ]]
-}
 
 state_hash_dir() {
     local dir="$1"
@@ -235,27 +222,9 @@ SELECTED_HASH=""
 
 archive_is_valid() {
     local state_file="$1"
-    local archive format expected actual archive_path checksum_path
 
-    format="$(state_value "$state_file" format)"
-    archive="$(state_value "$state_file" archive)"
-
-    [[ "$format" == 1 ]] || return 1
-    [[ -n "$archive" && "$archive" != */* ]] || return 1
-    [[ "$(basename "$state_file")" == "$archive.state" ]] || return 1
-
-    archive_path="$SYNC_DIR/$archive"
-    checksum_path="$archive_path.sha256"
-
-    [[ -f "$archive_path" && -f "$checksum_path" ]] || return 1
-
-    expected="$(tr -d '[:space:]' < "$checksum_path")"
-    valid_hash "$expected" || return 1
-
-    actual="$(sha256sum "$archive_path" | awk '{print $1}')"
-    [[ "$actual" == "$expected" ]] || return 1
-
-    SELECTED_ARCHIVE="$archive_path"
+    snapshot_archive_is_valid "$state_file" "$SYNC_DIR" || return 1
+    SELECTED_ARCHIVE="$SNAPSHOT_ARCHIVE_PATH"
 }
 
 select_snapshot() {
@@ -427,15 +396,15 @@ fi
 
 load_latest_metadata || die "No remote Codex snapshots found in $SYNC_DIR"
 
-# Do not establish a baseline from metadata whose archive has not arrived or
-# whose checksum fails. This also makes forced recovery from an older snapshot
-# wait until the current remote generation is complete.
-select_or_die "$REMOTE_GEN"
-LATEST_ARCHIVE="$SELECTED_ARCHIVE"
-
 if [[ "$MODE" == force ]]; then
+    # Forced recovery depends only on the requested generation. The remote
+    # head may still be arriving through the synchronization provider.
     select_or_die "$WANTED_GEN"
 else
+    # The normal forward path must restore a complete, checksum-valid head.
+    select_or_die "$REMOTE_GEN"
+    LATEST_ARCHIVE="$SELECTED_ARCHIVE"
+
     if $HAVE_BASE; then
         ((REMOTE_GEN >= BASE_GEN)) ||
             die "Remote generation $REMOTE_GEN is older than local baseline $BASE_GEN. Refusing."
