@@ -15,6 +15,8 @@ LSP-to-MCP bridge in terminal mode. Optional IntelliJ IDEA integration runs the
 same containerized Codex in JetBrains AI Chat and exposes a read-only view of
 the IDE's semantic tools.
 
+See the concise [change log](CHANGELOG.md) for release history.
+
 ## One command, one project, full toolchain
 
 One launcher gives Codex a ready-to-use toolchain, persistent sessions and
