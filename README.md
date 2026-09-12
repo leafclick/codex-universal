@@ -1198,8 +1198,24 @@ a different repository rather than another worktree of the same repository.
 
 ### Add an isolated experiment or reviewer lane
 
-Create the checkout on the host, then register that exact checkout. For
-example:
+Create a managed checkout from any commit available in the default lane's
+repository:
+
+```bash
+run-codex my-project --lane review --create HEAD
+run-codex my-project --lane review --onboard --from ~/src/my-project
+run-codex my-project --lane review --check
+```
+
+The default checkout must be clean. The launcher resolves the requested
+revision to a commit, creates branch `codex/PROJECT/LANE` and its linked
+worktree under `$XDG_CONFIG_HOME/run-codex/worktrees/PROJECT/LANE`, registers
+the isolated lane, and seeds only the default lane's login and user
+configuration. The onboarding step is needed only when the project declares
+checkout-local inputs.
+
+To adopt a checkout at an exact user-selected path instead, create and
+register it manually:
 
 ```bash
 git -C ~/src/my-project worktree add \
@@ -1226,6 +1242,34 @@ worktree. Give lanes distinct branches and coordinate approved Git operations.
 Worktrees created through symlinked or lexically non-canonical checkout paths
 are rejected because their absolute pointer/back-pointer paths would not exist
 inside the exact-path container mount; recreate them using canonical paths.
+
+After committing a managed lane's result, import its exact HEAD into a clean
+default lane with an explicit full commit ID:
+
+```bash
+result_commit="$(git -C ~/.config/run-codex/worktrees/my-project/review rev-parse HEAD)"
+run-codex my-project --lane review --import "$result_commit"
+```
+
+Import is deliberately local to linked worktrees that share Git metadata. It
+locks both launcher lanes, verifies a clean source whose HEAD equals the
+supplied commit, rechecks the default HEAD, and performs only a fast-forward of
+the clean default branch. It never merges divergent histories or accepts an
+abbreviated or moving source revision. Other trusted host or approved Git
+operations still share authority over the common repository and must be
+coordinated separately.
+
+When the result is integrated, remove a launcher-managed checkout with:
+
+```bash
+run-codex my-project --lane review --remove
+```
+
+Removal refuses adopted paths, active lanes, dirty/untracked/ignored files,
+declared local inputs, and commits not reachable from the default lane. It
+removes the managed worktree and registration, and deletes the expected safe
+branch when Git confirms it is integrated. Lane Codex state and synchronized
+snapshot history are deliberately retained for separate archival or recovery.
 
 To copy only login and user configuration into a new lane, opt in during
 registration:
@@ -1259,9 +1303,7 @@ lane's profile and Clojure MCP setting. It also seeds missing `auth.json`,
 `config.toml`, `requirements.toml`, and `*.config.toml` files from the default
 lane's Codex home with private permissions. Sessions, history, databases, and
 caches remain isolated. Existing lane registrations are never replaced, and a
-conflicting managed path is rejected rather than overwritten. Manual worktree
-registration remains available when an exact user-selected checkout path is
-required.
+conflicting managed path is rejected rather than overwritten.
 
 The launcher refuses a default lane or a reviewer checkout with tracked
 changes, starts a fresh context, and supplies a read-only review task for that

@@ -83,6 +83,9 @@ Usage:
 
   run-codex --init [--lane LANE] [--profile generic|cuda] [--clojure-mcp auto|on|off] [--bootstrap-codex-home DIR] [PROJECT [PATH]]
   run-codex --rebind PROJECT [PATH] [--lane LANE]
+  run-codex PROJECT --lane LANE --create REVISION
+  run-codex PROJECT --lane LANE --import REVISION
+  run-codex PROJECT --lane LANE --remove
   run-codex PROJECT [--lane LANE] --check
   run-codex PROJECT [--lane LANE] --onboard [--from CHECKOUT]
   run-codex PROJECT [--lane LANE] --setup
@@ -548,6 +551,8 @@ ONBOARD_SOURCE=""
 SETUP_SESSION=false
 STATE_SYNC_MODE=""
 STATE_SYNC_GENERATION=""
+LANE_MANAGEMENT_MODE=""
+LANE_MANAGEMENT_REVISION=""
 
 add_codex_option() {
     local option="$1"
@@ -687,6 +692,20 @@ parse_launch_args() {
                 ! $REVIEW_REVISION_SET || die "--review may be specified only once"
                 REVIEW_REVISION="${1#--review=}"
                 REVIEW_REVISION_SET=true
+                shift
+                ;;
+            --create|--import)
+                (($# >= 2)) || die "$1 requires an immutable Git revision"
+                [[ -z "$LANE_MANAGEMENT_MODE" ]] ||
+                    die "Only one lane management action may be specified"
+                LANE_MANAGEMENT_MODE="${1#--}"
+                LANE_MANAGEMENT_REVISION="$2"
+                shift 2
+                ;;
+            --remove)
+                [[ -z "$LANE_MANAGEMENT_MODE" ]] ||
+                    die "Only one lane management action may be specified"
+                LANE_MANAGEMENT_MODE="remove"
                 shift
                 ;;
             --check)
@@ -1142,6 +1161,273 @@ provision_missing_review_lane() {
     write_project_config "$name" "$lane" "$managed_path" "$profile" \
         "$clojure_mcp" isolated "$agent"
     exec {provision_lock_fd}>&-
+}
+
+managed_lane_path() {
+    local name="$1"
+    local lane="$2"
+    realpath -m -- "$CONFIG_ROOT/worktrees/$name/$lane"
+}
+
+managed_lane_branch() {
+    printf 'codex/%s/%s\n' "$1" "$2"
+}
+
+lane_handoff_lock() {
+    local name="$1"
+    local lane="$2"
+    local lock_path
+
+    if [[ -n "${CODEX_LOCK_FILE:-}" ]]; then
+        [[ "$CODEX_LOCK_FILE" == /* ]] ||
+            die "CODEX_LOCK_FILE must be an absolute path"
+        lock_path="$(realpath -m -- "$CODEX_LOCK_FILE")" || return 1
+    else
+        lock_path="$(realpath -m -- "$CONFIG_ROOT/locks/$name/$lane.handoff.lock")" ||
+            return 1
+    fi
+    [[ "$lock_path" != / ]] || die "CODEX_LOCK_FILE must not be the filesystem root"
+    printf '%s\n' "$lock_path"
+}
+
+create_managed_lane() {
+    local name="$1"
+    local lane="$2"
+    local revision="$3"
+    local default_file lane_file default_root commit profile clojure_mcp agent
+    local managed_parent managed_path branch lock_file lock_fd
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    [[ "$lane" != default ]] || die "--create requires a non-default lane"
+    [[ -n "$revision" && "$revision" != -* &&
+       "$revision" != *$'\n'* && "$revision" != *$'\r'* ]] ||
+        die "--create requires a valid Git revision"
+
+    default_file="$(registry_file_for "$name" default)"
+    lane_file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$default_file" ]] ||
+        die "Initialize project '$name' default lane before creating lane '$lane'"
+    [[ ! -e "$lane_file" && ! -L "$lane_file" ]] ||
+        die "Project '$name' lane '$lane' is already registered"
+
+    read_project_config "$default_file"
+    [[ "$CONFIG_LANE" == default ]] ||
+        die "Lane config identity mismatch in $default_file"
+    default_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Default lane for project '$name' is no longer a Git repository: $CONFIG_PATH"
+    [[ "$default_root" == "$CONFIG_PATH" ]] ||
+        die "Registered path for '$name' is not its Git repository root: $CONFIG_PATH"
+    [[ -z "$(git -C "$default_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Default lane must be clean before creating a managed lane"
+    commit="$(
+        git -C "$default_root" rev-parse --verify "${revision}^{commit}" 2>/dev/null
+    )" || die "Create revision is not a commit in project '$name': $revision"
+
+    profile="$CONFIG_PROFILE"
+    clojure_mcp="$CONFIG_CLOJURE_MCP"
+    agent="$CONFIG_AGENT"
+    managed_path="$(managed_lane_path "$name" "$lane")" ||
+        die "Cannot resolve managed lane path"
+    managed_parent="$(dirname -- "$managed_path")"
+    [[ "$managed_path" != "$default_root" &&
+       "$managed_path" != "$default_root/"* &&
+       "$default_root" != "$managed_path/"* ]] ||
+        die "Managed lane path overlaps the default checkout: $managed_path"
+    [[ ! -e "$managed_path" && ! -L "$managed_path" ]] ||
+        die "Managed lane path already exists without a registration: $managed_path"
+
+    branch="$(managed_lane_branch "$name" "$lane")"
+    git check-ref-format --branch "$branch" >/dev/null 2>&1 ||
+        die "Invalid managed lane branch: $branch"
+    ! git -C "$default_root" show-ref --verify --quiet "refs/heads/$branch" ||
+        die "Managed lane branch already exists: $branch"
+
+    lock_file="$(lane_handoff_lock "$name" default)" ||
+        die "Cannot resolve default lane lock"
+    mkdir -p -- "$(dirname -- "$lock_file")"
+    exec {lock_fd}>"$lock_file"
+    flock -n -x "$lock_fd" ||
+        die "Stop project '$name' default lane before creating lane '$lane'"
+    [[ ! -e "$lane_file" && ! -L "$lane_file" ]] ||
+        die "Project '$name' lane '$lane' was registered while waiting for its lock"
+    [[ ! -e "$managed_path" && ! -L "$managed_path" ]] ||
+        die "Managed lane path appeared while waiting for its lock: $managed_path"
+    ! git -C "$default_root" show-ref --verify --quiet "refs/heads/$branch" ||
+        die "Managed lane branch appeared while waiting for its lock: $branch"
+    [[ -z "$(git -C "$default_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Default lane changed while preparing managed lane '$lane'"
+
+    mkdir -p -- "$managed_parent"
+    echo "Creating managed lane '$lane' at $managed_path" >&2
+    git -C "$default_root" worktree add -b "$branch" \
+        "$managed_path" "$commit" >&2
+    write_project_config "$name" "$lane" "$managed_path" "$profile" \
+        "$clojure_mcp" isolated "$agent"
+    seed_managed_lane_codex_home "$name" "$lane"
+
+    echo "Created project '$name' lane '$lane':"
+    echo "  path:   $managed_path"
+    echo "  branch: $branch"
+    echo "  commit: $commit"
+    echo "Complete local inputs with:"
+    echo "  run-codex '$name' --lane '$lane' --onboard --from '$default_root'"
+}
+
+import_lane_result() {
+    local name="$1"
+    local lane="$2"
+    local revision="$3"
+    local default_file lane_file default_root lane_root commit lane_head default_head
+    local default_common lane_common default_lock lane_lock default_lock_fd lane_lock_fd
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    [[ "$lane" != default ]] || die "--import requires a non-default source lane"
+    [[ "$revision" =~ ^[0-9a-f]{40}$ || "$revision" =~ ^[0-9a-f]{64}$ ]] ||
+        die "--import requires a full immutable commit ID"
+    default_file="$(registry_file_for "$name" default)"
+    lane_file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$default_file" && -f "$lane_file" ]] ||
+        die "Project '$name' default lane and source lane '$lane' must both be registered"
+
+    read_project_config "$default_file"
+    default_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Default lane checkout is unavailable: $CONFIG_PATH"
+    inspect_git_layout "$default_root"
+    default_common="$GIT_COMMON_DIR"
+    read_project_config "$lane_file"
+    lane_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Source lane checkout is unavailable: $CONFIG_PATH"
+    inspect_git_layout "$lane_root"
+    lane_common="$GIT_COMMON_DIR"
+    [[ "$default_common" == "$lane_common" ]] ||
+        die "Source lane '$lane' no longer shares project '$name' Git metadata"
+
+    commit="$(git -C "$lane_root" rev-parse --verify "${revision}^{commit}" 2>/dev/null)" ||
+        die "Import commit is unavailable in lane '$lane': $revision"
+    [[ "$commit" == "$revision" ]] ||
+        die "--import requires the canonical full commit ID: $commit"
+    lane_head="$(git -C "$lane_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot resolve source lane HEAD"
+    [[ "$lane_head" == "$commit" ]] ||
+        die "Import commit must equal lane '$lane' HEAD ($lane_head)"
+
+    default_lock="$(lane_handoff_lock "$name" default)" ||
+        die "Cannot resolve default lane lock"
+    lane_lock="$(lane_handoff_lock "$name" "$lane")" ||
+        die "Cannot resolve source lane lock"
+    mkdir -p -- "$(dirname -- "$default_lock")" "$(dirname -- "$lane_lock")"
+    exec {default_lock_fd}>"$default_lock"
+    flock -n -x "$default_lock_fd" ||
+        die "Stop project '$name' default lane before importing"
+    if [[ "$lane_lock" != "$default_lock" ]]; then
+        exec {lane_lock_fd}>"$lane_lock"
+        flock -n -x "$lane_lock_fd" ||
+            die "Stop project '$name' lane '$lane' before importing"
+    fi
+
+    [[ -z "$(git -C "$default_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Default lane must be clean before importing"
+    [[ -z "$(git -C "$lane_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Source lane '$lane' must be clean before importing"
+    lane_head="$(git -C "$lane_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot recheck source lane HEAD"
+    [[ "$lane_head" == "$commit" ]] ||
+        die "Source lane HEAD changed while preparing import"
+    [[ -n "$(git -C "$default_root" symbolic-ref -q HEAD)" ]] ||
+        die "Default lane must be on a branch before importing"
+    default_head="$(git -C "$default_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot resolve default lane HEAD"
+    git -C "$default_root" merge-base --is-ancestor "$default_head" "$commit" ||
+        die "Import commit $commit does not fast-forward default HEAD $default_head"
+
+    if [[ "$default_head" == "$commit" ]]; then
+        echo "No changes. Default lane already contains $commit."
+        return 0
+    fi
+    [[ "$(git -C "$default_root" rev-parse --verify HEAD^{commit})" == "$default_head" ]] ||
+        die "Default lane HEAD changed while preparing import"
+    git -C "$default_root" merge --ff-only "$commit"
+    echo "Imported project '$name' lane '$lane' result at $commit."
+}
+
+remove_managed_lane() {
+    local name="$1"
+    local lane="$2"
+    local default_file lane_file default_root lane_root expected_path lane_head default_head
+    local branch expected_branch lock_file lock_fd manifest entry path
+    local default_common lane_common
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    [[ "$lane" != default ]] || die "The default lane cannot be removed"
+    default_file="$(registry_file_for "$name" default)"
+    lane_file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$default_file" && -f "$lane_file" ]] ||
+        die "Project '$name' lane '$lane' is not registered"
+
+    read_project_config "$default_file"
+    default_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Default lane checkout is unavailable: $CONFIG_PATH"
+    inspect_git_layout "$default_root"
+    default_common="$GIT_COMMON_DIR"
+    read_project_config "$lane_file"
+    lane_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Lane '$lane' checkout is unavailable: $CONFIG_PATH"
+    inspect_git_layout "$lane_root"
+    lane_common="$GIT_COMMON_DIR"
+    [[ "$default_common" == "$lane_common" ]] ||
+        die "Lane '$lane' no longer shares project '$name' Git metadata"
+    expected_path="$(managed_lane_path "$name" "$lane")" ||
+        die "Cannot resolve managed lane path"
+    [[ "$lane_root" == "$expected_path" ]] ||
+        die "Refusing to remove adopted checkout $lane_root; only managed lanes can be removed"
+
+    lock_file="$(lane_handoff_lock "$name" "$lane")" ||
+        die "Cannot resolve lane lock"
+    mkdir -p -- "$(dirname -- "$lock_file")"
+    exec {lock_fd}>"$lock_file"
+    flock -n -x "$lock_fd" ||
+        die "Stop project '$name' lane '$lane' before removing it"
+
+    PROJECT="$name"
+    LANE="$lane"
+    PROJECT_PATH="$lane_root"
+    need jq
+    load_onboarding_manifests "$name" "$lane"
+    for manifest in "${ONBOARDING_MANIFESTS[@]}"; do
+        while IFS= read -r entry; do
+            path="$(jq -r '.path' <<<"$entry")"
+            if [[ -e "$lane_root/$path" || -L "$lane_root/$path" ]]; then
+                die "Lane '$lane' still contains declared local input '$path'; preserve or remove it before cleanup"
+            fi
+        done < <(jq -c '.files[]' "$manifest")
+    done
+
+    [[ -z "$(git -C "$lane_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Lane '$lane' has uncommitted or untracked files; preserve them before cleanup"
+    [[ -z "$(git -C "$lane_root" status --porcelain=v1 --ignored=matching --untracked-files=all)" ]] ||
+        die "Lane '$lane' has ignored files; preserve or remove them before cleanup"
+    lane_head="$(git -C "$lane_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot resolve lane '$lane' HEAD"
+    default_head="$(git -C "$default_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot resolve default lane HEAD"
+    git -C "$default_root" merge-base --is-ancestor "$lane_head" "$default_head" ||
+        die "Lane '$lane' has commits not integrated into the default lane"
+
+    branch="$(git -C "$lane_root" symbolic-ref --short -q HEAD || true)"
+    expected_branch="$(managed_lane_branch "$name" "$lane")"
+    git -C "$default_root" worktree remove "$lane_root"
+    rm -- "$lane_file"
+    if [[ "$branch" == "$expected_branch" ]] &&
+       ! git -C "$default_root" branch -d "$branch" >/dev/null 2>&1; then
+        echo "WARNING: retained managed branch '$branch'; remove it after inspection." >&2
+    fi
+
+    echo "Removed managed checkout and registration for project '$name' lane '$lane'."
+    echo "Retained lane state: $CONFIG_ROOT/state/$name/$lane"
+    echo "Retained synchronization history: $SYNC_ROOT/projects/$name/lanes/$lane"
 }
 
 FOUND_PROJECT=""
@@ -1941,7 +2227,7 @@ bootstrap_lane_codex_home() {
     copy_codex_bootstrap_files "$requested_source" "$CODEX_HOST_HOME" true
 }
 
-seed_managed_review_codex_home() {
+seed_managed_lane_codex_home() {
     local project="$1"
     local lane="$2"
     local default_file lane_file default_state_mode default_codex_home
@@ -2408,6 +2694,34 @@ case "${1:-}" in
         ;;
 esac
 
+if [[ -n "$LANE_MANAGEMENT_MODE" ]]; then
+    [[ -n "$PROJECT" && "$LANE_SET" == true ]] ||
+        die "Lane management requires PROJECT and an explicit --lane LANE"
+    if $NEW_SESSION || $SESSION_LIST_MODE || $RESUME_QUERY_SET ||
+       $REVIEW_REVISION_SET || $ONBOARD_CHECK_MODE || $ONBOARD_APPLY_MODE ||
+       $SETUP_SESSION || [[ -n "$STATE_SYNC_MODE" ]] || $CODEX_PROMPT_SET ||
+       ((${#CODEX_FORWARD_ARGS[@]} > 0)) ||
+       ((${#CODEX_IMAGE_REQUESTS[@]} > 0)) || $IMAGE_TAG_OPTION_SET; then
+        die "Lane management actions cannot be combined with launch, onboarding, or state options"
+    fi
+    need git
+    need realpath
+    need flock
+    case "$LANE_MANAGEMENT_MODE" in
+        create)
+            create_managed_lane "$PROJECT" "$LANE" "$LANE_MANAGEMENT_REVISION"
+            ;;
+        import)
+            import_lane_result "$PROJECT" "$LANE" "$LANE_MANAGEMENT_REVISION"
+            ;;
+        remove)
+            remove_managed_lane "$PROJECT" "$LANE"
+            ;;
+        *) die "Unknown lane management action: $LANE_MANAGEMENT_MODE" ;;
+    esac
+    exit 0
+fi
+
 $NEW_SESSION && $RESUME_QUERY_SET &&
     die "--new and --resume are mutually exclusive"
 $REVIEW_REVISION_SET && $RESUME_QUERY_SET &&
@@ -2475,7 +2789,7 @@ if $REVIEW_REVISION_SET && $LANE_SET && [[ "$LANE" != default ]] &&
    [[ -n "$PROJECT" ]]; then
     need flock
     provision_missing_review_lane "$PROJECT" "$LANE" "$REVIEW_REVISION"
-    seed_managed_review_codex_home "$PROJECT" "$LANE"
+    seed_managed_lane_codex_home "$PROJECT" "$LANE"
 fi
 resolve_project "$PROJECT" "$LANE"
 

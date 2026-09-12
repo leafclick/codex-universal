@@ -265,14 +265,15 @@ revision and dirty state and require an explicit integration action.
 | 1 | Stable project/lane registry and backward-compatible default lane | Existing launch behaviour passes; canonical paths and IDs validated; registration survives restart | Implemented locally | M |
 | 2 | Per-lane state, runtime locks, scoped safety checks, and minimal checkout onboarding | Two projects run concurrently; local configuration can be adopted/copied/completed; existing files preserved; missing inputs block normal launch but permit setup | Implemented locally | M-H |
 | 3 | Per-lane snapshots and explicit machine handoff | Independent generations; incomplete transfer refusal; destination configuration reprovisioned/rebound; divergence preserves both copies; rollback tested | Partial: snapshots now bind a clean required commit, immutable runtime labels, and onboarding contract/readiness to each lane; local two-root refusal/restore fixtures pass, while live second-machine acceptance remains | M-H |
-| 4 | Background checkout creation, onboarding, and Git result exchange | Shared-Git authority bounded; independent branches; usable local configuration; source checkout unchanged; cleanup protects unpublished code and local inputs | Partial: existing linked worktrees can be adopted; creation/import/cleanup commands remain | M-H |
-| 5 | Two-agent cooperation and revision-specific review | Distinct containers/models; durable messages; cross-lane writes denied; result import and combined tests demonstrated | Partial: revision-specific Codex review exists; broker/import remain | M-H |
+| 4 | Background checkout creation, onboarding, and Git result exchange | Shared-Git authority bounded; independent branches; usable local configuration; source checkout unchanged; cleanup protects unpublished code and local inputs | Partial: managed creation, local exact-commit fast-forward import, and guarded cleanup pass host fixtures; live-image acceptance remains | M-H |
+| 5 | Two-agent cooperation and revision-specific review | Distinct containers/models; durable messages; cross-lane writes denied; result import and combined tests demonstrated | Partial: revision-specific Codex review and guarded local result import exist; durable messaging/broker remains | M-H |
 | 6 | Stricter checkout backend | Private Git authority or broker is proven without breaking exact-checkout IDE use | Not started; optional | H; optional |
 
 Phases 2 and 3 together deliver independent project handoff. The implemented
-part of Phase 4 delivers independent worktrees alongside IDEA under an explicit
+part of Phase 4 delivers managed independent worktrees alongside IDEA, guarded
+fast-forward result import, and conservative cleanup under an explicit
 shared-Git trust model. Phase 5 currently provides a fixed-revision reviewer;
-durable peer messaging and import still need the controller described above.
+durable peer messaging still needs the controller described above.
 
 ## Migration, verification, and operational costs
 

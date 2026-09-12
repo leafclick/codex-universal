@@ -2192,6 +2192,202 @@ if env PATH="$TEST_ROOT/no-jq-bin" \
 fi
 grep -Fxq 'ERROR: Missing command: jq' "$TEST_ROOT/no-jq.err" ||
     fail "IDEA launcher did not report missing jq"
+cli_root="$TEST_ROOT/phase4-cli"
+cli_repo="$cli_root/repo"
+cli_config="$cli_root/config"
+cli_sync="$cli_root/sync"
+mkdir -p "$cli_repo" "$cli_root/home"
+git -C "$cli_repo" init -q -b main
+printf '%s\n' base > "$cli_repo/payload"
+mkdir -p "$cli_repo/.codex-universal"
+printf '%s\n' \
+    '{"version":1,"files":[{"path":"local-input","template":"local-input.template"}]}' \
+    > "$cli_repo/.codex-universal/onboarding.json"
+printf '%s\n' template > "$cli_repo/local-input.template"
+printf '%s\n' '*.ignored' > "$cli_repo/.gitignore"
+git -C "$cli_repo" add payload .gitignore
+git -C "$cli_repo" add .codex-universal/onboarding.json local-input.template
+git -C "$cli_repo" -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid commit -qm base
+cli_base_commit="$(git -C "$cli_repo" rev-parse HEAD)"
+
+cli_env=(
+    env
+    "HOME=$cli_root/home"
+    "XDG_CONFIG_HOME=$cli_config"
+    "CODEX_IMAGE_SLUG=example/codex-universal"
+    "CODEX_IMAGE_TAG=test-version"
+    "CODEX_SYNC_ROOT=$cli_sync"
+    "CODEX_GIT_USER_NAME=host-smoke"
+    "CODEX_GIT_USER_EMAIL=host-smoke.invalid"
+    "CODEX_TEST_SKIP_IDEA_MCP_RELAY=1"
+    "CODEX_SECCOMP_PROFILE=$ROOT/security/seccomp/codex-bwrap.json"
+    "PATH=$TEST_ROOT/fake-bin:$PATH"
+)
+cli_run() {
+    "${cli_env[@]}" "$ROOT/bin/run-codex" "$@"
+}
+cli_project_config="$cli_config/run-codex/projects/cli-project"
+cli_lane_dir="$cli_config/run-codex/lanes/cli-project"
+cli_managed_path="$cli_config/run-codex/worktrees/cli-project/managed"
+cli_managed_config="$cli_lane_dir/managed"
+cli_managed_branch='codex/cli-project/managed'
+
+cli_help="$(cli_run --help)"
+assert_contains "$cli_help" "PROJECT --lane LANE --create REVISION"
+assert_contains "$cli_help" "PROJECT --lane LANE --import REVISION"
+assert_contains "$cli_help" "PROJECT --lane LANE --remove"
+cli_run --init cli-project "$cli_repo" >/dev/null
+cli_project_config_before="$(<"$cli_project_config")"
+printf '%s\n' dirty >> "$cli_repo/payload"
+if cli_run cli-project --lane managed --create "$cli_base_commit" \
+    >"$cli_root/create-dirty.log" 2>&1; then
+    fail "managed lane creation accepted a dirty default checkout"
+fi
+assert_contains "$(<"$cli_root/create-dirty.log")" \
+    "Default lane must be clean before creating a managed lane"
+[[ "$(<"$cli_project_config")" == "$cli_project_config_before" &&
+   ! -e "$cli_managed_config" && ! -e "$cli_managed_path" ]] ||
+    fail "dirty managed lane creation mutated path or registry"
+git -C "$cli_repo" checkout -q -- payload
+
+cli_default_before="$(git -C "$cli_repo" rev-parse HEAD)"
+cli_create_lock="$cli_config/run-codex/locks/cli-project/default.handoff.lock"
+mkdir -p -- "$(dirname -- "$cli_create_lock")"
+exec 8>"$cli_create_lock"
+flock -n -x 8 || fail "could not acquire default lane creation lock"
+if cli_run cli-project --lane managed --create "$cli_base_commit" \
+    >"$cli_root/create-lock.log" 2>&1; then
+    fail "managed lane creation ignored an active default lock"
+fi
+assert_contains "$(<"$cli_root/create-lock.log")" \
+    "Stop project 'cli-project' default lane"
+[[ ! -e "$cli_managed_config" && ! -e "$cli_managed_path" ]] ||
+    fail "locked managed lane creation mutated path or registry"
+exec 8>&-
+cli_run cli-project --lane managed --create "$cli_base_commit" \
+    >"$cli_root/create.log" 2>&1
+[[ "$(git -C "$cli_repo" rev-parse HEAD)" == "$cli_default_before" &&
+   "$(git -C "$cli_managed_path" rev-parse HEAD)" == "$cli_base_commit" ]] ||
+    fail "managed lane creation changed the default or used the wrong commit"
+grep -Fxq "path=$cli_managed_path" "$cli_managed_config" ||
+    fail "managed lane creation omitted its canonical registration"
+printf '%s\n' feature > "$cli_managed_path/feature"
+git -C "$cli_managed_path" add feature
+git -C "$cli_managed_path" -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid commit -qm feature
+cli_feature_commit="$(git -C "$cli_managed_path" rev-parse HEAD)"
+
+if cli_run cli-project --lane managed --import "${cli_feature_commit:0:12}" \
+    >"$cli_root/import-abbrev.log" 2>&1; then
+    fail "lane import accepted an abbreviated commit"
+fi
+assert_contains "$(<"$cli_root/import-abbrev.log")" \
+    "full immutable commit ID"
+if cli_run cli-project --lane managed --import "$cli_base_commit" \
+    >"$cli_root/import-nonhead.log" 2>&1; then
+    fail "lane import accepted a non-HEAD source commit"
+fi
+assert_contains "$(<"$cli_root/import-nonhead.log")" \
+    "must equal lane 'managed' HEAD"
+printf '%s\n' dirty > "$cli_managed_path/dirty"
+if cli_run cli-project --lane managed --import "$cli_feature_commit" \
+    >"$cli_root/import-source-dirty.log" 2>&1; then
+    fail "lane import accepted a dirty source checkout"
+fi
+assert_contains "$(<"$cli_root/import-source-dirty.log")" \
+    "Source lane 'managed' must be clean"
+rm -- "$cli_managed_path/dirty"
+printf '%s\n' dirty >> "$cli_repo/payload"
+if cli_run cli-project --lane managed --import "$cli_feature_commit" \
+    >"$cli_root/import-default-dirty.log" 2>&1; then
+    fail "lane import accepted a dirty default checkout"
+fi
+assert_contains "$(<"$cli_root/import-default-dirty.log")" \
+    "Default lane must be clean before importing"
+git -C "$cli_repo" checkout -q -- payload
+cli_run cli-project --lane managed --import "$cli_feature_commit" >/dev/null
+[[ "$(git -C "$cli_repo" rev-parse HEAD)" == "$cli_feature_commit" ]] ||
+    fail "clean lane import did not fast-forward default to the exact source HEAD"
+
+cli_run cli-project --lane nonff --create "$cli_feature_commit" >/dev/null 2>&1
+printf '%s\n' source-two > "$cli_config/run-codex/worktrees/cli-project/nonff/source-two"
+git -C "$cli_config/run-codex/worktrees/cli-project/nonff" add source-two
+git -C "$cli_config/run-codex/worktrees/cli-project/nonff" \
+    -c user.name=host-smoke -c user.email=host-smoke.invalid commit -qm source-two
+cli_nonff_commit="$(git -C "$cli_config/run-codex/worktrees/cli-project/nonff" rev-parse HEAD)"
+printf '%s\n' default-two > "$cli_repo/default-two"
+git -C "$cli_repo" add default-two
+git -C "$cli_repo" -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid commit -qm default-two
+cli_default_divergent="$(git -C "$cli_repo" rev-parse HEAD)"
+if cli_run cli-project --lane nonff --import "$cli_nonff_commit" \
+    >"$cli_root/import-nonff.log" 2>&1; then
+    fail "lane import accepted a non-fast-forward result"
+fi
+assert_contains "$(<"$cli_root/import-nonff.log")" "does not fast-forward default HEAD"
+[[ "$(git -C "$cli_repo" rev-parse HEAD)" == "$cli_default_divergent" ]] ||
+    fail "rejected non-fast-forward import changed default HEAD"
+
+cli_managed_state="$cli_config/run-codex/state/cli-project/managed"
+cli_managed_sync="$cli_sync/projects/cli-project/lanes/managed"
+mkdir -p "$cli_managed_state" "$cli_managed_sync"
+printf '%s\n' lane-state > "$cli_managed_state/marker"
+printf '%s\n' snapshot-history > "$cli_managed_sync/marker"
+cli_remove_lock="$cli_config/run-codex/locks/cli-project/managed.handoff.lock"
+exec 8>"$cli_remove_lock"
+flock -n -x 8 || fail "could not acquire managed lane removal lock"
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-lock.log" 2>&1; then
+    fail "managed lane removal ignored an active lock"
+fi
+assert_contains "$(<"$cli_root/remove-lock.log")" "Stop project 'cli-project' lane 'managed'"
+exec 8>&-
+printf '%s\n' unintegrated > "$cli_managed_path/unintegrated"
+git -C "$cli_managed_path" add unintegrated
+git -C "$cli_managed_path" -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid commit -qm unintegrated
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-unintegrated.log" 2>&1; then
+    fail "managed lane removal accepted unintegrated commits"
+fi
+assert_contains "$(<"$cli_root/remove-unintegrated.log")" "commits not integrated"
+git -C "$cli_managed_path" reset -q --hard "$cli_feature_commit"
+printf '%s\n' dirty > "$cli_managed_path/dirty"
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-dirty.log" 2>&1; then
+    fail "managed lane removal accepted dirty or untracked files"
+fi
+assert_contains "$(<"$cli_root/remove-dirty.log")" "uncommitted or untracked files"
+rm -- "$cli_managed_path/dirty"
+printf '%s\n' ignored > "$cli_managed_path/local.ignored"
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-ignored.log" 2>&1; then
+    fail "managed lane removal accepted ignored files"
+fi
+assert_contains "$(<"$cli_root/remove-ignored.log")" "ignored files"
+rm -- "$cli_managed_path/local.ignored"
+printf '%s\n' local > "$cli_managed_path/local-input"
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-local.log" 2>&1; then
+    fail "managed lane removal accepted a declared local input"
+fi
+assert_contains "$(<"$cli_root/remove-local.log")" "declared local input"
+rm -- "$cli_managed_path/local-input"
+
+cli_adopted_path="$cli_config/run-codex/worktrees/cli-project/adopted"
+cli_run cli-project --lane adopted --create "$cli_default_divergent" >/dev/null 2>&1
+sed -i "s#^path=.*#path=$cli_repo#" \
+    "$cli_config/run-codex/lanes/cli-project/adopted"
+if cli_run cli-project --lane adopted --remove >"$cli_root/remove-adopted.log" 2>&1; then
+    fail "managed lane removal accepted an adopted checkout path"
+fi
+assert_contains "$(<"$cli_root/remove-adopted.log")" "adopted checkout"
+[[ -e "$cli_adopted_path" ]] || fail "adopted lane fixture disappeared after rejection"
+
+cli_run cli-project --lane managed --remove >"$cli_root/remove-success.log" 2>&1
+[[ ! -e "$cli_managed_path" && ! -e "$cli_managed_config" ]] ||
+    fail "successful managed lane removal retained checkout or registry"
+git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_managed_branch" &&
+    fail "successful managed lane removal retained its safe branch"
+[[ -f "$cli_managed_state/marker" && -f "$cli_managed_sync/marker" ]] ||
+    fail "managed lane removal deleted lane state or snapshot history"
+pass "managed lane create, import, and removal lifecycle"
 pass "project registry and launcher policy"
 activity "JetBrains ACP configuration"
 
