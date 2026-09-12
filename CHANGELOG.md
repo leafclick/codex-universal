@@ -11,6 +11,13 @@ This change log follows the conventions of
 
 - Run Clojure-helper runtime smoke fixtures with the image's pinned Babashka
   instead of an arbitrary host installation.
+- Keep forced snapshot recovery available when the live Codex SQLite state is
+  corrupt while continuing to validate the selected incoming snapshot.
+- Report snapshot-install rollback outcomes and retain an actionable backup
+  path when rollback fails.
+- Discover SQLite databases by file header beyond the existing `.sqlite`
+  convention, and validate private database copies so whole-state WAL/SHM
+  sidecars remain byte-for-byte consistent with the snapshot hash.
 
 ## [0.6.0] - 2026-09-11
 
