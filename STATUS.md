@@ -1,6 +1,6 @@
 # Codex Universal Work Status
 
-Last updated: 2026-09-11
+Last updated: 2026-09-12
 
 `PLAN.md` is the source of remaining scope, ordering, complexity, and rationale;
 `REVIEW-ARCHIVE.md` preserves completed and refuted findings. This file tracks
@@ -18,10 +18,10 @@ runtime validation.
 |---|---:|---:|---:|---:|---|
 | Tier 1 | 10 | 10 | 0 | 0 | Issues 1 and 22 are rebuilt-image validated; all Tier 1 work is complete. |
 | Tier 2 | 13 | 13 | 0 | 0 | Issues 47–49 are fixed; host-only and pinned-image-runtime fixtures pass at their intended boundaries. |
-| Tier 3 | 23 | 17 | 0 | 6 | All six remaining items are deferred: optional Issue 23 and snapshot Issues 4, 20, 21, 37, and 44. |
+| Tier 3 | 23 | 21 | 0 | 2 | Issues 4, 20, 21, and 37 are complete; optional Issues 23 and 44 remain deferred by product decision. |
 | Tier 4 | 3 | 0 | 0 | 0 | Three original claims were dismissed after targeted refutation. |
 
-Evidence baseline: 24 dynamically confirmed, 19 source confirmed, 3 open, and
+Evidence baseline: 27 dynamically confirmed, 17 source confirmed, 2 open, and
 3 refuted items. There are 46 active planned items and 3 dismissed claims.
 
 ## Environment failures and prohibited behavior
@@ -87,15 +87,15 @@ Evidence baseline: 24 dynamically confirmed, 19 source confirmed, 3 open, and
 | 49 | 2 | DONE | The runtime fixture now executes only from `smoke_image`. With pinned Babashka `1.13.220`, `IMAGE-CLOJURE-FIXTURE-20260911` passes 13 network-context tests plus the full helper lifecycle. Approved-boundary host-only R2 passes 20 checks without invoking `bb`. | Run the complete image-enabled host suite outside this container. | Keep host launcher/sync validation independent of a container-only runtime while testing the helper against its shipped dependency. |
 | 45 | 2 | DONE | Project-first `PROJECT --set profile|clojure-mcp VALUE` replaces the two leading option forms; focused probes cover both keys, preserved companion values, removed-form rejection, unknown keys, and missing values. | Recheck through the complete host suite. | Make repeated project configuration follow a conventional and extensible command shape. |
 | 46 | 2 | DONE | `--image-version VERSION` overrides `CODEX_IMAGE_TAG` for one terminal launch; validation rejects malformed or duplicate versions and `--sessions` combinations. | Recheck through the complete host suite. | Select a known immutable build without changing persistent project configuration. |
-| 4 | 3 | DEFERRED | Forced restore failed on corrupt live SQLite. | Revisit with the other snapshot synchronization work. | Restore the recovery hatch after higher-priority general work. |
+| 4 | 3 | DONE | Forced restore skips corrupt live-state validation but still verifies the selected archive, restored hash, and incoming SQLite state before replacement. | None. | Preserve a strict recovery hatch when the local Codex instance is corrupt. |
 | 5 | 3 | DONE | A focused fixture proves normal pull rejects incomplete generation 4 while `--force 1` restores the complete older snapshot and baselines the remote head. | None. | Keep recovery available while the provider is still transferring the newest snapshot. |
 | 9 | 3 | DONE | `AGENTS.md` now describes portable fixed-identity images and runtime UID/GID replacement consistently with README. | None. | Keep contributor guidance accurate. |
 | 13 | 3 | DONE | The launcher probes the shared lock nonblockingly, reports `Waiting for Codex state handoff lock` with its path on contention, then preserves indefinite waiting. | None. | Distinguish expected synchronization contention from a hung launch. |
 | 14 | 3 | DONE | The shared handoff lock is acquired before `--sessions`/`--resume` read `state_5.sqlite`; a held-lock probe proves a row created during contention is visible only after release. | Recheck through the complete host suite. | Prevent pull from replacing session state during lookup or resume resolution. |
 | 18 | 3 | DONE | `codex-push --help` exits successfully and unknown options fail before creating sync, state, or lock paths; the installed-command fixture is nonmutating. | None. | Prevent accidental snapshots. |
 | 19 | 3 | DONE | `codex-sync-lib` supplies strict metadata/archive/checksum validation to both installed commands; both reject the malformed format fixture. | None. | Prevent validation drift. |
-| 20 | 3 | DEFERRED | Rollback failure is suppressed in source. | Revisit with the other snapshot synchronization work. | Avoid ambiguous live state after higher-priority general work. |
-| 21 | 3 | DEFERRED | Failure scenarios are absent from the sync suite. | Revisit with the other snapshot synchronization work. | Verify restore failure safety after higher-priority general work. |
+| 20 | 3 | DONE | Install failure now distinguishes successful rollback from failed rollback and reports the exact retained backup path; both outcomes have deterministic fixtures. | None. | Keep state ownership and manual recovery evidence explicit after restore failure. |
+| 21 | 3 | DONE | Nine focused sync groups now cover argument non-mutation, lock contention, incomplete heads, forward/divergent recovery, metadata, corruption, real WAL/SHM state, bad archives/hash mismatch, and both rollback outcomes. | None. | Verify failure behavior at the snapshot replacement boundary. |
 | 23 | 3 | DEFERRED | The shared Dockerfile blocks currently match; package presence does not establish that broad development tooling is unnecessary. | Revisit only if the Dockerfiles grow substantially or actual generic/CUDA drift appears. | Avoid a low-value refactor and speculative compatibility regressions. |
 | 29 | 3 | DONE | Probe guidance now requires the exact helper and private Unix transport, reuse of the existing service, preservation of state/workdir, and no reconstructed Bubblewrap or duplicate nREPL. | None. | Make worker behavior consistent with the managed skill boundary. |
 | 30 | 3 | DONE | The alternate nREPL recipe now warns that it bypasses supervision, private Unix transport, and the networkless namespace, and limits itself to installations without the skill. | None. | Make the lost isolation explicit before users copy the command. |
@@ -105,7 +105,7 @@ Evidence baseline: 24 dynamically confirmed, 19 source confirmed, 3 open, and
 | 34 | 3 | DONE | The snapshot lock comment now names `run-codex` instead of the obsolete `run-codex.sh`. | None. | Keep lock-coordination guidance tied to the actual command. |
 | 35 | 3 | DONE | Push success and handoff output now uses synchronized-generation and configured-provider wording; a source assertion rejects the old messages. | None. | Match every supported sync provider rather than the default directory's provider. |
 | 36 | 3 | DONE | Recovery docs state that `--list` is lock-free and an in-flight provider transfer can temporarily appear `INVALID`. | None. | Prevent a partial sync observation from being mistaken for durable corruption. |
-| 37 | 3 | DEFERRED | Codex DB suffix/WAL behavior remains unknown. | Revisit with the other snapshot synchronization work. | Avoid incomplete database snapshots after higher-priority general work. |
+| 37 | 3 | DONE | Current Codex state uses WAL-mode `*.sqlite` databases with WAL/SHM sidecars. Validation also discovers valid non-`.sqlite` databases and runs against private main/journal/WAL/SHM copies, preserving the exact whole-state hash. | None. | Validate complete logical databases without checkpointing or mutating archived state. |
 | 38 | 3 | DONE | Launcher help now lists every supported user-facing environment variable, including compatibility and identity/workflow controls. | None. | Improve configuration discoverability without requiring source inspection. |
 | 39 | 3 | DONE | Every launcher/push/pull `nullglob` enable now restores the caller's prior disabled state immediately after glob expansion. | None. | Reduce hidden coupling between later shell functions. |
 | 40 | 3 | DONE | `.local-fixtures/` is now ignored by the tracked repository rules; the intentional `.env.example` exception remains available for a future example file. | None. | Prevent accidental local-artifact commits. |
@@ -118,6 +118,7 @@ Evidence baseline: 24 dynamically confirmed, 19 source confirmed, 3 open, and
 
 | Date | Change | Validation | Reason |
 |---|---|---|---|
+| 2026-09-12 | Completed Issues 4, 20, 21, and 37; explicitly retained Issues 23 and 44 as deferred product decisions. Forced pull now bypasses corrupt live validation, rollback outcomes are actionable, SQLite discovery is suffix-tolerant, and integrity checks use private copies with real sidecars. | `SNAPSHOT-LOCK-CONTENTION-20260912` passed all nine focused sync groups. The canonical `./tests/host-smoke.sh` then passed every host and sync check in 15 seconds; Docker image-runtime checks were explicitly skipped because no daemon is available. | Restore recovery without weakening incoming validation, make failed installation recoverable, and prevent integrity checks from mutating hashed WAL state. |
 | 2026-09-11 | Completed Issue 49 by moving Clojure-helper runtime smoke coverage from host Babashka into each image check. | Pinned-runtime `IMAGE-CLOJURE-FIXTURE-20260911` passed 13 tests and the complete lifecycle fixture. Approved-boundary `REFACTORED-HOST-SMOKE-R2-20260911` passed 20 host checks with intentional sync/image skips and no host `bb` invocation. | Test container-only behavior against the shipped runtime while keeping launcher and synchronization validation host-native. |
 | 2026-09-11 | Split the live plan from the historical review ledger. | `PLAN.md` now contains exactly the six deferred items; `REVIEW-ARCHIVE.md` preserves all 39 completed items and three refuted claims with their IDs, evidence labels, complexity, and reasons. | Keep the actionable backlog scannable without discarding review history. |
 | 2026-09-11 | Verified the post-amend rebuilt CUDA image and completed Issue 22. | `lein version` now reports `2.13.0`; installed launcher metadata and the JAR manifest agree, and the JAR retains its pinned checksum. Ordinary-boundary smoke stopped at the known Unix-bind `EPERM`; approved-boundary `REBUILT-HOST-SMOKE-R2-20260911` passed 25 named checks and 13 embedded tests, with image checks explicitly skipped. | Close the last Tier 1 item using installed-runtime evidence while preserving the Docker-host coverage boundary. |

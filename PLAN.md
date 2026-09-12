@@ -5,8 +5,7 @@ subsequent runtime investigation. Completed and refuted findings are preserved
 in `REVIEW-ARCHIVE.md`; current execution evidence and probe failures remain in
 `STATUS.md`.
 
-All remaining items are intentionally deferred. Snapshot push/pull work stays
-lower priority than general runtime and security work.
+Both remaining items are intentionally deferred by product decision.
 
 Evidence labels:
 
@@ -23,19 +22,15 @@ test-heavy, and `H` architectural or integration-heavy.
 |---:|---|---|---|---|---|---|
 | 23 | Improvement | Optionally revisit generic/CUDA Dockerfile deduplication and package pruning if the files grow substantially or actual profile drift appears. | SOURCE CONFIRMED | Deferred by product decision. The common blocks currently match, and speculative package pruning is not valuable enough to pursue now. | H for refactor; M for package audit | Avoid architecture and compatibility work until growth or demonstrated drift justifies it. |
 
-## Deferred snapshot synchronization work
+## Deferred snapshot isolation work
 
 The current whole-state handoff remains usable when operators stop sessions
-before synchronization. These items stay below general repository and
-security-boundary work.
+before synchronization. Per-group isolation is optional future architecture,
+not a current handoff correctness defect.
 
 | ID | Type | Work item | Evidence | Status | Complexity | Reason |
 |---:|---|---|---|---|---|---|
-| 4 | Fix | Let `codex-pull --force` recover when the live SQLite state is corrupt. | DYNAMICALLY CONFIRMED | Deferred with snapshot synchronization work; live validation currently blocks recovery before extraction. | L | Forced restore should remain a recovery path. |
-| 20 | Fix | Report failed rollback, retain useful recovery evidence, and clean restore temporary state deterministically. | SOURCE CONFIRMED | Deferred with snapshot synchronization work; rollback failure is currently suppressed. | M | A failed restore must not leave state ownership ambiguous. |
-| 21 | Improvement | Add snapshot failure-path tests for locking, incomplete generations, corruption, divergence, and rollback. | SOURCE CONFIRMED | Deferred with snapshot synchronization work; the coverage gap remains. | M | Restore safety depends more on failure behavior than the happy path. |
-| 37 | Improvement | Confirm Codex database suffix and WAL/SHM behavior, then extend integrity handling if necessary. | OPEN | Deferred with snapshot synchronization work; actual Codex database lifecycle is unverified. | M | Snapshot validity depends on capturing complete database state. |
-| 44 | New feature | Add optional per-project or per-sync-group state isolation: each group gets its own complete `CODEX_DIR`, lock, baseline, and snapshot namespace. Do not filter rows or files from the current global state archive. | OPEN | Deferred with snapshot synchronization work; feasible only as isolated state roots, not a small filter on existing snapshots. | H | Enables different projects to run on different machines concurrently without sharing one live global state tree. |
+| 44 | New feature | Add optional per-project or per-sync-group state isolation: each group gets its own complete `CODEX_DIR`, lock, baseline, and snapshot namespace. Do not filter rows or files from the current global state archive. | OPEN | Deferred by product decision; feasible only as isolated state roots, not a small filter on existing snapshots. | H | Enables different projects to run on different machines concurrently without sharing one live global state tree. |
 
 ### Selective synchronization design gate
 

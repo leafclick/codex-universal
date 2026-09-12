@@ -127,17 +127,45 @@ state_hash_dir() {
 
 check_sqlite() {
     local dir="$1"
-    local db result
+    local db check_dir db_copy result sidecar
 
     while IFS= read -r -d '' db; do
+        [[ -r "$db" ]] || die "Could not inspect file for SQLite data: $db"
+        if [[ "$db" != *.sqlite ]] &&
+           ! LC_ALL=C head -c 15 -- "$db" | grep -Fqx 'SQLite format 3'; then
+            continue
+        fi
+
         echo "  checking $(basename "$db")"
 
-        result="$(sqlite3 "$db" 'PRAGMA integrity_check;')" ||
+        check_dir="$(mktemp -d "$STATE_DIR/.sqlite-check.XXXXXX")" ||
+            die "Could not create SQLite validation directory"
+        db_copy="$check_dir/$(basename "$db")"
+        if ! cp -- "$db" "$db_copy"; then
+            rm -rf -- "$check_dir"
+            die "Could not copy SQLite database for validation: $db"
+        fi
+
+        for sidecar in "$db-journal" "$db-wal" "$db-shm"; do
+            [[ -e "$sidecar" || -L "$sidecar" ]] || continue
+            if [[ ! -f "$sidecar" || -L "$sidecar" ]] ||
+               ! cp -- "$sidecar" "$check_dir/$(basename "$sidecar")"; then
+                rm -rf -- "$check_dir"
+                die "Could not safely copy SQLite sidecar for validation: $sidecar"
+            fi
+        done
+
+        if ! result="$(sqlite3 "$db_copy" 'PRAGMA integrity_check;')"; then
+            rm -rf -- "$check_dir"
             die "SQLite check failed: $db"
+        fi
+
+        rm -rf -- "$check_dir" ||
+            die "Could not remove SQLite validation directory: $check_dir"
 
         [[ "$result" == "ok" ]] ||
             die "SQLite corruption detected in $db: $result"
-    done < <(find "$dir" -type f -name '*.sqlite' -print0)
+    done < <(find "$dir" -type f -print0)
 }
 
 BASE_GEN=""
@@ -355,7 +383,7 @@ report_running_codex_containers() {
     return 0
 }
 
-for cmd in tar zstd find sqlite3 lsof flock hostname; do
+for cmd in tar zstd find grep head cp sqlite3 lsof flock hostname; do
     need "$cmd"
 done
 
@@ -382,16 +410,19 @@ if report_running_codex_containers; then
     die "Stop the listed Codex session(s) before pulling"
 fi
 
-echo "Checking local SQLite databases..."
-check_sqlite "$CODEX_DIR"
-
-echo "Calculating local state..."
-LOCAL_HASH="$(state_hash_dir "$CODEX_DIR")"
-
-if read_base; then
-    HAVE_BASE=true
+HAVE_BASE=false
+if [[ "$MODE" == force ]]; then
+    echo "Forced recovery: skipping validation of the local Codex state."
 else
-    HAVE_BASE=false
+    echo "Checking local SQLite databases..."
+    check_sqlite "$CODEX_DIR"
+
+    echo "Calculating local state..."
+    LOCAL_HASH="$(state_hash_dir "$CODEX_DIR")"
+
+    if read_base; then
+        HAVE_BASE=true
+    fi
 fi
 
 load_latest_metadata || die "No remote Codex snapshots found in $SYNC_DIR"
@@ -475,8 +506,11 @@ BACKUP_DIR="$CODEX_PARENT/${CODEX_NAME}.backup-${timestamp}-${nonce}"
 
 mv -- "$CODEX_DIR" "$BACKUP_DIR"
 if ! mv -- "$RESTORE_TMP/content" "$CODEX_DIR"; then
-    mv -- "$BACKUP_DIR" "$CODEX_DIR" || true
-    die "Could not install restored state; attempted to restore the original directory"
+    if mv -- "$BACKUP_DIR" "$CODEX_DIR"; then
+        die "Could not install restored state; original directory restored from $BACKUP_DIR"
+    fi
+
+    die "Could not install restored state and rollback failed; original directory remains at $BACKUP_DIR and $CODEX_DIR is unavailable"
 fi
 
 RESTORE_TMP=""

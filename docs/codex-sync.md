@@ -54,7 +54,7 @@ Important package-to-command mappings include:
 
 | Package | Commands used |
 | --- | --- |
-| `coreutils` | `sha256sum`, `realpath`, `basename`, `date`, `mktemp`, `sync` |
+| `coreutils` | `sha256sum`, `realpath`, `basename`, `cp`, `date`, `head`, `mktemp`, `sync` |
 | `findutils` | `find` |
 | `gawk` | `awk` |
 | `jq` | `jq` for `run-codex` session selection and `setup-codex-idea` |
@@ -188,7 +188,17 @@ Restore a known-good generation:
 codex-pull --force 37
 ```
 
-The command verifies the compressed archive checksum, extracts into a temporary sibling directory, verifies the restored state hash and SQLite databases, and only then replaces `~/.codex`. The previous live directory is retained as a timestamped backup.
+The command deliberately does not validate the live state first, so forced
+recovery remains available when a local SQLite database is corrupt. It still
+verifies the compressed archive checksum, extracts into a temporary sibling
+directory, verifies the restored state hash and every recognized SQLite
+database, and only then replaces `~/.codex`. The previous live directory is
+retained as a timestamped backup.
+
+If installation of the restored directory fails, the command reports whether
+it restored the original directory. If rollback also fails, the error names
+the retained backup path for manual recovery instead of suppressing the
+rollback failure.
 
 After restoring an older generation, publish the recovered contents:
 
@@ -214,6 +224,17 @@ the blocker, each offending container name is printed before the command
 exits. The exclusive lock remains authoritative and also catches a Codex
 session that is starting or a concurrent push/pull. Always exit Codex cleanly
 before a handoff.
+
+SQLite integrity discovery checks known `*.sqlite` files even when corruption
+damages their headers, and also recognizes valid database headers under other
+filenames. This broadens future database-name compatibility without relying
+only on an internal Codex naming convention. WAL and shared-memory
+sidecars are included because the complete state directory is hashed and
+archived. Integrity checks run on a private temporary copy of each database and
+its rollback-journal or WAL/SHM sidecars, preventing SQLite validation from
+checkpointing or otherwise changing the hashed state. The scripts do not delete
+or checkpoint the live or restored sidecars. Stopping every process with files
+open below the state directory is therefore part of the consistency contract.
 
 Each snapshot consists of three files:
 

@@ -37,7 +37,7 @@ case "${1:-}" in
         ;;
 esac
 
-for cmd in tar zstd sha256sum sqlite3 lsof flock awk find hostname realpath dirname basename tr; do
+for cmd in tar zstd sha256sum sqlite3 lsof flock awk find grep head cp hostname realpath dirname basename tr; do
     command -v "$cmd" >/dev/null || die "Missing command: $cmd"
 done
 
@@ -104,18 +104,46 @@ state_hash_dir() {
 
 check_sqlite() {
     local dir="$1"
+    local db check_dir db_copy result sidecar
 
     while IFS= read -r -d '' db; do
+        [[ -r "$db" ]] || die "Could not inspect file for SQLite data: $db"
+        if [[ "$db" != *.sqlite ]] &&
+           ! LC_ALL=C head -c 15 -- "$db" | grep -Fqx 'SQLite format 3'; then
+            continue
+        fi
+
         echo "  checking $(basename "$db")"
 
-        local result
-        result="$(sqlite3 "$db" 'PRAGMA integrity_check;')" ||
+        check_dir="$(mktemp -d "$STATE_DIR/.sqlite-check.XXXXXX")" ||
+            die "Could not create SQLite validation directory"
+        db_copy="$check_dir/$(basename "$db")"
+        if ! cp -- "$db" "$db_copy"; then
+            rm -rf -- "$check_dir"
+            die "Could not copy SQLite database for validation: $db"
+        fi
+
+        for sidecar in "$db-journal" "$db-wal" "$db-shm"; do
+            [[ -e "$sidecar" || -L "$sidecar" ]] || continue
+            if [[ ! -f "$sidecar" || -L "$sidecar" ]] ||
+               ! cp -- "$sidecar" "$check_dir/$(basename "$sidecar")"; then
+                rm -rf -- "$check_dir"
+                die "Could not safely copy SQLite sidecar for validation: $sidecar"
+            fi
+        done
+
+        if ! result="$(sqlite3 "$db_copy" 'PRAGMA integrity_check;')"; then
+            rm -rf -- "$check_dir"
             die "SQLite check failed: $db"
+        fi
+
+        rm -rf -- "$check_dir" ||
+            die "Could not remove SQLite validation directory: $check_dir"
 
         [[ "$result" == "ok" ]] ||
             die "SQLite corruption detected in $db: $result"
 
-    done < <(find "$dir" -type f -name '*.sqlite' -print0)
+    done < <(find "$dir" -type f -print0)
 }
 
 write_base() {

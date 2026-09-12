@@ -33,7 +33,7 @@ assert_contains() {
 }
 
 if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
-    for command in awk find flock hostname lsof sha256sum sqlite3 tar zstd; do
+    for command in awk cp find flock grep head hostname lsof sha256sum sqlite3 tar zstd; do
         need "$command"
     done
 
@@ -99,6 +99,51 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
             "$@"
     }
 
+    run_isolated() {
+        local root="$1"
+        shift
+
+        env \
+            "HOME=$root/home" \
+            "CODEX_DIR=$root/live" \
+            "CODEX_SYNC_DIR=$root/sync" \
+            "CODEX_LOCK_FILE=$root/handoff.lock" \
+            "XDG_STATE_HOME=$root/state" \
+            "$@"
+    }
+
+    fixture_state_hash() {
+        local dir="$1"
+
+        LC_ALL=C tar \
+            --sort=name \
+            --format=gnu \
+            --mtime='@0' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "$dir" \
+            -cf - . |
+            sha256sum |
+            awk '{print $1}'
+    }
+
+    make_fixture_archive() {
+        local source_dir="$1"
+        local archive_path="$2"
+
+        LC_ALL=C tar \
+            --sort=name \
+            --format=gnu \
+            --mtime='@0' \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            -C "$source_dir" \
+            -cf - . |
+            zstd -q -T0 -o "$archive_path"
+    }
+
     mkdir -p "$TEST_ROOT/a/live" "$TEST_ROOT/a/home"
     printf 'generation one\n' > "$TEST_ROOT/a/live/payload"
     generation_one_hash="$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')"
@@ -144,6 +189,31 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     run_machine a "$PUSH_COMMAND" >/dev/null
     no_change="$(run_machine a "$PUSH_COMMAND")"
     assert_contains "$no_change" "No changes"
+
+    lock_snapshot_count="$(find "$SYNC_ROOT" -maxdepth 1 -type f | wc -l)"
+    lock_live_hash="$(fixture_state_hash "$TEST_ROOT/a/live")"
+    exec 8>"$LOCK_FILE"
+    flock -n -x 8 || fail "could not acquire snapshot contention lock"
+    if run_machine a "$PUSH_COMMAND" >"$TEST_ROOT/lock-push.log" 2>&1; then
+        fail "snapshot push ignored an active handoff lock"
+    fi
+    assert_contains "$(<"$TEST_ROOT/lock-push.log")" \
+        "Codex is running, starting, or another push/pull is active"
+    [[ "$(find "$SYNC_ROOT" -maxdepth 1 -type f | wc -l)" == \
+       "$lock_snapshot_count" &&
+       "$(fixture_state_hash "$TEST_ROOT/a/live")" == "$lock_live_hash" ]] ||
+        fail "locked snapshot push mutated state"
+
+    lock_pull_hash="$(fixture_state_hash "$TEST_ROOT/a/live")"
+    if run_machine a "$PULL_COMMAND" >"$TEST_ROOT/lock-pull.log" 2>&1; then
+        fail "snapshot pull ignored an active handoff lock"
+    fi
+    assert_contains "$(<"$TEST_ROOT/lock-pull.log")" \
+        "Codex is running, starting, or another push/pull is active"
+    [[ "$(fixture_state_hash "$TEST_ROOT/a/live")" == "$lock_pull_hash" ]] ||
+        fail "locked snapshot pull mutated live state"
+    exec 8>&-
+    pass "snapshot push and pull reject lock contention without mutation"
 
     mkdir -p "$TEST_ROOT/b/live" "$TEST_ROOT/b/home"
     printf 'replace me\n' > "$TEST_ROOT/b/live/payload"
@@ -244,6 +314,229 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     assert_contains "$(<"$validator_root/push.out")" \
         "Remote snapshot metadata, archive, or checksum is invalid"
     pass "push and pull share strict snapshot metadata validation"
+
+    corrupt_live_root="$TEST_ROOT/corrupt-live"
+    mkdir -p "$corrupt_live_root/live" "$corrupt_live_root/home" \
+        "$corrupt_live_root/sync"
+    printf 'replace corrupt live state\n' > "$corrupt_live_root/live/payload"
+    sqlite3 "$corrupt_live_root/live/state.sqlite" \
+        'CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ("ok");'
+    dd if=/dev/zero of="$corrupt_live_root/live/state.sqlite" \
+        bs=1 count=100 seek=4096 conv=notrunc status=none
+    corrupt_source="$TEST_ROOT/corrupt-source"
+    mkdir -p "$corrupt_source"
+    printf 'valid restored state\n' > "$corrupt_source/payload"
+    sqlite3 "$corrupt_source/state.sqlite" \
+        'CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ("ok");'
+    corrupt_archive="$corrupt_live_root/sync/codex-g0000000001-corrupt.tar.zst"
+    make_fixture_archive "$corrupt_source" "$corrupt_archive"
+    corrupt_archive_hash="$(sha256sum "$corrupt_archive" | awk '{print $1}')"
+    corrupt_state_hash="$(fixture_state_hash "$corrupt_source")"
+    printf '%s\n' "$corrupt_archive_hash" > "$corrupt_archive.sha256"
+    {
+        printf 'format=1\n'
+        printf 'generation=1\nsha256=%s\n' "$corrupt_state_hash"
+        printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
+            "$(basename "$corrupt_archive")"
+    } > "$corrupt_archive.state"
+    run_isolated "$corrupt_live_root" "$PULL_COMMAND" --force 1 >/dev/null
+    [[ "$(<"$corrupt_live_root/live/payload")" == \
+       'valid restored state' ]] ||
+        fail "forced pull did not bypass corrupt local SQLite"
+    pass "forced pull bypasses corrupt local SQLite"
+
+    suffix_root="$TEST_ROOT/suffix-db"
+    mkdir -p "$suffix_root/live" "$suffix_root/home" "$suffix_root/sync"
+    printf 'suffix live state\n' > "$suffix_root/live/payload"
+    sqlite3 "$suffix_root/live/codex-state.db" \
+        'CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ("ok");'
+    dd if=/dev/zero of="$suffix_root/live/codex-state.db" \
+        bs=1 count=100 seek=4096 conv=notrunc status=none
+    suffix_archive="$suffix_root/sync/codex-g0000000001-suffix.tar.zst"
+    make_fixture_archive "$suffix_root/live" "$suffix_archive"
+    suffix_archive_hash="$(sha256sum "$suffix_archive" | awk '{print $1}')"
+    suffix_state_hash="$(fixture_state_hash "$suffix_root/live")"
+    printf '%s\n' "$suffix_archive_hash" > "$suffix_archive.sha256"
+    {
+        printf 'format=1\ngeneration=1\nsha256=%s\n' "$suffix_state_hash"
+        printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
+            "$(basename "$suffix_archive")"
+    } > "$suffix_archive.state"
+    if run_isolated "$suffix_root" "$PULL_COMMAND" --force 1 \
+        >"$suffix_root/suffix.log" 2>&1; then
+        fail "forced pull accepted corrupt non-.sqlite database"
+    fi
+    grep -Eq 'SQLite (corruption detected|check failed)' \
+        "$suffix_root/suffix.log" ||
+        fail "corrupt non-.sqlite database was not rejected"
+
+    sidecar_root="$TEST_ROOT/sidecars"
+    mkdir -p "$sidecar_root/live" "$sidecar_root/home" "$sidecar_root/sync"
+    printf 'sidecar payload\n' > "$sidecar_root/live/payload"
+    sidecar_db="$sidecar_root/live/codex-state.db"
+    sidecar_fifo="$sidecar_root/writer.fifo"
+    mkfifo "$sidecar_fifo"
+    sqlite3 "$sidecar_db" < "$sidecar_fifo" >"$sidecar_root/writer.log" 2>&1 &
+    sidecar_writer=$!
+    exec 7>"$sidecar_fifo"
+    printf '%s\n' \
+        'PRAGMA journal_mode=WAL;' \
+        'PRAGMA wal_autocheckpoint=0;' \
+        'CREATE TABLE smoke (value TEXT);' \
+        'BEGIN IMMEDIATE;' \
+        'INSERT INTO smoke VALUES ("committed in WAL");' \
+        'COMMIT;' >&7
+    for attempt in {1..20}; do
+        [[ -f "$sidecar_db-wal" && -f "$sidecar_db-shm" ]] && break
+        sleep 0.05
+    done
+    [[ -f "$sidecar_db-wal" && -f "$sidecar_db-shm" ]] ||
+        fail "SQLite writer did not create WAL/SHM sidecars"
+    sidecar_archive="$sidecar_root/sync/codex-g0000000001-sidecars.tar.zst"
+    make_fixture_archive "$sidecar_root/live" "$sidecar_archive"
+    sidecar_archive_hash="$(sha256sum "$sidecar_archive" | awk '{print $1}')"
+    sidecar_state_hash="$(fixture_state_hash "$sidecar_root/live")"
+    sidecar_main_hash="$(sha256sum "$sidecar_db" | awk '{print $1}')"
+    sidecar_wal_hash="$(sha256sum "$sidecar_db-wal" | awk '{print $1}')"
+    sidecar_shm_hash="$(sha256sum "$sidecar_db-shm" | awk '{print $1}')"
+    exec 7>&-
+    wait "$sidecar_writer"
+    rm -f -- "$sidecar_fifo"
+    printf '%s\n' "$sidecar_archive_hash" > "$sidecar_archive.sha256"
+    {
+        printf 'format=1\ngeneration=1\nsha256=%s\n' "$sidecar_state_hash"
+        printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
+            "$(basename "$sidecar_archive")"
+    } > "$sidecar_archive.state"
+    run_isolated "$sidecar_root" "$PULL_COMMAND" --force 1 >/dev/null
+    [[ -f "$sidecar_root/live/codex-state.db-wal" &&
+       -f "$sidecar_root/live/codex-state.db-shm" ]] ||
+        fail "SQLite WAL/SHM sidecars did not survive restore"
+    [[ "$(sha256sum "$sidecar_root/live/codex-state.db" | awk '{print $1}')" == \
+       "$sidecar_main_hash" &&
+       "$(sha256sum "$sidecar_root/live/codex-state.db-wal" | awk '{print $1}')" == \
+       "$sidecar_wal_hash" &&
+       "$(sha256sum "$sidecar_root/live/codex-state.db-shm" | awk '{print $1}')" == \
+       "$sidecar_shm_hash" ]] ||
+        fail "SQLite main/WAL/SHM bytes changed during restore"
+    sidecar_no_change="$(run_isolated "$sidecar_root" "$PULL_COMMAND")"
+    assert_contains "$sidecar_no_change" "No changes"
+    [[ "$(fixture_state_hash "$sidecar_root/live")" == "$sidecar_state_hash" ]] ||
+        fail "restored SQLite state hash differs from snapshot hash"
+    sidecar_query_root="$TEST_ROOT/sidecar-query"
+    mkdir -p "$sidecar_query_root"
+    cp -- "$sidecar_root/live/codex-state.db" \
+        "$sidecar_root/live/codex-state.db-wal" \
+        "$sidecar_root/live/codex-state.db-shm" "$sidecar_query_root/"
+    [[ "$(sqlite3 "$sidecar_query_root/codex-state.db" \
+        'SELECT value FROM smoke;')" == 'committed in WAL' ]] ||
+        fail "restored SQLite state did not include committed WAL contents"
+    pass "non-.sqlite databases are validated and live WAL/SHM state survives restore"
+
+    nonmutating_root="$TEST_ROOT/nonmutating"
+    mkdir -p "$nonmutating_root/live" "$nonmutating_root/home" \
+        "$nonmutating_root/sync"
+    printf 'must survive validation failures\n' > "$nonmutating_root/live/payload"
+    nonmutating_archive='codex-g0000000001-invalid.tar.zst'
+    printf 'not a compressed archive\n' > \
+        "$nonmutating_root/sync/$nonmutating_archive"
+    nonmutating_archive_hash="$(sha256sum \
+        "$nonmutating_root/sync/$nonmutating_archive" | awk '{print $1}')"
+    printf '%s\n' "$nonmutating_archive_hash" > \
+        "$nonmutating_root/sync/$nonmutating_archive.sha256"
+    {
+        printf 'format=1\ngeneration=1\nsha256=%s\n' "$generation_one_hash"
+        printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
+            "$nonmutating_archive"
+    } > "$nonmutating_root/sync/$nonmutating_archive.state"
+    if run_isolated "$nonmutating_root" "$PULL_COMMAND" --force 1 \
+        >"$nonmutating_root/bad-archive.log" 2>&1; then
+        fail "forced pull accepted malformed archive"
+    fi
+    [[ "$(<"$nonmutating_root/live/payload")" == \
+       'must survive validation failures' ]] ||
+        fail "malformed archive changed live state"
+
+    make_fixture_archive "$nonmutating_root/live" \
+        "$nonmutating_root/sync/codex-g0000000002-hash.tar.zst"
+    hash_archive="$nonmutating_root/sync/codex-g0000000002-hash.tar.zst"
+    sha256sum "$hash_archive" | awk '{print $1}' > "$hash_archive.sha256"
+    {
+        printf 'format=1\ngeneration=2\nsha256=%s\n' "$incomplete_hash"
+        printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
+            "$(basename "$hash_archive")"
+    } > "$hash_archive.state"
+    if run_isolated "$nonmutating_root" "$PULL_COMMAND" --force 2 \
+        >"$nonmutating_root/hash.log" 2>&1; then
+        fail "forced pull accepted restored hash mismatch"
+    fi
+    assert_contains "$(<"$nonmutating_root/hash.log")" \
+        "Restored state hash does not match"
+    [[ "$(<"$nonmutating_root/live/payload")" == \
+       'must survive validation failures' ]] ||
+        fail "restored hash mismatch changed live state"
+    pass "bad archives and restored hash mismatches are nonmutating"
+
+    rollback_root="$TEST_ROOT/rollback"
+    mkdir -p "$rollback_root/live" "$rollback_root/home" "$rollback_root/sync"
+    printf 'rollback original\n' > "$rollback_root/live/payload"
+    rollback_source="$TEST_ROOT/rollback-source"
+    mkdir -p "$rollback_source"
+    printf 'rollback restored\n' > "$rollback_source/payload"
+    rollback_archive="$rollback_root/sync/codex-g0000000001-rollback.tar.zst"
+    make_fixture_archive "$rollback_source" "$rollback_archive"
+    rollback_archive_hash="$(sha256sum "$rollback_archive" | awk '{print $1}')"
+    rollback_state_hash="$(fixture_state_hash "$rollback_source")"
+    printf '%s\n' "$rollback_archive_hash" > "$rollback_archive.sha256"
+    {
+        printf 'format=1\ngeneration=1\nsha256=%s\n' "$rollback_state_hash"
+        printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
+            "$(basename "$rollback_archive")"
+    } > "$rollback_archive.state"
+
+    rollback_bin="$TEST_ROOT/rollback-bin"
+    mkdir -p "$rollback_bin"
+    rollback_mv="$rollback_bin/mv"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'if [[ "${2:-}" == */content && "${3:-}" == "'$rollback_root'/live" ]]; then' \
+        '    exit 1' \
+        'fi' \
+        'exec /bin/mv "$@"' > "$rollback_mv"
+    chmod 755 "$rollback_mv"
+    if PATH="$rollback_bin:$PATH" run_isolated "$rollback_root" "$PULL_COMMAND" --force 1 \
+        >"$rollback_root/success.log" 2>&1; then
+        fail "pull unexpectedly succeeded after mocked install failure"
+    fi
+    rollback_success_log="$(<"$rollback_root/success.log")"
+    assert_contains "$rollback_success_log" "rollback"
+    assert_contains "$rollback_success_log" "$rollback_root/live.backup-"
+    [[ "$(<"$rollback_root/live/payload")" == 'rollback original' ]] ||
+        fail "successful rollback did not preserve original live state"
+
+    rollback_fail_bin="$TEST_ROOT/rollback-fail-bin"
+    mkdir -p "$rollback_fail_bin"
+    rollback_mv_fail="$rollback_fail_bin/mv"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'if [[ "${2:-}" == */content && "${3:-}" == "'$rollback_root'/live" ]]; then' \
+        '    exit 1' \
+        'fi' \
+        'if [[ "${2:-}" == "'$rollback_root'/live.backup-"* && "${3:-}" == "'$rollback_root'/live" ]]; then' \
+        '    exit 1' \
+        'fi' \
+        'exec /bin/mv "$@"' > "$rollback_mv_fail"
+    chmod 755 "$rollback_mv_fail"
+    # A fresh live directory is required because the previous case restored it.
+    printf 'rollback original 2\n' > "$rollback_root/live/payload"
+    if PATH="$rollback_fail_bin:$PATH" run_isolated "$rollback_root" "$PULL_COMMAND" --force 1 \
+        >"$rollback_root/failure.log" 2>&1; then
+        fail "pull unexpectedly succeeded after mocked install and rollback failure"
+    fi
+    rollback_failure_log="$(<"$rollback_root/failure.log")"
+    assert_contains "$rollback_failure_log" "rollback"
+    assert_contains "$rollback_failure_log" "$rollback_root/live.backup-"
+    pass "install failure reports backup and rollback outcome"
 else
     printf 'skip - snapshot integration (CODEX_TEST_SKIP_SYNC=1)\n'
 fi
