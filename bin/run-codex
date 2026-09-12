@@ -92,8 +92,12 @@ Usage:
   run-codex PROJECT [--lane LANE] --force-state GENERATION
   run-codex PROJECT --set profile generic|cuda
   run-codex PROJECT --set clojure-mcp auto|on|off
+  run-codex PROJECT --set model MODEL
+  run-codex PROJECT --set reasoning minimal|low|medium|high|xhigh
   run-codex PROJECT --lane LANE --set profile generic|cuda
   run-codex PROJECT --lane LANE --set clojure-mcp auto|on|off
+  run-codex PROJECT --lane LANE --set model MODEL
+  run-codex PROJECT --lane LANE --set reasoning minimal|low|medium|high|xhigh
   run-codex --doctor [PROJECT]
   run-codex --list
 
@@ -513,6 +517,18 @@ normalize_clojure_mcp_setting() {
     esac
 }
 
+validate_codex_model() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*$ ]] ||
+        die "Invalid Codex model '$1'"
+}
+
+validate_codex_reasoning() {
+    case "$1" in
+        minimal|low|medium|high|xhigh) ;;
+        *) die "Invalid Codex reasoning effort '$1'. Supported values: minimal, low, medium, high, xhigh" ;;
+    esac
+}
+
 CODEX_FORWARD_ARGS=()
 CODEX_IMAGE_REQUESTS=()
 CODEX_INITIAL_PROMPT=""
@@ -548,18 +564,14 @@ add_codex_option() {
             ;;
         model=*)
             value="${option#model=}"
-            [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*$ ]] ||
-                die "Invalid Codex model '$value'"
+            validate_codex_model "$value"
             ! $CODEX_MODEL_SET || die "Codex option 'model' may be specified only once"
             CODEX_MODEL_SET=true
             CODEX_FORWARD_ARGS+=(--model "$value")
             ;;
         reasoning=*)
             value="${option#reasoning=}"
-            case "$value" in
-                minimal|low|medium|high|xhigh) ;;
-                *) die "Invalid Codex reasoning effort '$value'. Supported values: minimal, low, medium, high, xhigh" ;;
-            esac
+            validate_codex_reasoning "$value"
             ! $CODEX_REASONING_SET ||
                 die "Codex option 'reasoning' may be specified only once"
             CODEX_REASONING_SET=true
@@ -924,6 +936,8 @@ inspect_git_layout() {
 CONFIG_PATH=""
 CONFIG_PROFILE=""
 CONFIG_CLOJURE_MCP=""
+CONFIG_MODEL=""
+CONFIG_REASONING=""
 CONFIG_LANE="default"
 CONFIG_STATE_MODE="legacy-global"
 CONFIG_AGENT="codex"
@@ -945,6 +959,8 @@ read_project_config() {
     local path=""
     local profile=""
     local clojure_mcp=""
+    local model=""
+    local reasoning=""
     local lane=""
     local state_mode=""
     local agent=""
@@ -969,6 +985,12 @@ read_project_config() {
                     ;;
                 clojure_mcp=*)
                     clojure_mcp="${line#clojure_mcp=}"
+                    ;;
+                model=*)
+                    model="${line#model=}"
+                    ;;
+                reasoning=*)
+                    reasoning="${line#reasoning=}"
                     ;;
                 lane=*)
                     lane="${line#lane=}"
@@ -996,6 +1018,8 @@ read_project_config() {
     agent="${agent:-codex}"
     validate_profile "$profile"
     validate_clojure_mcp_setting "$clojure_mcp"
+    [[ -z "$model" ]] || validate_codex_model "$model"
+    [[ -z "$reasoning" ]] || validate_codex_reasoning "$reasoning"
     validate_lane_name "$lane"
     case "$state_mode" in
         isolated|legacy-global) ;;
@@ -1009,6 +1033,8 @@ read_project_config() {
     CONFIG_PATH="$path"
     CONFIG_PROFILE="$profile"
     CONFIG_CLOJURE_MCP="$clojure_mcp"
+    CONFIG_MODEL="$model"
+    CONFIG_REASONING="$reasoning"
     CONFIG_LANE="$lane"
     CONFIG_STATE_MODE="$state_mode"
     CONFIG_AGENT="$agent"
@@ -1022,6 +1048,8 @@ write_project_config() {
     local clojure_mcp="$5"
     local state_mode="${6:-isolated}"
     local agent="${7:-codex}"
+    local model="${8:-}"
+    local reasoning="${9:-}"
     local file
     file="$(registry_file_for "$name" "$lane")"
     local tmp="$file.tmp.$$"
@@ -1030,6 +1058,8 @@ write_project_config() {
     validate_lane_name "$lane"
     validate_profile "$profile"
     validate_clojure_mcp_setting "$clojure_mcp"
+    [[ -z "$model" ]] || validate_codex_model "$model"
+    [[ -z "$reasoning" ]] || validate_codex_reasoning "$reasoning"
     [[ "$state_mode" == isolated || "$state_mode" == legacy-global ]] ||
         die "Invalid lane state mode '$state_mode'"
     [[ "$agent" == codex ]] || die "Unsupported agent adapter '$agent'"
@@ -1040,12 +1070,78 @@ write_project_config() {
         printf 'path=%s\n' "$path"
         printf 'profile=%s\n' "$profile"
         printf 'clojure_mcp=%s\n' "$clojure_mcp"
+        [[ -z "$model" ]] || printf 'model=%s\n' "$model"
+        [[ -z "$reasoning" ]] || printf 'reasoning=%s\n' "$reasoning"
         printf 'lane=%s\n' "$lane"
         printf 'state=%s\n' "$state_mode"
         printf 'agent=%s\n' "$agent"
     } > "$tmp"
 
     mv -- "$tmp" "$file"
+}
+
+provision_missing_review_lane() {
+    local name="$1"
+    local lane="$2"
+    local revision="$3"
+    local default_file lane_file default_root commit
+    local profile clojure_mcp agent managed_parent managed_path
+    local provision_lock provision_lock_fd
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    [[ "$lane" != default ]] || return 0
+    [[ -n "$revision" && "$revision" != -* &&
+       "$revision" != *$'\n'* && "$revision" != *$'\r'* ]] ||
+        die "--review requires a valid Git revision"
+
+    lane_file="$(registry_file_for "$name" "$lane")"
+    [[ ! -f "$lane_file" ]] || return 0
+
+    default_file="$(registry_file_for "$name" default)"
+    [[ -f "$default_file" ]] || print_missing_project_help "$name"
+    read_project_config "$default_file"
+    [[ "$CONFIG_LANE" == default ]] ||
+        die "Lane config identity mismatch in $default_file"
+    default_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Default lane for project '$name' is no longer a Git repository: $CONFIG_PATH"
+    [[ "$default_root" == "$CONFIG_PATH" ]] ||
+        die "Registered path for '$name' is not its Git repository root: $CONFIG_PATH"
+    commit="$(
+        git -C "$default_root" rev-parse --verify "${revision}^{commit}" 2>/dev/null
+    )" || die "Review revision is not a commit in project '$name': $revision"
+
+    profile="$CONFIG_PROFILE"
+    clojure_mcp="$CONFIG_CLOJURE_MCP"
+    agent="$CONFIG_AGENT"
+    managed_parent="$(realpath -m -- "$CONFIG_ROOT/worktrees/$name")" ||
+        die "Cannot resolve managed review worktree directory"
+    managed_path="$managed_parent/$lane"
+    if [[ "$managed_path" == "$default_root" ||
+          "$managed_path" == "$default_root/"* ||
+          "$default_root" == "$managed_path/"* ]]; then
+        die "Managed review worktree path overlaps the default checkout: $managed_path"
+    fi
+    provision_lock="$CONFIG_ROOT/locks/$name/$lane.provision.lock"
+    mkdir -p -- "$(dirname -- "$provision_lock")"
+    exec {provision_lock_fd}>"$provision_lock"
+    flock -x "$provision_lock_fd"
+
+    # Another launcher may have completed provisioning while this invocation
+    # waited for the project/lane provisioning lock.
+    if [[ -f "$lane_file" ]]; then
+        exec {provision_lock_fd}>&-
+        return 0
+    fi
+    [[ ! -e "$managed_path" && ! -L "$managed_path" ]] ||
+        die "Managed review worktree path already exists without a lane registration: $managed_path"
+
+    mkdir -p -- "$managed_parent"
+    echo "Creating managed review lane '$lane' at $managed_path" >&2
+    git -C "$default_root" worktree add --detach "$managed_path" "$commit" >&2
+    write_project_config "$name" "$lane" "$managed_path" "$profile" \
+        "$clojure_mcp" isolated "$agent"
+    exec {provision_lock_fd}>&-
 }
 
 FOUND_PROJECT=""
@@ -1342,7 +1438,7 @@ rebind_project() {
     local requested_path="${2:-$PWD}"
     local lane="${3:-default}"
     local file
-    local path root profile clojure_mcp state_mode agent
+    local path root profile clojure_mcp model reasoning state_mode agent
     local candidate_git_layout candidate_git_common_dir default_file default_root
     local lane_file lane_root restore_nullglob=false
 
@@ -1357,6 +1453,8 @@ rebind_project() {
     read_project_config "$file"
     profile="$CONFIG_PROFILE"
     clojure_mcp="$CONFIG_CLOJURE_MCP"
+    model="$CONFIG_MODEL"
+    reasoning="$CONFIG_REASONING"
     state_mode="$CONFIG_STATE_MODE"
     agent="$CONFIG_AGENT"
 
@@ -1409,7 +1507,8 @@ rebind_project() {
         die "$root is already registered as project '$FOUND_PROJECT' lane '$FOUND_LANE'"
     fi
 
-    write_project_config "$name" "$lane" "$root" "$profile" "$clojure_mcp" "$state_mode" "$agent"
+    write_project_config "$name" "$lane" "$root" "$profile" "$clojure_mcp" \
+        "$state_mode" "$agent" "$model" "$reasoning"
 
     echo "Rebound project '$name' lane '$lane':"
     echo "  path:        $root"
@@ -1431,7 +1530,8 @@ set_profile() {
 
     read_project_config "$file"
     write_project_config "$name" "$lane" "$CONFIG_PATH" "$profile" \
-        "$CONFIG_CLOJURE_MCP" "$CONFIG_STATE_MODE" "$CONFIG_AGENT"
+        "$CONFIG_CLOJURE_MCP" "$CONFIG_STATE_MODE" "$CONFIG_AGENT" \
+        "$CONFIG_MODEL" "$CONFIG_REASONING"
 
     echo "Project '$name' lane '$lane' now uses profile '$profile':"
     echo "  $(profile_image "$profile")"
@@ -1451,9 +1551,50 @@ set_clojure_mcp() {
 
     read_project_config "$file"
     write_project_config "$name" "$lane" "$CONFIG_PATH" "$CONFIG_PROFILE" \
-        "$clojure_mcp" "$CONFIG_STATE_MODE" "$CONFIG_AGENT"
+        "$clojure_mcp" "$CONFIG_STATE_MODE" "$CONFIG_AGENT" \
+        "$CONFIG_MODEL" "$CONFIG_REASONING"
 
     echo "Project '$name' lane '$lane' now uses Clojure MCP setting '$clojure_mcp'."
+}
+
+set_model() {
+    local name="$1"
+    local lane="$2"
+    local model="$3"
+    local file
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    validate_codex_model "$model"
+    file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$file" ]] || die "Project '$name' is not registered"
+
+    read_project_config "$file"
+    write_project_config "$name" "$lane" "$CONFIG_PATH" "$CONFIG_PROFILE" \
+        "$CONFIG_CLOJURE_MCP" "$CONFIG_STATE_MODE" "$CONFIG_AGENT" \
+        "$model" "$CONFIG_REASONING"
+
+    echo "Project '$name' lane '$lane' now uses Codex model '$model'."
+}
+
+set_reasoning() {
+    local name="$1"
+    local lane="$2"
+    local reasoning="$3"
+    local file
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    validate_codex_reasoning "$reasoning"
+    file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$file" ]] || die "Project '$name' is not registered"
+
+    read_project_config "$file"
+    write_project_config "$name" "$lane" "$CONFIG_PATH" "$CONFIG_PROFILE" \
+        "$CONFIG_CLOJURE_MCP" "$CONFIG_STATE_MODE" "$CONFIG_AGENT" \
+        "$CONFIG_MODEL" "$reasoning"
+
+    echo "Project '$name' lane '$lane' now uses Codex reasoning effort '$reasoning'."
 }
 
 set_project_value() {
@@ -1465,15 +1606,17 @@ set_project_value() {
     case "$key" in
         profile) set_profile "$name" "$lane" "$value" ;;
         clojure-mcp) set_clojure_mcp "$name" "$lane" "$value" ;;
-        *) die "Unknown project setting '$key'. Supported settings: profile, clojure-mcp" ;;
+        model) set_model "$name" "$lane" "$value" ;;
+        reasoning) set_reasoning "$name" "$lane" "$value" ;;
+        *) die "Unknown project setting '$key'. Supported settings: profile, clojure-mcp, model, reasoning" ;;
     esac
 }
 
 list_projects() {
     mkdir -p "$PROJECTS_DIR"
 
-    printf '%-20s %-16s %-10s %-12s %-10s %s\n' \
-        "PROJECT" "LANE" "PROFILE" "CLOJURE-MCP" "STATUS" "PATH"
+    printf '%-20s %-16s %-10s %-12s %-24s %-10s %-10s %s\n' \
+        "PROJECT" "LANE" "PROFILE" "CLOJURE-MCP" "MODEL" "REASONING" "STATUS" "PATH"
 
     local restore_nullglob=false
     if ! shopt -q nullglob; then
@@ -1490,7 +1633,7 @@ list_projects() {
         return 0
     fi
 
-    local file name lane path profile clojure_mcp status actual_root
+    local file name lane path profile clojure_mcp model reasoning status actual_root
 
     for file in "${files[@]}"; do
         [[ -f "$file" ]] || continue
@@ -1507,6 +1650,8 @@ list_projects() {
         path="$CONFIG_PATH"
         profile="$CONFIG_PROFILE"
         clojure_mcp="$CONFIG_CLOJURE_MCP"
+        model="${CONFIG_MODEL:--}"
+        reasoning="${CONFIG_REASONING:--}"
 
         if [[ ! -d "$path" ]]; then
             status="MISSING"
@@ -1516,8 +1661,9 @@ list_projects() {
             status="NOT-GIT"
         fi
 
-        printf '%-20s %-16s %-10s %-12s %-10s %s\n' \
-            "$name" "$lane" "$profile" "$clojure_mcp" "$status" "$path"
+        printf '%-20s %-16s %-10s %-12s %-24s %-10s %-10s %s\n' \
+            "$name" "$lane" "$profile" "$clojure_mcp" "$model" \
+            "$reasoning" "$status" "$path"
     done
 }
 
@@ -1552,6 +1698,8 @@ RESOLVED_NAME=""
 RESOLVED_PATH=""
 RESOLVED_PROFILE=""
 RESOLVED_CLOJURE_MCP=""
+RESOLVED_MODEL=""
+RESOLVED_REASONING=""
 RESOLVED_LANE="default"
 RESOLVED_STATE_MODE="legacy-global"
 RESOLVED_AGENT="codex"
@@ -1562,7 +1710,8 @@ resolve_project() {
     local requested_name="${1:-}"
     local requested_lane="${2:-default}"
     local file root current_root name lane
-    local lane_profile lane_clojure_mcp lane_state_mode lane_agent
+    local lane_profile lane_clojure_mcp lane_model lane_reasoning
+    local lane_state_mode lane_agent
     local candidate_git_layout candidate_git_common_dir default_file default_root
 
     if [[ -n "$requested_name" ]]; then
@@ -1594,6 +1743,8 @@ resolve_project() {
 
         lane_profile="$CONFIG_PROFILE"
         lane_clojure_mcp="$CONFIG_CLOJURE_MCP"
+        lane_model="$CONFIG_MODEL"
+        lane_reasoning="$CONFIG_REASONING"
         lane_state_mode="$CONFIG_STATE_MODE"
         lane_agent="$CONFIG_AGENT"
         candidate_git_layout="$GIT_LAYOUT"
@@ -1614,6 +1765,8 @@ resolve_project() {
         RESOLVED_PATH="$root"
         RESOLVED_PROFILE="$lane_profile"
         RESOLVED_CLOJURE_MCP="$lane_clojure_mcp"
+        RESOLVED_MODEL="$lane_model"
+        RESOLVED_REASONING="$lane_reasoning"
         RESOLVED_LANE="$requested_lane"
         RESOLVED_STATE_MODE="$lane_state_mode"
         RESOLVED_AGENT="$lane_agent"
@@ -1658,6 +1811,8 @@ resolve_project() {
 
     lane_profile="$CONFIG_PROFILE"
     lane_clojure_mcp="$CONFIG_CLOJURE_MCP"
+    lane_model="$CONFIG_MODEL"
+    lane_reasoning="$CONFIG_REASONING"
     lane_state_mode="$CONFIG_STATE_MODE"
     lane_agent="$CONFIG_AGENT"
     candidate_git_layout="$GIT_LAYOUT"
@@ -1678,6 +1833,8 @@ resolve_project() {
     RESOLVED_PATH="$current_root"
     RESOLVED_PROFILE="$lane_profile"
     RESOLVED_CLOJURE_MCP="$lane_clojure_mcp"
+    RESOLVED_MODEL="$lane_model"
+    RESOLVED_REASONING="$lane_reasoning"
     RESOLVED_LANE="$lane"
     RESOLVED_STATE_MODE="$lane_state_mode"
     RESOLVED_AGENT="$lane_agent"
@@ -1725,10 +1882,10 @@ resolve_lane_codex_home() {
     esac
 }
 
-bootstrap_lane_codex_home() {
-    local project="$1"
-    local lane="$2"
-    local requested_source="$3"
+copy_codex_bootstrap_files() {
+    local requested_source="$1"
+    local destination_root="$2"
+    local require_empty="$3"
     local source file destination
     local restore_nullglob=false
     local inputs=()
@@ -1738,11 +1895,12 @@ bootstrap_lane_codex_home() {
 
     source="$(canonical_dir "$requested_source")" ||
         die "Codex bootstrap directory does not exist: $requested_source"
-    resolve_lane_codex_home "$project" "$lane" isolated
-    [[ "$source" != "$CODEX_HOST_HOME" ]] ||
+    [[ "$source" != "$destination_root" ]] ||
         die "Codex bootstrap source and destination must differ"
-    [[ -z "$(find "$CODEX_HOST_HOME" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
-        die "Refusing to bootstrap a non-empty lane Codex home: $CODEX_HOST_HOME"
+    if $require_empty; then
+        [[ -z "$(find "$destination_root" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+            die "Refusing to bootstrap a non-empty lane Codex home: $destination_root"
+    fi
 
     if ! shopt -q nullglob; then
         shopt -s nullglob
@@ -1761,12 +1919,50 @@ bootstrap_lane_codex_home() {
     done
     for file in "${inputs[@]}"; do
         [[ -f "$file" ]] || continue
-        destination="$CODEX_HOST_HOME/$(basename -- "$file")"
+        destination="$destination_root/$(basename -- "$file")"
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            [[ -f "$destination" && ! -L "$destination" ]] ||
+                die "Codex bootstrap destination must be a regular file, not a symlink: $destination"
+            $require_empty || continue
+        fi
         install -m 0600 -- "$file" "$destination"
     done
     if $restore_nullglob; then
         shopt -u nullglob
     fi
+}
+
+bootstrap_lane_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local requested_source="$3"
+
+    resolve_lane_codex_home "$project" "$lane" isolated
+    copy_codex_bootstrap_files "$requested_source" "$CODEX_HOST_HOME" true
+}
+
+seed_managed_review_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local default_file lane_file default_state_mode default_codex_home
+    local managed_parent managed_path
+
+    default_file="$(registry_file_for "$project" default)"
+    lane_file="$(registry_file_for "$project" "$lane")"
+    [[ -f "$default_file" && -f "$lane_file" ]] || return 0
+
+    read_project_config "$default_file"
+    default_state_mode="$CONFIG_STATE_MODE"
+    read_project_config "$lane_file"
+    managed_parent="$(realpath -m -- "$CONFIG_ROOT/worktrees/$project")" ||
+        die "Cannot resolve managed review worktree directory"
+    managed_path="$managed_parent/$lane"
+    [[ "$CONFIG_PATH" == "$managed_path" ]] || return 0
+
+    resolve_lane_codex_home "$project" default "$default_state_mode"
+    default_codex_home="$CODEX_HOST_HOME"
+    resolve_lane_codex_home "$project" "$lane" isolated
+    copy_codex_bootstrap_files "$default_codex_home" "$CODEX_HOST_HOME" false
 }
 
 run_lane_state_sync() {
@@ -2147,13 +2343,13 @@ case "${1:-}" in
     *)
         if (($# >= 2)) && [[ "$2" == --set ]]; then
             (($# == 4)) ||
-                die "Usage: run-codex PROJECT --set profile|clojure-mcp VALUE"
+                die "Usage: run-codex PROJECT --set profile|clojure-mcp|model|reasoning VALUE"
             set_project_value "$1" default "$3" "$4"
             exit 0
         fi
         if (($# >= 4)) && [[ "$2" == --lane && "$4" == --set ]]; then
             (($# == 6)) ||
-                die "Usage: run-codex PROJECT --lane LANE --set profile|clojure-mcp VALUE"
+                die "Usage: run-codex PROJECT --lane LANE --set profile|clojure-mcp|model|reasoning VALUE"
             set_project_value "$1" "$3" "$5" "$6"
             exit 0
         fi
@@ -2224,6 +2420,12 @@ fi
 # on a new machine whose Docker setup is not complete yet.
 need git
 need realpath
+if $REVIEW_REVISION_SET && $LANE_SET && [[ "$LANE" != default ]] &&
+   [[ -n "$PROJECT" ]]; then
+    need flock
+    provision_missing_review_lane "$PROJECT" "$LANE" "$REVIEW_REVISION"
+    seed_managed_review_codex_home "$PROJECT" "$LANE"
+fi
 resolve_project "$PROJECT" "$LANE"
 
 PROJECT="$RESOLVED_NAME"
@@ -2795,6 +2997,12 @@ else
         session_args+=(resume "$RESOLVED_SESSION_ID")
     elif ! $NEW_SESSION; then
         session_args+=(resume --last)
+    fi
+    if ! $CODEX_MODEL_SET && [[ -n "$RESOLVED_MODEL" ]]; then
+        session_args+=(--model "$RESOLVED_MODEL")
+    fi
+    if ! $CODEX_REASONING_SET && [[ -n "$RESOLVED_REASONING" ]]; then
+        session_args+=(-c "model_reasoning_effort=\"$RESOLVED_REASONING\"")
     fi
     session_args+=("${CODEX_FORWARD_ARGS[@]}")
     if $CODEX_PROMPT_SET; then

@@ -1109,6 +1109,77 @@ assert_contains "$init_again_output" "already initialized"
 [[ "$(<"$project_config")" == "$config_before" ]] ||
     fail "repeated project initialization changed its configuration"
 
+default_review_codex_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/codex-home"
+mkdir -p -- "$default_review_codex_home"
+printf '%s\n' '{"token":"default-lane-fixture"}' \
+    > "$default_review_codex_home/auth.json"
+printf '%s\n' 'approval_policy = "on-request"' \
+    > "$default_review_codex_home/config.toml"
+printf '%s\n' 'must-not-copy' > "$default_review_codex_home/history.jsonl"
+
+managed_review_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --lane auto-review --review HEAD 2>&1
+)"
+managed_review_path="$TEST_ROOT/launcher-config/run-codex/worktrees/smoke-project/auto-review"
+managed_review_config="$TEST_ROOT/launcher-config/run-codex/lanes/smoke-project/auto-review"
+managed_review_codex_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/auto-review/codex-home"
+assert_contains "$managed_review_output" "Creating managed review lane 'auto-review'"
+assert_contains "$managed_review_output" \
+    "Starting codex reviewer for 'smoke-project' lane 'auto-review'"
+grep -Fxq "path=$managed_review_path" "$managed_review_config" &&
+    grep -Fxq 'profile=generic' "$managed_review_config" &&
+    grep -Fxq 'clojure_mcp=auto' "$managed_review_config" &&
+    grep -Fxq 'state=isolated' "$managed_review_config" ||
+    fail "automatic review lane registration is incomplete"
+grep -Fxq '{"token":"default-lane-fixture"}' \
+    "$managed_review_codex_home/auth.json" &&
+    grep -Fxq 'approval_policy = "on-request"' \
+        "$managed_review_codex_home/config.toml" ||
+    fail "automatic review lane omitted allowlisted Codex login/config state"
+[[ "$(stat -c '%a' "$managed_review_codex_home/auth.json")" == 600 ]] ||
+    fail "automatic review lane did not make authentication state private"
+[[ ! -e "$managed_review_codex_home/history.jsonl" ]] ||
+    fail "automatic review lane copied Codex session history"
+[[ "$(git -C "$managed_review_path" rev-parse HEAD)" == \
+   "$(git -C "$TEST_ROOT/repo" rev-parse HEAD)" ]] ||
+    fail "automatic review lane did not check out the requested commit"
+managed_review_config_before="$(<"$managed_review_config")"
+rm -- "$managed_review_codex_home/auth.json"
+printf '%s\n' 'preserve-runtime-state' \
+    > "$managed_review_codex_home/runtime-marker"
+managed_review_reuse_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --lane auto-review --review HEAD
+)"
+assert_contains "$managed_review_reuse_output" \
+    "Starting codex reviewer for 'smoke-project' lane 'auto-review'"
+[[ "$(<"$managed_review_config")" == "$managed_review_config_before" ]] ||
+    fail "reusing an automatic review lane rewrote its registration"
+grep -Fxq '{"token":"default-lane-fixture"}' \
+    "$managed_review_codex_home/auth.json" ||
+    fail "reused automatic review lane did not restore missing authentication state"
+grep -Fxq 'preserve-runtime-state' "$managed_review_codex_home/runtime-marker" ||
+    fail "seeding a reused automatic review lane replaced unrelated state"
+
+managed_conflict_path="$TEST_ROOT/launcher-config/run-codex/worktrees/smoke-project/conflict-review"
+mkdir -p -- "$managed_conflict_path"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --lane conflict-review --review HEAD \
+    >"$TEST_ROOT/managed-review-conflict.out" 2>&1; then
+    fail "automatic review lane accepted a conflicting managed path"
+fi
+grep -Fq "Managed review worktree path already exists" \
+    "$TEST_ROOT/managed-review-conflict.out" ||
+    fail "automatic review lane path conflict was not useful"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --lane missing-non-review --new \
+    >"$TEST_ROOT/missing-non-review-lane.out" 2>&1; then
+    fail "non-review launch automatically created a missing lane"
+fi
+[[ ! -e "$TEST_ROOT/launcher-config/run-codex/lanes/smoke-project/missing-non-review" ]] ||
+    fail "non-review launch registered a missing lane"
+
 git -C "$TEST_ROOT/repo" worktree add -q -b smoke-review \
     "$TEST_ROOT/repo-review"
 review_init_output="$(
@@ -1127,6 +1198,17 @@ grep -Fxq 'profile=cuda' "$review_config" ||
     fail "lane-specific profile setter did not update the selected lane"
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     smoke-project --lane review --set profile generic >/dev/null
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set model gpt-5.6-sol >/dev/null
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set reasoning high >/dev/null
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set profile cuda >/dev/null
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set profile generic >/dev/null
+grep -Fxq 'model=gpt-5.6-sol' "$review_config" &&
+    grep -Fxq 'reasoning=high' "$review_config" ||
+    fail "lane-specific Codex presets were not persisted"
 mkdir -p "$TEST_ROOT/unrelated-lane-repo"
 git -C "$TEST_ROOT/unrelated-lane-repo" init -q
 if "${launcher_env[@]}" "$ROOT/bin/run-codex" --init --lane unrelated \
@@ -1150,13 +1232,34 @@ lane_list_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --list)"
 assert_contains "$lane_list_output" "smoke-project"
 assert_contains "$lane_list_output" "review"
 assert_contains "$lane_list_output" "$TEST_ROOT/repo-review"
+assert_contains "$lane_list_output" "MODEL"
+assert_contains "$lane_list_output" "REASONING"
+assert_contains "$lane_list_output" "gpt-5.6-sol"
+assert_contains "$lane_list_output" "high"
+
+review_preset_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --lane review --new
+)"
+assert_contains "$review_preset_output" "--model gpt-5.6-sol"
+assert_contains "$review_preset_output" 'model_reasoning_effort="high"'
+default_preset_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new
+)"
+assert_not_contains "$default_preset_output" "--model gpt-5.6-sol"
+assert_not_contains "$default_preset_output" 'model_reasoning_effort="high"'
 
 review_output="$(
     "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
-        --lane review --review HEAD --codex-option model=gpt-5.6-sol
+        --lane review --review HEAD \
+        --codex-option model=gpt-5.6-terra \
+        --codex-option reasoning=low
 )"
 assert_contains "$review_output" "Starting codex reviewer for 'smoke-project' lane 'review'"
-assert_contains "$review_output" "--model gpt-5.6-sol"
+assert_contains "$review_output" "--model gpt-5.6-terra"
+assert_contains "$review_output" 'model_reasoning_effort="low"'
+assert_not_contains "$review_output" "--model gpt-5.6-sol"
+assert_not_contains "$review_output" 'model_reasoning_effort="high"'
 assert_contains "$review_output" "Review immutable Git commit"
 assert_contains "$review_output" "codex-universal.project=smoke-project"
 assert_contains "$review_output" "codex-universal.lane=review"
@@ -1175,6 +1278,8 @@ list_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --list)"
 assert_contains "$list_output" "smoke-project"
 assert_contains "$list_output" "generic"
 assert_contains "$list_output" "CLOJURE-MCP"
+assert_contains "$list_output" "MODEL"
+assert_contains "$list_output" "REASONING"
 assert_contains "$list_output" "auto"
 assert_contains "$list_output" "OK"
 
@@ -1753,14 +1858,26 @@ if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     plain-project --set unknown value >"$set_error" 2>&1; then
     fail "project setter accepted an unknown setting"
 fi
-grep -Fq "Supported settings: profile, clojure-mcp" "$set_error" ||
+grep -Fq "Supported settings: profile, clojure-mcp, model, reasoning" "$set_error" ||
     fail "unknown project setting error does not list supported settings"
 if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     plain-project --set profile >"$set_error" 2>&1; then
     fail "project setter accepted a missing value"
 fi
-grep -Fq "Usage: run-codex PROJECT --set profile|clojure-mcp VALUE" \
+grep -Fq "Usage: run-codex PROJECT --set profile|clojure-mcp|model|reasoning VALUE" \
     "$set_error" || fail "project setter arity error is not useful"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set model '../unsafe' >"$set_error" 2>&1; then
+    fail "project setter accepted an invalid Codex model"
+fi
+grep -Fq "Invalid Codex model '../unsafe'" "$set_error" ||
+    fail "invalid persistent model error is not useful"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set reasoning extreme >"$set_error" 2>&1; then
+    fail "project setter accepted an invalid reasoning effort"
+fi
+grep -Fq "Supported values: minimal, low, medium, high, xhigh" "$set_error" ||
+    fail "invalid persistent reasoning error is not useful"
 
 plain_env_output="$(
     "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=1 \
@@ -1851,12 +1968,27 @@ printf 'path=%s\nprofile=generic\n' "$TEST_ROOT/legacy-repo" > "$legacy_config"
 legacy_before="$(<"$legacy_config")"
 legacy_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" legacy-project --new)"
 assert_not_contains "$legacy_output" "mcp_servers.clojure_lsp"
+assert_not_contains "$legacy_output" "--model"
+assert_not_contains "$legacy_output" "model_reasoning_effort"
 assert_contains "$legacy_output" \
     "Clojure MCP: disabled (no Clojure project signals detected)"
 assert_contains "$legacy_output" \
     "$TEST_ROOT/launcher-home/.codex:/home/codex/.codex"
 [[ "$(<"$legacy_config")" == "$legacy_before" ]] ||
     fail "launching rewrote a legacy project registration"
+
+mkdir -p "$TEST_ROOT/one-line-legacy-repo"
+git -C "$TEST_ROOT/one-line-legacy-repo" init -q
+one_line_legacy_config="$TEST_ROOT/launcher-config/run-codex/projects/one-line-legacy"
+printf '%s\n' "$TEST_ROOT/one-line-legacy-repo" > "$one_line_legacy_config"
+one_line_legacy_before="$(<"$one_line_legacy_config")"
+one_line_legacy_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" one-line-legacy --new
+)"
+assert_not_contains "$one_line_legacy_output" "--model"
+assert_not_contains "$one_line_legacy_output" "model_reasoning_effort"
+[[ "$(<"$one_line_legacy_config")" == "$one_line_legacy_before" ]] ||
+    fail "launching rewrote a one-line legacy project registration"
 
 # IDEA may terminate the attached ACP launcher abruptly. Verify that the host
 # launcher retains ownership of the container and removes its exact ID when

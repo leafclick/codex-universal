@@ -1251,12 +1251,24 @@ run-codex my-project --lane review --review owner-branch \
   --codex-option reasoning=high
 ```
 
-The launcher resolves the revision to a commit, refuses a default lane or a
-reviewer checkout with tracked changes, starts a fresh context, and supplies a
-read-only review task for that exact commit. `agent=codex` is the first trusted
-container adapter. The registry and Docker labels keep the adapter identity
-separate from the lane and reviewer role so a future hardened image can add a
-Claude adapter without changing the handoff or human-approval boundary.
+If the explicitly named non-default lane is not registered, `--review` creates
+a detached managed worktree for the resolved commit under
+`$XDG_CONFIG_HOME/run-codex/worktrees/PROJECT/LANE` (or the corresponding
+`~/.config` path), registers isolated lane state, and inherits the default
+lane's profile and Clojure MCP setting. It also seeds missing `auth.json`,
+`config.toml`, `requirements.toml`, and `*.config.toml` files from the default
+lane's Codex home with private permissions. Sessions, history, databases, and
+caches remain isolated. Existing lane registrations are never replaced, and a
+conflicting managed path is rejected rather than overwritten. Manual worktree
+registration remains available when an exact user-selected checkout path is
+required.
+
+The launcher refuses a default lane or a reviewer checkout with tracked
+changes, starts a fresh context, and supplies a read-only review task for that
+exact commit. `agent=codex` is the first trusted container adapter. The
+registry and Docker labels keep the adapter identity separate from the lane
+and reviewer role so a future hardened image can add a Claude adapter without
+changing the handoff or human-approval boundary.
 
 Lane state uses a separate snapshot namespace and local baseline. After
 stopping the selected lane, publish or restore it independently:
@@ -1355,10 +1367,12 @@ run-codex --list
 Example:
 
 ```text
-PROJECT              PROFILE    CLOJURE-MCP  STATUS     PATH
-my-project            cuda       auto         OK         /home/leafclick/src/my-project
-website              generic    off          OK         /home/leafclick/src/website
+PROJECT              LANE             PROFILE    CLOJURE-MCP  MODEL                    REASONING  STATUS     PATH
+my-project            default          cuda       auto         gpt-5.6-sol              high       OK         /home/leafclick/src/my-project
+website               default          generic    off          -                        -          OK         /home/leafclick/src/website
 ```
+
+Model and reasoning columns show `-` when a lane has no persistent preset.
 
 ## Diagnose a project environment
 
@@ -1420,6 +1434,23 @@ run-codex my-project --set clojure-mcp off
 The setting affects both terminal and IDEA modes. IDEA always keeps its
 integrated semantic MCP connection when enabled; a resolved `auto` or `on`
 setting adds `clojure_lsp` as a second provider.
+
+## Set persistent Codex model and reasoning presets
+
+Store terminal-session defaults in a project's selected lane:
+
+```bash
+run-codex my-project --set model gpt-5.6-sol
+run-codex my-project --set reasoning high
+run-codex my-project --lane review --set model gpt-5.6-terra
+run-codex my-project --lane review --set reasoning medium
+```
+
+The model uses the same identifier validation as `--codex-option model=...`.
+Reasoning accepts `minimal`, `low`, `medium`, `high`, or `xhigh`. Presets are
+lane-scoped: changing a review lane does not change the default lane. Registry
+entries written by older launchers remain valid and behave as if neither
+preset were configured.
 
 ## Move a checkout
 
@@ -1499,8 +1530,9 @@ run-codex my-project --new \
   --codex-option no-alt-screen
 ```
 
-Zero `--codex-option` occurrences keeps the normal defaults. Supported values
-are:
+Without a model or reasoning option, the selected lane's persistent preset is
+used when present. A one-shot `model=...` or `reasoning=...` value takes
+precedence over its corresponding persistent preset. Supported values are:
 
 | Value | Effect |
 | --- | --- |
