@@ -6,8 +6,8 @@ in `REVIEW-ARCHIVE.md`; current execution evidence and probe failures remain in
 `STATUS.md`.
 
 Issue 23 remains deferred. Issue 44 now has a substantial source implementation
-and remains in progress for live/multi-machine acceptance and the collaboration
-broker. See the
+and remains in progress for live/multi-machine acceptance and expansion of the
+local collaboration mailbox into a broker. See the
 [project isolation and cooperation plan](docs/project-isolation-plan.md) for
 scope, tradeoffs, migration, implementation phases, and acceptance gates.
 Checkout onboarding (including ignored configuration, completed templates, and
@@ -36,7 +36,7 @@ not a current handoff correctness defect.
 
 | ID | Type | Work item | Evidence | Status | Complexity | Reason |
 |---:|---|---|---|---|---|---|
-| 44 | New feature | Add project/lane isolation, independent state handoff, and cooperation between isolated agents. | SOURCE IMPLEMENTED (partial) | Local lanes now have distinct checkout/state/cache/container/lock identities, managed and adopted linked-worktree support, onboarding gates, contextual handoff markers, local exact-commit fast-forward result import, guarded managed-lane cleanup, and fixed-revision Codex review with independent model/context. Live second-machine acceptance, durable peer messaging, and a future Claude adapter remain. See `docs/project-isolation-plan.md`. | H, phased | Preserve the user's IDEA checkout while enabling independent experiments and cross-machine work. |
+| 44 | New feature | Add project/lane isolation, independent state handoff, and cooperation between isolated agents. | SOURCE IMPLEMENTED (partial) | Local lanes now have distinct checkout/state/cache/container/lock identities, managed and adopted linked-worktree support, onboarding gates, contextual handoff markers, local exact-commit fast-forward result import, guarded managed-lane cleanup, fixed-revision Codex review, and a bounded host-side mailbox with explicit delivery and acknowledgment. Live second-machine/image acceptance, cross-machine message brokering and wakeup, and a future Claude adapter remain. See `docs/project-isolation-plan.md`. | H, phased | Preserve the user's IDEA checkout while enabling independent experiments and cross-machine work. |
 
 ### Selective synchronization design gate
 
