@@ -10,10 +10,10 @@ no full-access mode.
 
 Both the generic Ubuntu and NVIDIA CUDA images include Codex, Java, Node.js,
 Clojure CLI, Leiningen, Git, and common build tools. Clojure projects also get
-native `bb`, `cljfmt`, `clj-kondo`, and `clojure-lsp`, plus a persistent local
-LSP-to-MCP bridge in terminal mode. Optional IntelliJ IDEA integration runs the
-same containerized Codex in JetBrains AI Chat and exposes a read-only view of
-the IDE's semantic tools.
+native `bb`, `cljfmt`, and `clj-kondo`, a Java-backed `clojure-lsp`, and a
+persistent local LSP-to-MCP bridge in terminal mode. Optional IntelliJ IDEA
+integration runs the same containerized Codex in JetBrains AI Chat and exposes
+a read-only view of the IDE's semantic tools.
 
 See the concise [change log](CHANGELOG.md) for release history.
 
@@ -353,7 +353,7 @@ repositories and some non-Clojure package channels are resolved at build time.
 Do not overwrite a published version tag, and use the registry digest when an
 exact image artifact must be selected.
 
-Stable system, Java, and core Clojure layers precede the native Clojure tools,
+Stable system, Java, and core Clojure layers precede the standalone Clojure tools,
 versioned Codex/ACP/LSP packages, and copied integration files. Updating an
 agent package version or an integration script therefore preserves the costly
 Java and core Clojure cache. Git-derived OCI labels are applied after every
@@ -406,7 +406,17 @@ Both image profiles install checksum-verified, pinned native releases of:
 - `bb` (Babashka)
 - `cljfmt`
 - `clj-kondo`
-- `clojure-lsp`
+
+They install the architecture-independent, Java-backed upstream `clojure-lsp`
+executable. Unlike its GraalVM native-image alternative, it starts inside the
+terminal bridge's deliberately empty `/proc` while retaining the same pinned
+server version and checksum validation. The image smoke fixture uses a
+config-free Clojure source tree so this startup check remains networkless and
+does not launch a native build tool inside that sandbox.
+
+See [GraalVM Native Image in procfs-hidden sandboxes](docs/graalvm-native-image-procfs.md)
+for the general compatibility finding and packaging recommendation behind this
+choice.
 
 They also install pinned Clojure CLI, Leiningen, native deps.clj, and `rlwrap`.
 The current versions and SHA-256 values are in
@@ -920,6 +930,25 @@ host installation. The CUDA check additionally starts the
 container with `--gpus all` and verifies `nvcc`, CUDA headers, and
 `nvidia-smi`. It therefore requires the NVIDIA driver and Container Toolkit
 described in [CUDA host setup](#cuda-host-setup).
+
+For each local image, the host first runs a bounded `bb --version` preflight,
+then uses that image's pinned Babashka to orchestrate the image-internal test
+phases. The runner prints each phase before it starts, its timeout, periodic
+elapsed-time heartbeats, its duration, and a final phase summary. Successful
+command output is captured; a failed phase prints only bounded stdout and
+stderr tails. The host also applies an outer deadline to the Docker run and
+removes the specifically named test container on failure or interruption.
+
+The default image-suite heartbeat is 10 seconds, the process kill grace period
+is 5 seconds, and the outer per-image deadline is 660 seconds. Override these
+positive integer values when diagnosing unusually slow hosts:
+
+```bash
+CODEX_TEST_IMAGE_HEARTBEAT_SECONDS=15 \
+CODEX_TEST_IMAGE_KILL_AFTER_SECONDS=10 \
+CODEX_TEST_IMAGE_TIMEOUT_SECONDS=900 \
+  ./tests/host-smoke.sh
+```
 
 The suite uses `--pull=never --network none`; it never pulls or builds an
 image. Select different local images with:

@@ -82,14 +82,24 @@ for index in "${!agent_args[@]}"; do
     fi
 done
 
-if [[ "${1:-}" == --check-java ]]; then
-    (($# == 1)) || {
-        echo "--check-java does not accept arguments" >&2
-        exit 2
-    }
-    exec bwrap "${bwrap_args[@]}" -- \
-        /usr/local/bin/codex-no-nested-userns "$java_binary" -version
-fi
+case "${1:-}" in
+    --check-java)
+        (($# == 1)) || {
+            echo "--check-java does not accept arguments" >&2
+            exit 2
+        }
+        exec bwrap "${bwrap_args[@]}" -- \
+            /usr/local/bin/codex-no-nested-userns "$java_binary" -version
+        ;;
+    --check-clojure-lsp)
+        (($# == 1)) || {
+            echo "--check-clojure-lsp does not accept arguments" >&2
+            exit 2
+        }
+        exec bwrap "${bwrap_args[@]}" -- \
+            /usr/local/bin/codex-no-nested-userns clojure-lsp --version
+        ;;
+esac
 
 exec bwrap "${bwrap_args[@]}" -- \
     /usr/local/bin/codex-no-nested-userns \

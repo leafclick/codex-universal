@@ -3,6 +3,7 @@
 
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -68,6 +69,8 @@ def main():
         "initialize_error": None,
     }
     state_lock = threading.Lock()
+    client_input = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
+    client_stop = threading.Event()
 
     def terminate_child(signum, _frame):
         try:
@@ -80,8 +83,11 @@ def main():
 
     def forward_client():
         try:
-            while True:
-                body = read_frame(sys.stdin.buffer)
+            while not client_stop.is_set():
+                readable, _, _ = select.select([client_input], [], [], 0.1)
+                if not readable:
+                    continue
+                body = read_frame(client_input)
                 if body is None:
                     break
                 try:
@@ -163,7 +169,9 @@ def main():
                 child.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 terminate_child(signal.SIGKILL, None)
+        client_stop.set()
         client_thread.join(timeout=2)
+        client_input.close()
     return child.returncode or 0
 
 

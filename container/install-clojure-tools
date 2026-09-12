@@ -29,8 +29,6 @@ case "$(dpkg --print-architecture)" in
         cljfmt_checksum="$CLJFMT_AMD64_SHA256"
         clj_kondo_archive="clj-kondo-${CLJ_KONDO_VERSION}-linux-amd64.zip"
         clj_kondo_checksum="$CLJ_KONDO_AMD64_SHA256"
-        clojure_lsp_archive=clojure-lsp-native-linux-amd64.zip
-        clojure_lsp_checksum="$CLOJURE_LSP_AMD64_SHA256"
         ;;
     arm64)
         babashka_archive="babashka-${BABASHKA_VERSION}-linux-aarch64-static.tar.gz"
@@ -39,8 +37,6 @@ case "$(dpkg --print-architecture)" in
         cljfmt_checksum="$CLJFMT_ARM64_SHA256"
         clj_kondo_archive="clj-kondo-${CLJ_KONDO_VERSION}-linux-aarch64.zip"
         clj_kondo_checksum="$CLJ_KONDO_ARM64_SHA256"
-        clojure_lsp_archive=clojure-lsp-native-linux-aarch64.zip
-        clojure_lsp_checksum="$CLOJURE_LSP_ARM64_SHA256"
         ;;
     *)
         echo "Unsupported architecture: $(dpkg --print-architecture)" >&2
@@ -67,13 +63,12 @@ unzip -qq "$install_root/$clj_kondo_archive" -d "$install_root/clj-kondo"
 install -m 0755 "$install_root/clj-kondo/clj-kondo" /usr/local/bin/clj-kondo
 
 download_verified \
-    "https://github.com/clojure-lsp/clojure-lsp/releases/download/${CLOJURE_LSP_VERSION}/${clojure_lsp_archive}" \
-    "$clojure_lsp_checksum" "$install_root/$clojure_lsp_archive"
-unzip -qq "$install_root/$clojure_lsp_archive" -d "$install_root/clojure-lsp"
-install -m 0755 "$install_root/clojure-lsp/clojure-lsp" /usr/local/bin/clojure-lsp
+    "https://github.com/clojure-lsp/clojure-lsp/releases/download/${CLOJURE_LSP_VERSION}/clojure-lsp" \
+    "$CLOJURE_LSP_JVM_SHA256" "$install_root/clojure-lsp"
+install -m 0755 "$install_root/clojure-lsp" /usr/local/bin/clojure-lsp
 
-# Fail the image build if an installer returned success without leaving a
-# runnable native tool behind.
+# Fail the image build if an installer returned success without leaving its
+# pinned command runnable.
 bb --version
 cljfmt --version
 clj-kondo --version

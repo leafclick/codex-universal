@@ -141,13 +141,9 @@ clj_kondo_arm64_sha256="$(
     asset_sha256 "$update_root/clj-kondo.json" \
         "clj-kondo-${clj_kondo_version}-linux-aarch64.zip"
 )"
-clojure_lsp_amd64_sha256="$(
+clojure_lsp_jvm_sha256="$(
     asset_sha256 "$update_root/clojure-lsp.json" \
-        clojure-lsp-native-linux-amd64.zip
-)"
-clojure_lsp_arm64_sha256="$(
-    asset_sha256 "$update_root/clojure-lsp.json" \
-        clojure-lsp-native-linux-aarch64.zip
+        clojure-lsp
 )"
 
 curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
@@ -177,8 +173,7 @@ new_config="$update_root/clojure-tool-versions.conf"
     printf 'CLJ_KONDO_AMD64_SHA256=%s\n' "$clj_kondo_amd64_sha256"
     printf 'CLJ_KONDO_ARM64_SHA256=%s\n' "$clj_kondo_arm64_sha256"
     printf 'CLOJURE_LSP_VERSION=%s\n' "$clojure_lsp_version"
-    printf 'CLOJURE_LSP_AMD64_SHA256=%s\n' "$clojure_lsp_amd64_sha256"
-    printf 'CLOJURE_LSP_ARM64_SHA256=%s\n' "$clojure_lsp_arm64_sha256"
+    printf 'CLOJURE_LSP_JVM_SHA256=%s\n' "$clojure_lsp_jvm_sha256"
 } >"$new_config"
 
 new_system_config="$update_root/system-tool-versions.conf"
