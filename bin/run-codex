@@ -1258,20 +1258,75 @@ create_managed_lane() {
     [[ -z "$(git -C "$default_root" status --porcelain=v1 --untracked-files=all)" ]] ||
         die "Default lane changed while preparing managed lane '$lane'"
 
-    mkdir -p -- "$managed_parent"
-    echo "Creating managed lane '$lane' at $managed_path" >&2
-    git -C "$default_root" worktree add -b "$branch" \
-        "$managed_path" "$commit" >&2
-    write_project_config "$name" "$lane" "$managed_path" "$profile" \
-        "$clojure_mcp" isolated "$agent"
-    seed_managed_lane_codex_home "$name" "$lane"
+    (
+        local rollback_pending=true
+        local temp_worktree_created=false
+        local registration_created=false
+        local branch_created=false
+        local temp_path=""
 
-    echo "Created project '$name' lane '$lane':"
-    echo "  path:   $managed_path"
-    echo "  branch: $branch"
-    echo "  commit: $commit"
-    echo "Complete local inputs with:"
-    echo "  run-codex '$name' --lane '$lane' --onboard --from '$default_root'"
+        rollback_managed_lane_create() {
+            local status=$?
+            local worktree_removed=true
+
+            trap - EXIT HUP INT TERM
+            if $rollback_pending && [[ -e "$managed_path" || -L "$managed_path" ]]; then
+                echo "WARNING: managed lane reached its final path before interruption; preserving path '$managed_path', registration '$lane_file', and branch '$branch' for inspection." >&2
+                exit "$status"
+            fi
+            if $rollback_pending && $temp_worktree_created; then
+                set +e
+                echo "Rolling back incomplete managed lane '$lane'" >&2
+                if [[ -e "$temp_path" || -L "$temp_path" ]]; then
+                    git -C "$default_root" worktree remove "$temp_path" \
+                        >/dev/null 2>&1 || worktree_removed=false
+                fi
+                rm -f -- "$lane_file.tmp.$$"
+                $registration_created && rm -f -- "$lane_file"
+                if $worktree_removed && $branch_created; then
+                    git -C "$default_root" update-ref -d \
+                        "refs/heads/$branch" "$commit" >/dev/null 2>&1 || true
+                fi
+                if [[ -e "$temp_path" || -L "$temp_path" ||
+                      -e "$managed_path" || -L "$managed_path" ||
+                      -e "$lane_file" || -L "$lane_file" ]] ||
+                   git -C "$default_root" show-ref --verify --quiet \
+                       "refs/heads/$branch"; then
+                    echo "WARNING: incomplete lane artifacts remain; inspect temporary path '$temp_path', final path '$managed_path', registration '$lane_file', and branch '$branch'." >&2
+                fi
+            fi
+            exit "$status"
+        }
+
+        trap rollback_managed_lane_create EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
+        need mktemp
+        mkdir -p -- "$managed_parent"
+        temp_path="$(mktemp -d "$managed_parent/.${lane}.create.XXXXXX")"
+        rmdir -- "$temp_path"
+        echo "Creating managed lane '$lane' at $managed_path" >&2
+        git -C "$default_root" worktree add --detach "$temp_path" "$commit" >&2
+        temp_worktree_created=true
+        seed_new_managed_lane_codex_home "$name" "$lane"
+        write_project_config "$name" "$lane" "$managed_path" "$profile" \
+            "$clojure_mcp" isolated "$agent"
+        registration_created=true
+        git -C "$temp_path" switch -c "$branch" >&2
+        branch_created=true
+        git -C "$default_root" worktree move "$temp_path" "$managed_path"
+
+        rollback_pending=false
+        trap - EXIT HUP INT TERM
+        echo "Created project '$name' lane '$lane':"
+        echo "  path:   $managed_path"
+        echo "  branch: $branch"
+        echo "  commit: $commit"
+        echo "Complete local inputs with:"
+        echo "  run-codex '$name' --lane '$lane' --onboard --from '$default_root'"
+    )
 }
 
 import_lane_result() {
@@ -2230,7 +2285,7 @@ bootstrap_lane_codex_home() {
 seed_managed_lane_codex_home() {
     local project="$1"
     local lane="$2"
-    local default_file lane_file default_state_mode default_codex_home
+    local default_file lane_file default_state_mode
     local managed_parent managed_path
 
     default_file="$(registry_file_for "$project" default)"
@@ -2245,6 +2300,21 @@ seed_managed_lane_codex_home() {
     managed_path="$managed_parent/$lane"
     [[ "$CONFIG_PATH" == "$managed_path" ]] || return 0
 
+    seed_new_managed_lane_codex_home "$project" "$lane" "$default_state_mode"
+}
+
+seed_new_managed_lane_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local default_state_mode="${3:-}"
+    local default_file default_codex_home
+
+    default_file="$(registry_file_for "$project" default)"
+    [[ -f "$default_file" ]] || return 0
+    if [[ -z "$default_state_mode" ]]; then
+        read_project_config "$default_file"
+        default_state_mode="$CONFIG_STATE_MODE"
+    fi
     resolve_lane_codex_home "$project" default "$default_state_mode"
     default_codex_home="$CODEX_HOST_HOME"
     resolve_lane_codex_home "$project" "$lane" isolated
@@ -2697,6 +2767,7 @@ esac
 if [[ -n "$LANE_MANAGEMENT_MODE" ]]; then
     [[ -n "$PROJECT" && "$LANE_SET" == true ]] ||
         die "Lane management requires PROJECT and an explicit --lane LANE"
+    [[ -z "$ONBOARD_SOURCE" ]] || die "--from is valid only with --onboard"
     if $NEW_SESSION || $SESSION_LIST_MODE || $RESUME_QUERY_SET ||
        $REVIEW_REVISION_SET || $ONBOARD_CHECK_MODE || $ONBOARD_APPLY_MODE ||
        $SETUP_SESSION || [[ -n "$STATE_SYNC_MODE" ]] || $CODEX_PROMPT_SET ||

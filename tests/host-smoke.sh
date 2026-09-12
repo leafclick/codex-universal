@@ -2251,6 +2251,20 @@ assert_contains "$(<"$cli_root/create-dirty.log")" \
     fail "dirty managed lane creation mutated path or registry"
 git -C "$cli_repo" checkout -q -- payload
 
+cli_from_lane_config="$cli_config/run-codex/lanes/cli-project/from-reject"
+cli_from_lane_path="$cli_config/run-codex/worktrees/cli-project/from-reject"
+if cli_run cli-project --lane from-reject --create HEAD --from "$cli_repo" \
+    >"$cli_root/create-from.log" 2>&1; then
+    fail "managed lane creation accepted an onboarding source"
+fi
+assert_contains "$(<"$cli_root/create-from.log")" \
+    "--from is valid only with --onboard"
+[[ ! -e "$cli_from_lane_config" && ! -e "$cli_from_lane_path" ]] ||
+    fail "--create --from mutated managed lane path or registration"
+git -C "$cli_repo" show-ref --verify --quiet \
+    refs/heads/codex/cli-project/from-reject &&
+    fail "--create --from created a managed branch"
+
 cli_default_before="$(git -C "$cli_repo" rev-parse HEAD)"
 cli_create_lock="$cli_config/run-codex/locks/cli-project/default.handoff.lock"
 mkdir -p -- "$(dirname -- "$cli_create_lock")"
@@ -2272,6 +2286,36 @@ cli_run cli-project --lane managed --create "$cli_base_commit" \
     fail "managed lane creation changed the default or used the wrong commit"
 grep -Fxq "path=$cli_managed_path" "$cli_managed_config" ||
     fail "managed lane creation omitted its canonical registration"
+
+cli_rollback_path="$cli_config/run-codex/worktrees/cli-project/rollback"
+cli_rollback_config="$cli_config/run-codex/lanes/cli-project/rollback"
+cli_rollback_branch='codex/cli-project/rollback'
+cli_rollback_bin="$cli_root/rollback-bin"
+mkdir -p "$cli_rollback_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${3:-}" == "'$cli_rollback_config'" ]]; then exit 1; fi' \
+    'exec /bin/mv "$@"' > "$cli_rollback_bin/mv"
+chmod 755 "$cli_rollback_bin/mv"
+cli_rollback_env=(
+    "${cli_env[@]}"
+    "PATH=$cli_rollback_bin:$TEST_ROOT/fake-bin:$PATH"
+)
+cli_run_rollback() {
+    "${cli_rollback_env[@]}" "$ROOT/bin/run-codex" "$@"
+}
+if cli_run_rollback cli-project --lane rollback --create "$cli_base_commit" \
+    >"$cli_root/create-rollback.log" 2>&1; then
+    fail "managed lane creation ignored post-worktree registration failure"
+fi
+[[ ! -e "$cli_rollback_path" && ! -e "$cli_rollback_config" ]] ||
+    fail "failed managed lane creation left checkout or registration"
+git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_rollback_branch" &&
+    fail "failed managed lane creation left its managed branch"
+cli_run cli-project --lane rollback --create "$cli_base_commit" >/dev/null 2>&1
+[[ -e "$cli_rollback_path" && -f "$cli_rollback_config" &&
+   "$(git -C "$cli_rollback_path" rev-parse HEAD)" == "$cli_base_commit" ]] ||
+    fail "managed lane creation did not succeed after rollback retry"
 printf '%s\n' feature > "$cli_managed_path/feature"
 git -C "$cli_managed_path" add feature
 git -C "$cli_managed_path" -c user.name=host-smoke \
