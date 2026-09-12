@@ -1,0 +1,962 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/run-codex"
+PROJECTS_DIR="$CONFIG_ROOT/projects"
+LANES_DIR="$CONFIG_ROOT/lanes"
+STATE_ROOT="$CONFIG_ROOT/state"
+LOCK_ROOT="$CONFIG_ROOT/locks"
+MAX_BODY_BYTES=65536
+MAX_RECORD_BYTES=$((MAX_BODY_BYTES * 6 + 8192))
+MAX_PENDING_MESSAGES=1000
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  codex-collab send PROJECT --lane FROM --to TO --kind KIND --revision COMMIT --body-file FILE
+  codex-collab deliver PROJECT --lane FROM MESSAGE_ID
+  codex-collab list PROJECT --lane LANE
+  codex-collab read PROJECT --lane LANE MESSAGE_ID
+  codex-collab ack PROJECT --lane LANE MESSAGE_ID
+  codex-collab prune PROJECT --lane LANE
+
+Kinds:
+  question | interface-proposal | result-available | review-finding | integration-result
+
+Messages are inert, bounded JSON records. send writes only the selected source
+lane's outbox; deliver is the explicit host-controller step that copies a
+validated record into its declared recipient's inbox.
+USAGE
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+validate_name() {
+    local label="$1"
+    local value="$2"
+    [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+        die "Invalid $label '$value'. Use letters, digits, '.', '_' or '-'."
+}
+
+validate_message_id() {
+    [[ "$1" =~ ^[0-9a-f]{32}$ ]] || die "Invalid message ID '$1'"
+}
+
+validate_kind() {
+    case "$1" in
+        question|interface-proposal|result-available|review-finding|integration-result) ;;
+        *) die "Invalid message kind '$1'" ;;
+    esac
+}
+
+validate_commit_id() {
+    [[ "$1" =~ ^[0-9a-f]{40}$ || "$1" =~ ^[0-9a-f]{64}$ ]] ||
+        die "Revision must be a full lowercase commit ID"
+}
+
+registry_file_for() {
+    local project="$1"
+    local lane="$2"
+    if [[ "$lane" == default ]]; then
+        printf '%s\n' "$PROJECTS_DIR/$project"
+    else
+        printf '%s\n' "$LANES_DIR/$project/$lane"
+    fi
+}
+
+LANE_PATH=""
+LANE_COMMON_DIR=""
+
+load_lane() {
+    local project="$1"
+    local lane="$2"
+    local file registry_root line path="" configured_lane="" state_mode=""
+    local root raw_common common
+
+    validate_name project "$project"
+    validate_name lane "$lane"
+    file="$(registry_file_for "$project" "$lane")"
+    [[ -f "$file" && ! -L "$file" ]] ||
+        die "Project '$project' lane '$lane' is not registered"
+    if [[ "$lane" == default ]]; then
+        registry_root="$(realpath -e -- "$PROJECTS_DIR")" ||
+            die "Cannot resolve project registry"
+    else
+        registry_root="$(realpath -e -- "$LANES_DIR")" ||
+            die "Cannot resolve lane registry"
+    fi
+    file="$(realpath -e -- "$file")" || die "Cannot resolve lane registration"
+    [[ "$file" == "$registry_root/"* ]] ||
+        die "Lane registration escapes its managed registry"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+            path=*) path="${line#path=}" ;;
+            lane=*) configured_lane="${line#lane=}" ;;
+            state=*) state_mode="${line#state=}" ;;
+            ''|'#'*|profile=*|clojure_mcp=*|model=*|reasoning=*|agent=*) ;;
+            *) die "Invalid project config line in $file: $line" ;;
+        esac
+    done < "$file"
+    [[ "$configured_lane" == "$lane" ]] ||
+        die "Lane config identity mismatch in $file"
+    [[ "$state_mode" == isolated ]] ||
+        die "Collaboration requires isolated state for project '$project' lane '$lane'"
+    [[ "$path" == /* && "$path" != / && -d "$path" ]] ||
+        die "Registered checkout is unavailable: $path"
+    root="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" ||
+        die "Registered checkout is not a Git repository: $path"
+    root="$(realpath -e -- "$root")" || die "Cannot resolve checkout: $path"
+    path="$(realpath -e -- "$path")" || die "Cannot resolve checkout: $path"
+    [[ "$root" == "$path" ]] || die "Registered checkout is not its Git root: $path"
+    raw_common="$(
+        git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+    )" || die "Cannot resolve common Git metadata for: $path"
+    common="$(realpath -e -- "$raw_common")" ||
+        die "Common Git metadata is unavailable: $raw_common"
+    LANE_PATH="$path"
+    LANE_COMMON_DIR="$common"
+}
+
+COLLAB_DIR=""
+
+resolve_collab_dir() {
+    local project="$1"
+    local lane="$2"
+    local create="$3"
+    local root project_state lane_state collab
+
+    if $create; then
+        if [[ -e "$STATE_ROOT" || -L "$STATE_ROOT" ]]; then
+            [[ -d "$STATE_ROOT" && ! -L "$STATE_ROOT" ]] ||
+                die "State root must be a directory, not a symlink: $STATE_ROOT"
+        else
+            mkdir -p -- "$STATE_ROOT"
+        fi
+    elif [[ ! -d "$STATE_ROOT" || -L "$STATE_ROOT" ]]; then
+        [[ ! -e "$STATE_ROOT" && ! -L "$STATE_ROOT" ]] ||
+            die "State root must be a directory, not a symlink: $STATE_ROOT"
+        COLLAB_DIR=""
+        return 0
+    fi
+    root="$(realpath -e -- "$STATE_ROOT")" || die "Cannot resolve state root"
+    project_state="$root/$project"
+    if $create; then
+        if [[ -e "$project_state" || -L "$project_state" ]]; then
+            [[ -d "$project_state" && ! -L "$project_state" ]] ||
+                die "Project state must be a directory, not a symlink: $project_state"
+        else
+            mkdir -- "$project_state"
+        fi
+    elif [[ ! -d "$project_state" || -L "$project_state" ]]; then
+        [[ ! -e "$project_state" && ! -L "$project_state" ]] ||
+            die "Project state must be a directory, not a symlink: $project_state"
+        COLLAB_DIR=""
+        return 0
+    fi
+    lane_state="$project_state/$lane"
+    if $create; then
+        if [[ -e "$lane_state" || -L "$lane_state" ]]; then
+            [[ -d "$lane_state" && ! -L "$lane_state" ]] ||
+                die "Lane state must be a directory, not a symlink: $lane_state"
+        else
+            mkdir -p -- "$lane_state"
+        fi
+    elif [[ ! -d "$lane_state" || -L "$lane_state" ]]; then
+        [[ ! -e "$lane_state" && ! -L "$lane_state" ]] ||
+            die "Lane state must be a directory, not a symlink: $lane_state"
+        COLLAB_DIR=""
+        return 0
+    fi
+    lane_state="$(realpath -e -- "$lane_state")" || die "Cannot resolve lane state path"
+    [[ "$lane_state" == "$root/"* ]] || die "Lane state escapes its managed root"
+    collab="$lane_state/collaboration"
+    if $create; then
+        if [[ -e "$collab" || -L "$collab" ]]; then
+            [[ -d "$collab" && ! -L "$collab" ]] ||
+                die "Collaboration path must be a directory, not a symlink: $collab"
+        else
+            mkdir -p -- "$collab"
+        fi
+        collab="$(realpath -e -- "$collab")" ||
+            die "Cannot resolve collaboration directory"
+        [[ "$collab" == "$lane_state/"* ]] ||
+            die "Collaboration directory escapes lane state"
+    elif [[ ! -d "$collab" || -L "$collab" ]]; then
+        [[ ! -e "$collab" && ! -L "$collab" ]] ||
+            die "Collaboration path must be a directory, not a symlink: $collab"
+        COLLAB_DIR=""
+        return 0
+    fi
+    collab="$(realpath -e -- "$collab")" || die "Cannot resolve collaboration directory"
+    [[ "$collab" == "$lane_state/"* ]] || die "Collaboration directory escapes lane state"
+    COLLAB_DIR="$collab"
+}
+
+ensure_mailbox() {
+    local project="$1"
+    local lane="$2"
+    local mailbox="$3"
+    local path
+
+    resolve_collab_dir "$project" "$lane" true
+    path="$COLLAB_DIR/$mailbox"
+    if [[ -e "$path" || -L "$path" ]]; then
+        [[ -d "$path" && ! -L "$path" ]] ||
+            die "Mailbox must be a directory, not a symlink: $path"
+    else
+        mkdir -p -- "$path"
+    fi
+    path="$(realpath -e -- "$path")" || die "Cannot resolve mailbox: $path"
+    [[ "$path" == "$COLLAB_DIR/"* ]] || die "Mailbox escapes collaboration state"
+    printf '%s\n' "$path"
+}
+
+MAILBOX_DIR=""
+
+resolve_existing_mailbox() {
+    local project="$1"
+    local lane="$2"
+    local mailbox="$3"
+    local path
+
+    resolve_collab_dir "$project" "$lane" false
+    if [[ -z "$COLLAB_DIR" ]]; then
+        MAILBOX_DIR=""
+        return 0
+    fi
+    path="$COLLAB_DIR/$mailbox"
+    if [[ ! -d "$path" || -L "$path" ]]; then
+        [[ ! -e "$path" && ! -L "$path" ]] ||
+            die "Mailbox must be a directory, not a symlink: $path"
+        MAILBOX_DIR=""
+        return 0
+    fi
+    path="$(realpath -e -- "$path")" || die "Cannot resolve mailbox: $path"
+    [[ "$path" == "$COLLAB_DIR/"* ]] || die "Mailbox escapes collaboration state"
+    MAILBOX_DIR="$path"
+}
+
+lock_path_for() {
+    local project="$1"
+    local lane="$2"
+    local root dir
+    local lock
+
+    if [[ -e "$LOCK_ROOT" || -L "$LOCK_ROOT" ]]; then
+        [[ -d "$LOCK_ROOT" && ! -L "$LOCK_ROOT" ]] ||
+            die "Lock root must be a directory, not a symlink: $LOCK_ROOT"
+    else
+        mkdir -p -- "$LOCK_ROOT"
+    fi
+    root="$(realpath -e -- "$LOCK_ROOT")" || die "Cannot resolve lock root"
+    dir="$root/$project"
+    if [[ -e "$dir" || -L "$dir" ]]; then
+        [[ -d "$dir" && ! -L "$dir" ]] ||
+            die "Project lock path must be a directory, not a symlink: $dir"
+    else
+        mkdir -- "$dir"
+    fi
+    lock="$dir/$lane.collaboration.lock"
+    [[ ! -L "$lock" ]] || die "Collaboration lock must not be a symlink: $lock"
+    printf '%s\n' "$lock"
+}
+
+LOCK_FD_ONE=""
+LOCK_FD_TWO=""
+
+lock_lanes() {
+    local project="$1"
+    local first_lane="$2"
+    local second_lane="${3:-}"
+    local first_lock second_lock swap
+
+    first_lock="$(lock_path_for "$project" "$first_lane")"
+    if [[ -n "$second_lane" && "$second_lane" != "$first_lane" ]]; then
+        second_lock="$(lock_path_for "$project" "$second_lane")"
+        if [[ "$second_lock" < "$first_lock" ]]; then
+            swap="$first_lock"
+            first_lock="$second_lock"
+            second_lock="$swap"
+        fi
+    else
+        second_lock=""
+    fi
+    exec {LOCK_FD_ONE}>"$first_lock"
+    flock -n -x "$LOCK_FD_ONE" || die "Collaboration lane is busy: $first_lane"
+    if [[ -n "$second_lock" ]]; then
+        exec {LOCK_FD_TWO}>"$second_lock"
+        flock -n -x "$LOCK_FD_TWO" || die "Collaboration lane is busy: $second_lane"
+    fi
+}
+
+pending_count() {
+    local records="$1"
+    local markers="$2"
+    local timestamp_key="$3"
+    local file name id digest count=0 list_fd find_pid
+
+    exec {list_fd}< <(
+        find "$records" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0
+    )
+    find_pid=$!
+    while IFS= read -r -d '' file; do
+        name="${file##*/}"
+        id="${name%.json}"
+        if [[ -n "$markers" && ( -e "$markers/$id.json" || -L "$markers/$id.json" ) ]] &&
+            (validate_message_id "$id" &&
+             digest="$(message_hash "$file")" &&
+             validate_marker_file "$markers/$id.json" "$id" "$digest" "$timestamp_key") \
+                >/dev/null 2>&1; then
+            continue
+        fi
+        count=$((count + 1))
+    done <&"$list_fd"
+    exec {list_fd}<&-
+    wait "$find_pid" || die "Cannot enumerate collaboration mailbox: $records"
+    printf '%s\n' "$count"
+}
+
+message_hash() {
+    local file="$1"
+    local value
+    value="$(sha256sum -- "$file")" || return 1
+    printf '%s\n' "${value%% *}"
+}
+
+validate_message_file() {
+    local file="$1"
+    local expected_id="${2:-}"
+    local id body_hash recorded_hash size
+
+    [[ -f "$file" && ! -L "$file" ]] || die "Message is not a regular file: $file"
+    size="$(stat -c %s -- "$file")" || die "Cannot inspect message: $file"
+    ((size <= MAX_RECORD_BYTES)) || die "Message record is oversized: $file"
+    jq -e --argjson max "$MAX_BODY_BYTES" '
+        type == "object" and
+        keys == ["body","body_sha256","created_at","from_lane","id","kind","project","revision","to_lane","version"] and
+        .version == 1 and
+        (.id | type == "string" and test("^[0-9a-f]{32}$")) and
+        (.project | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+        (.from_lane | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+        (.to_lane | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+        (.kind == "question" or .kind == "interface-proposal" or
+         .kind == "result-available" or .kind == "review-finding" or
+         .kind == "integration-result") and
+        (.revision | type == "string" and test("^([0-9a-f]{40}|[0-9a-f]{64})$")) and
+        (.created_at | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")) and
+        (.body_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+        (.body | type == "string" and utf8bytelength <= $max)
+    ' "$file" >/dev/null || die "Invalid collaboration message: $file"
+    id="$(jq -r '.id' "$file")"
+    [[ -z "$expected_id" || "$id" == "$expected_id" ]] ||
+        die "Message ID does not match its filename: $file"
+    recorded_hash="$(jq -r '.body_sha256' "$file")"
+    body_hash="$(jq -j '.body' "$file" | sha256sum)" ||
+        die "Cannot hash collaboration message body: $file"
+    body_hash="${body_hash%% *}"
+    [[ "$body_hash" == "$recorded_hash" ]] ||
+        die "Collaboration message body hash mismatch: $file"
+}
+
+validate_marker_file() {
+    local file="$1"
+    local expected_id="$2"
+    local expected_hash="$3"
+    local timestamp_key="$4"
+
+    [[ -f "$file" && ! -L "$file" ]] || die "Invalid collaboration marker: $file"
+    jq -e \
+        --arg id "$expected_id" \
+        --arg hash "$expected_hash" \
+        --arg timestamp_key "$timestamp_key" '
+        type == "object" and
+        (keys == ([$timestamp_key,"message_id","message_sha256","version"] | sort)) and
+        .version == 1 and
+        .message_id == $id and
+        .message_sha256 == $hash and
+        (.[$timestamp_key] | type == "string" and
+         test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+    ' "$file" >/dev/null || die "Invalid collaboration marker: $file"
+}
+
+command_send() {
+    local project="$1"
+    local from_lane="$2"
+    local to_lane="$3"
+    local kind="$4"
+    local revision="$5"
+    local body_file="$6"
+    local source_path source_common recipient_path recipient_common commit
+    local outbox delivered id final tmp body_size body_hash created count
+
+    validate_kind "$kind"
+    validate_commit_id "$revision"
+    [[ -f "$body_file" && ! -L "$body_file" ]] ||
+        die "Body file must be a regular file, not a symlink: $body_file"
+    body_size="$(stat -c %s -- "$body_file")" || die "Cannot inspect body file"
+    ((body_size <= MAX_BODY_BYTES)) ||
+        die "Message body exceeds $MAX_BODY_BYTES bytes"
+    load_lane "$project" "$from_lane"
+    source_path="$LANE_PATH"
+    source_common="$LANE_COMMON_DIR"
+    load_lane "$project" "$to_lane"
+    recipient_path="$LANE_PATH"
+    recipient_common="$LANE_COMMON_DIR"
+    [[ "$source_common" == "$recipient_common" ]] ||
+        die "Sender and recipient no longer share project Git metadata"
+    commit="$(git -C "$source_path" rev-parse --verify "${revision}^{commit}" 2>/dev/null)" ||
+        die "Revision is unavailable in sender lane: $revision"
+    [[ "$commit" == "$revision" ]] || die "Revision is not its canonical full commit ID: $commit"
+    git -C "$recipient_path" cat-file -e "${commit}^{commit}" 2>/dev/null ||
+        die "Revision is unavailable in recipient lane: $commit"
+    if [[ "$kind" == result-available ]]; then
+        [[ "$(git -C "$source_path" rev-parse HEAD^{commit})" == "$commit" ]] ||
+            die "A result-available revision must equal sender lane HEAD"
+        [[ -z "$(git -C "$source_path" status --porcelain=v1 --untracked-files=all)" ]] ||
+            die "Sender lane must be clean before publishing a result"
+    fi
+
+    lock_lanes "$project" "$from_lane"
+    outbox="$(ensure_mailbox "$project" "$from_lane" outbox)"
+    delivered="$(ensure_mailbox "$project" "$from_lane" delivered)"
+    count="$(pending_count "$outbox" "$delivered" delivered_at)"
+    ((count < MAX_PENDING_MESSAGES)) || die "Sender outbox message limit reached"
+    id="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    validate_message_id "$id"
+    final="$outbox/$id.json"
+    [[ ! -e "$final" && ! -L "$final" ]] || die "Generated message ID already exists"
+    tmp="$(mktemp "$outbox/.${id}.json.XXXXXX")"
+    cleanup_send() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        rm -f -- "$tmp"
+        exit "$status"
+    }
+    trap cleanup_send EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    body_hash="$(message_hash "$body_file")" || die "Cannot hash body file"
+    created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    jq -n \
+        --arg id "$id" --arg project "$project" \
+        --arg from_lane "$from_lane" --arg to_lane "$to_lane" \
+        --arg kind "$kind" --arg revision "$commit" --arg created_at "$created" \
+        --arg body_sha256 "$body_hash" --rawfile body "$body_file" \
+        '{version:1,id:$id,project:$project,from_lane:$from_lane,to_lane:$to_lane,
+          kind:$kind,revision:$revision,created_at:$created_at,
+          body_sha256:$body_sha256,body:$body}' > "$tmp"
+    chmod 600 -- "$tmp"
+    validate_message_file "$tmp" "$id"
+    mv -T -- "$tmp" "$final"
+    trap - EXIT HUP INT TERM
+    printf '%s\n' "$id"
+}
+
+command_deliver() {
+    local project="$1"
+    local from_lane="$2"
+    local id="$3"
+    local sender_path sender_common to_lane recipient_path recipient_common
+    local outbox inbox delivered acks quarantine source final tmp="" digest receipt receipt_tmp=""
+    local quarantine_final source_digest_before revision
+
+    validate_message_id "$id"
+    load_lane "$project" "$from_lane"
+    sender_path="$LANE_PATH"
+    sender_common="$LANE_COMMON_DIR"
+    resolve_existing_mailbox "$project" "$from_lane" outbox
+    [[ -n "$MAILBOX_DIR" ]] || die "Sender has no collaboration outbox"
+    outbox="$MAILBOX_DIR"
+    source="$outbox/$id.json"
+    validate_message_file "$source" "$id"
+    source_digest_before="$(message_hash "$source")" || die "Cannot hash message: $id"
+    [[ "$(jq -r '.project' "$source")" == "$project" &&
+       "$(jq -r '.from_lane' "$source")" == "$from_lane" ]] ||
+        die "Message sender binding does not match its outbox"
+    to_lane="$(jq -r '.to_lane' "$source")"
+    revision="$(jq -r '.revision' "$source")"
+    load_lane "$project" "$to_lane"
+    recipient_path="$LANE_PATH"
+    recipient_common="$LANE_COMMON_DIR"
+    [[ "$sender_common" == "$recipient_common" ]] ||
+        die "Sender and recipient no longer share project Git metadata"
+    git -C "$recipient_path" cat-file -e "${revision}^{commit}" 2>/dev/null ||
+        die "Message revision is unavailable in recipient lane"
+
+    lock_lanes "$project" "$from_lane" "$to_lane"
+    cleanup_deliver() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        [[ -z "$tmp" ]] || rm -f -- "$tmp"
+        [[ -z "$receipt_tmp" ]] || rm -f -- "$receipt_tmp"
+        exit "$status"
+    }
+    trap cleanup_deliver EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    inbox="$(ensure_mailbox "$project" "$to_lane" inbox)"
+    delivered="$(ensure_mailbox "$project" "$from_lane" delivered)"
+    acks="$(ensure_mailbox "$project" "$to_lane" acks)"
+    tmp="$(mktemp "$inbox/.${id}.json.XXXXXX")"
+    install -m 600 -- "$source" "$tmp"
+    validate_message_file "$tmp" "$id"
+    digest="$(message_hash "$tmp")"
+    [[ "$digest" == "$source_digest_before" ]] ||
+        die "Message changed while delivery was being prepared: $id"
+    [[ "$(jq -r '.project' "$tmp")" == "$project" &&
+       "$(jq -r '.from_lane' "$tmp")" == "$from_lane" &&
+       "$(jq -r '.to_lane' "$tmp")" == "$to_lane" &&
+       "$(jq -r '.revision' "$tmp")" == "$revision" ]] ||
+        die "Message binding changed while delivery was being prepared: $id"
+    final="$inbox/$id.json"
+    receipt="$delivered/$id.json"
+    if [[ -e "$receipt" || -L "$receipt" ]]; then
+        validate_marker_file "$receipt" "$id" "$digest" delivered_at
+    fi
+    if [[ -e "$final" || -L "$final" ]]; then
+        if [[ -f "$final" && ! -L "$final" ]] && cmp -s -- "$tmp" "$final"; then
+            rm -f -- "$tmp"
+            tmp=""
+        else
+            quarantine="$(ensure_mailbox "$project" "$to_lane" quarantine)"
+            quarantine_final="$quarantine/$id.conflict.$$.json"
+            mv -T -- "$tmp" "$quarantine_final"
+            tmp=""
+            die "DIVERGENCE: recipient already has different message ID $id"
+        fi
+    else
+        (($(pending_count "$inbox" "$acks" acknowledged_at) < MAX_PENDING_MESSAGES)) ||
+            die "Recipient inbox message limit reached"
+        mv -T -- "$tmp" "$final"
+        tmp=""
+    fi
+    if [[ ! -e "$receipt" && ! -L "$receipt" ]]; then
+        receipt_tmp="$(mktemp "$delivered/.${id}.json.XXXXXX")"
+        jq -n --arg id "$id" --arg hash "$digest" \
+            --arg delivered_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{version:1,message_id:$id,message_sha256:$hash,delivered_at:$delivered_at}' \
+            > "$receipt_tmp"
+        chmod 600 -- "$receipt_tmp"
+        mv -T -- "$receipt_tmp" "$receipt"
+        receipt_tmp=""
+    fi
+    trap - EXIT HUP INT TERM
+    echo "Delivered $id from $from_lane to $to_lane."
+}
+
+command_list() {
+    local project="$1"
+    local lane="$2"
+    local inbox acks file id status invalid=false list_fd find_pid
+
+    load_lane "$project" "$lane"
+    printf 'ID\tKIND\tFROM\tREVISION\tSTATUS\tCREATED\n'
+    resolve_existing_mailbox "$project" "$lane" inbox
+    [[ -n "$MAILBOX_DIR" ]] || return 0
+    inbox="$MAILBOX_DIR"
+    resolve_existing_mailbox "$project" "$lane" acks
+    acks="$MAILBOX_DIR"
+    exec {list_fd}< <(
+        find "$inbox" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0 |
+            sort -z
+    )
+    find_pid=$!
+    while IFS= read -r -d '' file; do
+        id="$(basename -- "$file" .json)"
+        if ! (validate_message_id "$id" && validate_message_file "$file" "$id") \
+            >/dev/null 2>&1; then
+            echo "INVALID collaboration message: $file" >&2
+            invalid=true
+            continue
+        fi
+        if [[ "$(jq -r '.project' "$file")" != "$project" ||
+              "$(jq -r '.to_lane' "$file")" != "$lane" ]]; then
+            echo "INVALID collaboration recipient binding: $file" >&2
+            invalid=true
+            continue
+        fi
+        status=PENDING
+        if [[ -n "$acks" && ( -e "$acks/$id.json" || -L "$acks/$id.json" ) ]]; then
+            if (validate_marker_file "$acks/$id.json" "$id" \
+                "$(message_hash "$file")" acknowledged_at) >/dev/null 2>&1; then
+                status=ACKED
+            else
+                echo "INVALID collaboration acknowledgment: $acks/$id.json" >&2
+                invalid=true
+            fi
+        fi
+        jq -r --arg status "$status" \
+            '[.id,.kind,.from_lane,.revision,$status,.created_at] | @tsv' "$file"
+    done <&"$list_fd"
+    exec {list_fd}<&-
+    if ! wait "$find_pid"; then
+        echo "Cannot enumerate collaboration mailbox: $inbox" >&2
+        invalid=true
+    fi
+    ! $invalid
+}
+
+command_read() {
+    local project="$1"
+    local lane="$2"
+    local id="$3"
+    local file
+
+    validate_message_id "$id"
+    load_lane "$project" "$lane"
+    resolve_existing_mailbox "$project" "$lane" inbox
+    [[ -n "$MAILBOX_DIR" ]] || die "Message not found: $id"
+    file="$MAILBOX_DIR/$id.json"
+    validate_message_file "$file" "$id"
+    [[ "$(jq -r '.project' "$file")" == "$project" &&
+       "$(jq -r '.to_lane' "$file")" == "$lane" ]] ||
+        die "Message recipient binding does not match its inbox"
+    jq . "$file"
+}
+
+command_ack() {
+    local project="$1"
+    local lane="$2"
+    local id="$3"
+    local inbox file acks final tmp="" digest
+
+    validate_message_id "$id"
+    load_lane "$project" "$lane"
+    lock_lanes "$project" "$lane"
+    resolve_existing_mailbox "$project" "$lane" inbox
+    [[ -n "$MAILBOX_DIR" ]] || die "Message not found: $id"
+    inbox="$MAILBOX_DIR"
+    file="$inbox/$id.json"
+    validate_message_file "$file" "$id"
+    [[ "$(jq -r '.project' "$file")" == "$project" &&
+       "$(jq -r '.to_lane' "$file")" == "$lane" ]] ||
+        die "Message recipient binding does not match its inbox"
+    digest="$(message_hash "$file")"
+    acks="$(ensure_mailbox "$project" "$lane" acks)"
+    final="$acks/$id.json"
+    if [[ -e "$final" || -L "$final" ]]; then
+        validate_marker_file "$final" "$id" "$digest" acknowledged_at
+        echo "Already acknowledged $id."
+        return 0
+    fi
+    tmp="$(mktemp "$acks/.${id}.json.XXXXXX")"
+    cleanup_ack() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        [[ -z "$tmp" ]] || rm -f -- "$tmp"
+        exit "$status"
+    }
+    trap cleanup_ack EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    jq -n --arg id "$id" --arg hash "$digest" \
+        --arg acknowledged_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{version:1,message_id:$id,message_sha256:$hash,acknowledged_at:$acknowledged_at}' \
+        > "$tmp"
+    chmod 600 -- "$tmp"
+    mv -T -- "$tmp" "$final"
+    tmp=""
+    trap - EXIT HUP INT TERM
+    echo "Acknowledged $id."
+}
+
+PRUNE_COUNT=0
+PRUNE_HOLD_DIR=""
+PRUNE_HELD_MARKER=""
+PRUNE_HELD_RECORD=""
+PRUNE_ORIGINAL_MARKER=""
+PRUNE_RECORD=""
+PRUNE_EXPECTED_HASH=""
+PRUNE_DELETE_COMMITTED=false
+PRUNE_ID=""
+PRUNE_PROJECT=""
+PRUNE_BINDING_KEY=""
+PRUNE_BINDING_VALUE=""
+PRUNE_TIMESTAMP_KEY=""
+PRUNE_QUARANTINE=""
+
+clear_prune_hold() {
+    PRUNE_HOLD_DIR=""
+    PRUNE_HELD_MARKER=""
+    PRUNE_HELD_RECORD=""
+    PRUNE_ORIGINAL_MARKER=""
+    PRUNE_RECORD=""
+    PRUNE_EXPECTED_HASH=""
+    PRUNE_DELETE_COMMITTED=false
+    PRUNE_ID=""
+    PRUNE_PROJECT=""
+    PRUNE_BINDING_KEY=""
+    PRUNE_BINDING_VALUE=""
+    PRUNE_TIMESTAMP_KEY=""
+    PRUNE_QUARANTINE=""
+}
+
+validate_prune_record() {
+    local file="$1"
+
+    validate_message_file "$file" "$PRUNE_ID"
+    [[ "$(jq -r '.project' "$file")" == "$PRUNE_PROJECT" ]]
+    [[ "$(jq -r ".$PRUNE_BINDING_KEY" "$file")" == "$PRUNE_BINDING_VALUE" ]]
+}
+
+quarantine_prune_hold() {
+    local token record_target marker_target preserved="$PRUNE_HOLD_DIR"
+
+    token="${PRUNE_HOLD_DIR##*.}"
+    record_target="$PRUNE_QUARANTINE/$PRUNE_ID.prune-record.$token.json"
+    marker_target="$PRUNE_QUARANTINE/$PRUNE_ID.prune-marker.$token.json"
+    if [[ ( -e "$PRUNE_HELD_RECORD" || -L "$PRUNE_HELD_RECORD" ) &&
+          ( -e "$record_target" || -L "$record_target" ) ]] ||
+       [[ ( -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ) &&
+          ( -e "$marker_target" || -L "$marker_target" ) ]]; then
+        echo "Preserved conflicting prune hold at $preserved" >&2
+        clear_prune_hold
+        return 1
+    fi
+    if [[ -e "$PRUNE_HELD_RECORD" || -L "$PRUNE_HELD_RECORD" ]]; then
+        mv -T -- "$PRUNE_HELD_RECORD" "$record_target"
+        preserved="$record_target"
+    fi
+    if [[ -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ]]; then
+        mv -T -- "$PRUNE_HELD_MARKER" "$marker_target"
+        [[ "$preserved" != "$PRUNE_HOLD_DIR" ]] || preserved="$marker_target"
+    fi
+    rmdir -- "$PRUNE_HOLD_DIR" 2>/dev/null || true
+    clear_prune_hold
+    echo "Preserved conflicting prune data at $preserved" >&2
+    return 1
+}
+
+restore_prune_hold() {
+    local held_hash="" held_valid=false marker_valid=false
+
+    [[ -n "$PRUNE_HOLD_DIR" ]] || return 0
+    if $PRUNE_DELETE_COMMITTED; then
+        rm -f -- "$PRUNE_HELD_RECORD" "$PRUNE_HELD_MARKER"
+    elif [[ -e "$PRUNE_HELD_RECORD" || -L "$PRUNE_HELD_RECORD" ]]; then
+        if (validate_prune_record "$PRUNE_HELD_RECORD") >/dev/null 2>&1; then
+            held_valid=true
+            held_hash="$(message_hash "$PRUNE_HELD_RECORD")"
+        fi
+        if [[ -n "$held_hash" ]] &&
+           (validate_marker_file "$PRUNE_HELD_MARKER" "$PRUNE_ID" \
+               "$PRUNE_EXPECTED_HASH" "$PRUNE_TIMESTAMP_KEY") >/dev/null 2>&1; then
+            marker_valid=true
+        fi
+        if $held_valid && [[ "$held_hash" == "$PRUNE_EXPECTED_HASH" ]] &&
+           $marker_valid &&
+           [[ ! -e "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" &&
+              ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]]; then
+            mv -T -- "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
+            mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
+        elif $held_valid &&
+             [[ ! -e "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" ]]; then
+            mv -T -- "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
+            quarantine_prune_hold
+            return 1
+        else
+            quarantine_prune_hold
+            return 1
+        fi
+    elif [[ -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ]]; then
+        if [[ -f "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" &&
+              "$(message_hash "$PRUNE_RECORD")" == "$PRUNE_EXPECTED_HASH" &&
+              ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]] &&
+           (validate_marker_file "$PRUNE_HELD_MARKER" "$PRUNE_ID" \
+               "$PRUNE_EXPECTED_HASH" "$PRUNE_TIMESTAMP_KEY") >/dev/null 2>&1; then
+            mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
+        else
+            quarantine_prune_hold
+            return 1
+        fi
+    fi
+    rmdir -- "$PRUNE_HOLD_DIR" 2>/dev/null || true
+    clear_prune_hold
+}
+
+prune_completed_mailbox() {
+    local records="$1"
+    local markers="$2"
+    local timestamp_key="$3"
+    local binding_key="$4"
+    local binding_value="$5"
+    local project="$6"
+    local quarantine="$7"
+    local file id marker digest invalid=false list_fd find_pid
+
+    [[ -n "$records" && -n "$markers" ]] || return 0
+    exec {list_fd}< <(
+        find "$records" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0
+    )
+    find_pid=$!
+    while IFS= read -r -d '' file; do
+        id="$(basename -- "$file" .json)"
+        marker="$markers/$id.json"
+        [[ -e "$marker" || -L "$marker" ]] || continue
+        if ! (validate_message_id "$id" &&
+              validate_message_file "$file" "$id" &&
+              [[ "$(jq -r '.project' "$file")" == "$project" ]] &&
+              [[ "$(jq -r ".$binding_key" "$file")" == "$binding_value" ]] &&
+              digest="$(message_hash "$file")" &&
+              validate_marker_file "$marker" "$id" "$digest" "$timestamp_key") \
+                >/dev/null 2>&1; then
+            echo "INVALID completed collaboration record: $file" >&2
+            invalid=true
+            continue
+        fi
+        digest="$(message_hash "$file")"
+        PRUNE_HOLD_DIR="$(mktemp -d "$markers/.${id}.prune.XXXXXX")"
+        PRUNE_HELD_MARKER="$PRUNE_HOLD_DIR/marker.json"
+        PRUNE_HELD_RECORD="$PRUNE_HOLD_DIR/record.json"
+        PRUNE_ORIGINAL_MARKER="$marker"
+        PRUNE_RECORD="$file"
+        PRUNE_EXPECTED_HASH="$digest"
+        PRUNE_DELETE_COMMITTED=false
+        PRUNE_ID="$id"
+        PRUNE_PROJECT="$project"
+        PRUNE_BINDING_KEY="$binding_key"
+        PRUNE_BINDING_VALUE="$binding_value"
+        PRUNE_TIMESTAMP_KEY="$timestamp_key"
+        PRUNE_QUARANTINE="$quarantine"
+        mv -T -- "$marker" "$PRUNE_HELD_MARKER"
+        mv -T -- "$file" "$PRUNE_HELD_RECORD"
+        if ! (validate_message_file "$PRUNE_HELD_RECORD" "$id" &&
+              [[ "$(message_hash "$PRUNE_HELD_RECORD")" == "$digest" ]] &&
+              validate_marker_file "$PRUNE_HELD_MARKER" "$id" "$digest" \
+                  "$timestamp_key") >/dev/null 2>&1; then
+            echo "Collaboration record changed while pruning: $file" >&2
+            restore_prune_hold || true
+            invalid=true
+            continue
+        fi
+        PRUNE_DELETE_COMMITTED=true
+        rm -f -- "$PRUNE_HELD_RECORD" "$PRUNE_HELD_MARKER"
+        rmdir -- "$PRUNE_HOLD_DIR"
+        clear_prune_hold
+        PRUNE_COUNT=$((PRUNE_COUNT + 1))
+    done <&"$list_fd"
+    exec {list_fd}<&-
+    if ! wait "$find_pid"; then
+        echo "Cannot enumerate collaboration mailbox: $records" >&2
+        invalid=true
+    fi
+    ! $invalid
+}
+
+command_prune() {
+    local project="$1"
+    local lane="$2"
+    local outbox delivered inbox acks quarantine invalid=false
+
+    load_lane "$project" "$lane"
+    lock_lanes "$project" "$lane"
+    cleanup_prune() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        restore_prune_hold || true
+        exit "$status"
+    }
+    trap cleanup_prune EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    resolve_existing_mailbox "$project" "$lane" outbox
+    outbox="$MAILBOX_DIR"
+    resolve_existing_mailbox "$project" "$lane" delivered
+    delivered="$MAILBOX_DIR"
+    resolve_existing_mailbox "$project" "$lane" inbox
+    inbox="$MAILBOX_DIR"
+    resolve_existing_mailbox "$project" "$lane" acks
+    acks="$MAILBOX_DIR"
+    quarantine="$(ensure_mailbox "$project" "$lane" quarantine)"
+    PRUNE_COUNT=0
+    if ! prune_completed_mailbox "$outbox" "$delivered" delivered_at \
+        from_lane "$lane" "$project" "$quarantine"; then
+        invalid=true
+    fi
+    if ! prune_completed_mailbox "$inbox" "$acks" acknowledged_at \
+        to_lane "$lane" "$project" "$quarantine"; then
+        invalid=true
+    fi
+    echo "Pruned $PRUNE_COUNT completed collaboration record(s) from $project/$lane."
+    trap - EXIT HUP INT TERM
+    ! $invalid
+}
+
+for command in git realpath jq flock find stat sha256sum mktemp date od tr sort \
+    install cmp basename mkdir rmdir mv chmod rm; do
+    need "$command"
+done
+
+ACTION="${1:-}"
+[[ -n "$ACTION" ]] || { usage >&2; exit 2; }
+shift
+case "$ACTION" in
+    --help|-h|help)
+        usage
+        exit 0
+        ;;
+    send)
+        (($# >= 1)) || die "send requires PROJECT"
+        PROJECT="$1"
+        shift
+        FROM_LANE=""
+        TO_LANE=""
+        KIND=""
+        REVISION=""
+        BODY_FILE=""
+        while (($#)); do
+            case "$1" in
+                --lane) (($# >= 2)) || die "--lane requires a value"; FROM_LANE="$2"; shift 2 ;;
+                --to) (($# >= 2)) || die "--to requires a value"; TO_LANE="$2"; shift 2 ;;
+                --kind) (($# >= 2)) || die "--kind requires a value"; KIND="$2"; shift 2 ;;
+                --revision) (($# >= 2)) || die "--revision requires a value"; REVISION="$2"; shift 2 ;;
+                --body-file) (($# >= 2)) || die "--body-file requires a value"; BODY_FILE="$2"; shift 2 ;;
+                *) die "Unknown send option: $1" ;;
+            esac
+        done
+        [[ -n "$FROM_LANE" && -n "$TO_LANE" && -n "$KIND" &&
+           -n "$REVISION" && -n "$BODY_FILE" ]] || die "send requires --lane, --to, --kind, --revision, and --body-file"
+        command_send "$PROJECT" "$FROM_LANE" "$TO_LANE" "$KIND" "$REVISION" "$BODY_FILE"
+        ;;
+    deliver|list|read|ack|prune)
+        (($# >= 1)) || die "$ACTION requires PROJECT"
+        PROJECT="$1"
+        shift
+        LANE=""
+        POSITIONAL=()
+        while (($#)); do
+            case "$1" in
+                --lane) (($# >= 2)) || die "--lane requires a value"; LANE="$2"; shift 2 ;;
+                --*) die "Unknown $ACTION option: $1" ;;
+                *) POSITIONAL+=("$1"); shift ;;
+            esac
+        done
+        [[ -n "$LANE" ]] || die "$ACTION requires --lane"
+        case "$ACTION" in
+            list|prune)
+                ((${#POSITIONAL[@]} == 0)) || die "$ACTION accepts no message ID"
+                "command_$ACTION" "$PROJECT" "$LANE"
+                ;;
+            deliver|read|ack)
+                ((${#POSITIONAL[@]} == 1)) || die "$ACTION requires one MESSAGE_ID"
+                "command_$ACTION" "$PROJECT" "$LANE" "${POSITIONAL[0]}"
+                ;;
+        esac
+        ;;
+    *)
+        usage >&2
+        die "Unknown action: $ACTION"
+        ;;
+esac

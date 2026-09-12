@@ -82,6 +82,7 @@ for script in \
     "$ROOT/bin/codex-push" \
     "$ROOT/bin/codex-pull" \
     "$ROOT/bin/codex-sync-lib" \
+    "$ROOT/bin/codex-collab" \
     "$ROOT/container/codex-entrypoint" \
     "$ROOT/container/codex-acp-entrypoint" \
     "$ROOT/container/codex-bwrap-cuda" \
@@ -93,6 +94,7 @@ for script in \
     "$ROOT/container/install-system-runtimes" \
     "$ROOT/scripts/update-tool-versions" \
     "$ROOT/tests/host-smoke-sync.sh" \
+    "$ROOT/tests/host-smoke-collab.sh" \
     "$ROOT/tests/fixtures/host-smoke-image.sh" \
     "$ROOT/tests/fixtures/host-smoke-image-phase.sh" \
     "$ROOT/tests/fixtures/host-smoke-clojure-runtime.sh"; do
@@ -2808,6 +2810,8 @@ pass "sanitized Git image source metadata"
 
 activity "snapshot synchronization state machine"
 "$ROOT/tests/host-smoke-sync.sh"
+activity "lane collaboration mailbox"
+"$ROOT/tests/host-smoke-collab.sh"
 
 # If built images and a Docker daemon are present, inspect the real containers.
 # The host does not need Codex installed; Codex is invoked only in the images.

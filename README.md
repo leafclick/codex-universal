@@ -70,7 +70,7 @@ step fails or needs customization.
    mkdir -p ~/.local/bin
    install -m 755 bin/run-codex bin/setup-codex-idea ~/.local/bin/
    install -m 644 bin/run-codex-doctor.bash ~/.local/bin/
-   install -m 700 bin/codex-push bin/codex-pull ~/.local/bin/
+   install -m 700 bin/codex-push bin/codex-pull bin/codex-collab ~/.local/bin/
    install -m 600 bin/codex-sync-lib ~/.local/bin/
    ```
 
@@ -1087,6 +1087,7 @@ install -m 644 bin/run-codex-doctor.bash ~/.local/bin/run-codex-doctor.bash
 install -m 755 bin/setup-codex-idea ~/.local/bin/setup-codex-idea
 install -m 700 bin/codex-push ~/.local/bin/codex-push
 install -m 700 bin/codex-pull ~/.local/bin/codex-pull
+install -m 700 bin/codex-collab ~/.local/bin/codex-collab
 install -m 600 bin/codex-sync-lib ~/.local/bin/codex-sync-lib
 ```
 
@@ -1270,6 +1271,43 @@ declared local inputs, and commits not reachable from the default lane. It
 removes the managed worktree and registration, and deletes the expected safe
 branch when Git confirms it is integrated. Lane Codex state and synchronized
 snapshot history are deliberately retained for separate archival or recovery.
+
+Exchange a bounded, revision-specific message between two isolated lanes with
+an explicit host-side delivery step:
+
+```bash
+commit="$(git -C ~/.config/run-codex/worktrees/my-project/review rev-parse HEAD)"
+printf '%s\n' 'Please review the result at the attached revision.' > /tmp/review-message.txt
+message_id="$(codex-collab send my-project --lane review --to default \
+  --kind result-available --revision "$commit" --body-file /tmp/review-message.txt)"
+codex-collab deliver my-project --lane review "$message_id"
+codex-collab list my-project --lane default
+codex-collab read my-project --lane default "$message_id"
+codex-collab ack my-project --lane default "$message_id"
+codex-collab prune my-project --lane review
+codex-collab prune my-project --lane default
+```
+
+`send` writes only an immutable record in the selected source lane's host-side
+outbox. `deliver` validates its project, lanes, full commit, body hash, and
+recipient before atomically copying it to the declared inbox. Repeated delivery
+and acknowledgment are idempotent; a reused ID with different content is
+quarantined and reported as divergence. Message bodies are inert data, limited
+to 64 KiB, and never authorize commands, approvals, wakeups, Git operations, or
+merges. The controller supports `question`, `interface-proposal`,
+`result-available`, `review-finding`, and `integration-result`; importing an
+accepted result remains the separate explicit `run-codex --import` operation.
+Capacity is limited to 1,000 unresolved records per inbox or outbox; valid
+delivery and acknowledgment markers remove completed records from that count.
+Records remain available for audit until the host operator explicitly runs
+`prune` for each participating lane. Pruning removes only outbox records with a
+valid delivery receipt and inbox records with a valid acknowledgment; malformed,
+unresolved, or concurrently changed records are retained and reported.
+
+This first controller slice is local to one host's registered linked-worktree
+lanes. It does not yet broker messages across machines or automatically wake an
+agent. Run the command on the host, not inside an agent container; containers
+do not receive the other lane's inbox or state directory.
 
 To copy only login and user configuration into a new lane, opt in during
 registration:
