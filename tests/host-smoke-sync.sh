@@ -112,6 +112,36 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
             "$@"
     }
 
+    handoff_sync_root="$TEST_ROOT/handoff-sync"
+    handoff_project='handoff-project'
+    handoff_lane='default'
+    handoff_commit='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    handoff_profile='generic'
+    handoff_version='test-version'
+    handoff_revision='abcdef1234567'
+    handoff_onboarding_hash='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+
+    run_handoff() {
+        local machine="$1"
+        shift
+
+        env \
+            "HOME=$TEST_ROOT/$machine/home" \
+            "CODEX_DIR=$TEST_ROOT/$machine/live" \
+            "CODEX_SYNC_DIR=$handoff_sync_root" \
+            "CODEX_LOCK_FILE=$TEST_ROOT/handoff.lock" \
+            "XDG_STATE_HOME=$TEST_ROOT/$machine/state" \
+            "CODEX_HANDOFF_PROJECT=$handoff_project" \
+            "CODEX_HANDOFF_LANE=$handoff_lane" \
+            "CODEX_HANDOFF_COMMIT=$handoff_commit" \
+            "CODEX_HANDOFF_RUNTIME_PROFILE=$handoff_profile" \
+            "CODEX_HANDOFF_RUNTIME_VERSION=$handoff_version" \
+            "CODEX_HANDOFF_RUNTIME_REVISION=$handoff_revision" \
+            "CODEX_HANDOFF_ONBOARDING_SHA256=$handoff_onboarding_hash" \
+            'CODEX_HANDOFF_READY=1' \
+            "$@"
+    }
+
     fixture_state_hash() {
         local dir="$1"
 
@@ -476,6 +506,132 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
        'must survive validation failures' ]] ||
         fail "restored hash mismatch changed live state"
     pass "bad archives and restored hash mismatches are nonmutating"
+
+    handoff_source="$TEST_ROOT/handoff-a"
+    handoff_destination="$TEST_ROOT/handoff-b"
+    mkdir -p "$handoff_source/live" "$handoff_source/home" \
+        "$handoff_destination/live" "$handoff_destination/home"
+    printf 'contextual handoff state\n' > "$handoff_source/live/payload"
+    mkdir -p "$handoff_sync_root"
+    run_handoff handoff-a "$PUSH_COMMAND" >/dev/null
+    handoff_state="$(find "$handoff_sync_root" -maxdepth 1 -name '*.state' -print -quit)"
+    [[ -n "$handoff_state" ]] || fail "contextual push did not publish snapshot metadata"
+    for handoff_field in \
+        'handoff_format=1' \
+        "project=$handoff_project" \
+        "lane=$handoff_lane" \
+        "required_commit=$handoff_commit" \
+        "runtime_profile=$handoff_profile" \
+        "runtime_version=$handoff_version" \
+        "runtime_revision=$handoff_revision" \
+        "onboarding_sha256=$handoff_onboarding_hash"; do
+        grep -Fxq -- "$handoff_field" "$handoff_state" ||
+            fail "contextual push omitted $handoff_field"
+    done
+
+    original_handoff_commit="$handoff_commit"
+    handoff_commit='cccccccccccccccccccccccccccccccccccccccc'
+    updated_handoff_output="$(run_handoff handoff-a "$PUSH_COMMAND")"
+    assert_contains "$updated_handoff_output" \
+        "publishing updated lane handoff requirements"
+    updated_handoff_state="$(
+        grep -l '^generation=2$' "$handoff_sync_root"/*.state
+    )"
+    [[ -n "$updated_handoff_state" ]] ||
+        fail "changed handoff requirements did not publish a new generation"
+    grep -Fxq "required_commit=$handoff_commit" "$updated_handoff_state" ||
+        fail "new handoff generation did not record changed requirements"
+    handoff_commit="$original_handoff_commit"
+
+    mkdir -p "$TEST_ROOT/handoff-c/live" "$TEST_ROOT/handoff-c/home"
+    cp -- "$handoff_source/live/payload" "$TEST_ROOT/handoff-c/live/payload"
+    no_base_handoff_output="$(run_handoff handoff-c "$PUSH_COMMAND")"
+    assert_contains "$no_base_handoff_output" \
+        "publishing lane handoff requirements"
+    no_base_handoff_state="$(
+        grep -l '^generation=3$' "$handoff_sync_root"/*.state
+    )"
+    [[ -n "$no_base_handoff_state" ]] ||
+        fail "matching state without a baseline did not advance handoff metadata"
+    grep -Fxq "required_commit=$handoff_commit" "$no_base_handoff_state" ||
+        fail "no-baseline handoff generation recorded the wrong requirements"
+    handoff_list="$(run_handoff handoff-a "$PULL_COMMAND" --list)"
+    assert_contains "$handoff_list" "REQUIREMENTS"
+    assert_contains "$handoff_list" "$handoff_project/$handoff_lane"
+    assert_contains "$handoff_list" "${handoff_commit:0:12}"
+    assert_contains "$handoff_list" \
+        "$handoff_profile:$handoff_version@${handoff_revision:0:12}"
+
+    partial_root="$TEST_ROOT/handoff-partial"
+    mkdir -p "$partial_root/live" "$partial_root/home"
+    printf 'partial context survives\n' > "$partial_root/live/payload"
+    if env \
+        "HOME=$partial_root/home" \
+        "CODEX_DIR=$partial_root/live" \
+        "CODEX_SYNC_DIR=$partial_root/sync" \
+        "CODEX_LOCK_FILE=$partial_root/handoff.lock" \
+        "XDG_STATE_HOME=$partial_root/state" \
+        "CODEX_HANDOFF_PROJECT=$handoff_project" \
+        "$PUSH_COMMAND" >"$partial_root/partial.log" 2>&1; then
+        fail "partial handoff context was accepted"
+    fi
+    [[ ! -e "$partial_root/sync" && ! -e "$partial_root/state" &&
+       ! -e "$partial_root/handoff.lock" ]] ||
+        fail "partial handoff context mutated synchronization state"
+
+    printf 'destination survives missing lane context\n' > \
+        "$handoff_destination/live/payload"
+    handoff_destination_before="$(fixture_state_hash "$handoff_destination/live")"
+    if env \
+        "HOME=$handoff_destination/home" \
+        "CODEX_DIR=$handoff_destination/live" \
+        "CODEX_SYNC_DIR=$handoff_sync_root" \
+        "CODEX_LOCK_FILE=$TEST_ROOT/handoff.lock" \
+        "XDG_STATE_HOME=$handoff_destination/state" \
+        "$PULL_COMMAND" --force 1 \
+        >"$handoff_destination/missing-context.log" 2>&1; then
+        fail "contextual restore without lane context was accepted"
+    fi
+    [[ "$(fixture_state_hash "$handoff_destination/live")" == \
+       "$handoff_destination_before" ]] ||
+        fail "missing lane context changed destination state"
+
+    for wrong_context in commit runtime onboarding; do
+        wrong_root="$TEST_ROOT/handoff-wrong-$wrong_context"
+        mkdir -p "$wrong_root/live" "$wrong_root/home"
+        printf 'wrong context survives\n' > "$wrong_root/live/payload"
+        wrong_before="$(fixture_state_hash "$wrong_root/live")"
+        case "$wrong_context" in
+            commit) wrong_value='cccccccccccccccccccccccccccccccccccccccc' ;;
+            runtime) wrong_value='other-version' ;;
+            onboarding) wrong_value='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd' ;;
+        esac
+        if env \
+            "HOME=$wrong_root/home" \
+            "CODEX_DIR=$wrong_root/live" \
+            "CODEX_SYNC_DIR=$handoff_sync_root" \
+            "CODEX_LOCK_FILE=$TEST_ROOT/handoff.lock" \
+            "XDG_STATE_HOME=$wrong_root/state" \
+            "CODEX_HANDOFF_PROJECT=$handoff_project" \
+            "CODEX_HANDOFF_LANE=$handoff_lane" \
+            "CODEX_HANDOFF_COMMIT=$([[ "$wrong_context" == commit ]] && printf '%s' "$wrong_value" || printf '%s' "$handoff_commit")" \
+            "CODEX_HANDOFF_RUNTIME_PROFILE=$handoff_profile" \
+            "CODEX_HANDOFF_RUNTIME_VERSION=$([[ "$wrong_context" == runtime ]] && printf '%s' "$wrong_value" || printf '%s' "$handoff_version")" \
+            "CODEX_HANDOFF_RUNTIME_REVISION=$handoff_revision" \
+            "CODEX_HANDOFF_ONBOARDING_SHA256=$([[ "$wrong_context" == onboarding ]] && printf '%s' "$wrong_value" || printf '%s' "$handoff_onboarding_hash")" \
+            'CODEX_HANDOFF_READY=1' \
+            "$PULL_COMMAND" --force 1 >"$wrong_root/$wrong_context.log" 2>&1; then
+            fail "wrong $wrong_context handoff context was accepted"
+        fi
+        [[ "$(fixture_state_hash "$wrong_root/live")" == "$wrong_before" ]] ||
+            fail "wrong $wrong_context context changed live state"
+    done
+
+    run_handoff handoff-b "$PULL_COMMAND" --force 1 >/dev/null
+    [[ "$(<"$handoff_destination/live/payload")" == \
+       'contextual handoff state' ]] ||
+        fail "matching handoff context did not restore across machine roots"
+    pass "lane handoff metadata is published, validated, and nonmutating"
 
     rollback_root="$TEST_ROOT/rollback"
     mkdir -p "$rollback_root/live" "$rollback_root/home" "$rollback_root/sync"

@@ -1295,6 +1295,29 @@ printf '%s\n' review-state > \
 "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --lane review --push-state >/dev/null
 compgen -G "$TEST_ROOT/lane-sync/projects/smoke-project/lanes/review/codex-g*.tar.zst.state" >/dev/null ||
     fail "review lane state push did not use its independent snapshot namespace"
+review_handoff_state="$(find \
+    "$TEST_ROOT/lane-sync/projects/smoke-project/lanes/review" \
+    -maxdepth 1 -name '*.state' -print -quit)"
+[[ -n "$review_handoff_state" ]] ||
+    fail "review lane state push did not publish handoff metadata"
+review_required_commit="$(git -C "$TEST_ROOT/repo-linked" rev-parse HEAD)"
+grep -Fxq 'handoff_format=1' "$review_handoff_state" ||
+    fail "review lane state omitted handoff format"
+grep -Fxq 'project=smoke-project' "$review_handoff_state" ||
+    fail "review lane state omitted project handoff field"
+grep -Fxq 'lane=review' "$review_handoff_state" ||
+    fail "review lane state omitted lane handoff field"
+grep -Fxq "required_commit=$review_required_commit" "$review_handoff_state" ||
+    fail "review lane state omitted required HEAD commit"
+grep -Fxq 'runtime_profile=generic' "$review_handoff_state" ||
+    fail "review lane state omitted runtime profile"
+grep -Fxq 'runtime_version=test-version' "$review_handoff_state" ||
+    fail "review lane state omitted runtime version"
+grep -Fxq 'runtime_revision=0123456789abcdef' "$review_handoff_state" ||
+    fail "review lane state omitted runtime revision"
+grep -Eq '^onboarding_sha256=[0-9a-f]{64}$' "$review_handoff_state" ||
+    fail "review lane state omitted a valid onboarding contract hash"
+pass "lane state publishes contextual handoff requirements"
 lane_state_list="$(
     "${launcher_env[@]}" "$ROOT/bin/run-codex" \
         smoke-project --lane review --list-state

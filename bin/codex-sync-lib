@@ -24,6 +24,62 @@ SNAPSHOT_GENERATION=""
 SNAPSHOT_HASH=""
 SNAPSHOT_ARCHIVE=""
 SNAPSHOT_ARCHIVE_PATH=""
+SNAPSHOT_STATE_FILE=""
+SNAPSHOT_HANDOFF_FORMAT=""
+SNAPSHOT_PROJECT=""
+SNAPSHOT_LANE=""
+SNAPSHOT_REQUIRED_COMMIT=""
+SNAPSHOT_RUNTIME_PROFILE=""
+SNAPSHOT_RUNTIME_VERSION=""
+SNAPSHOT_RUNTIME_REVISION=""
+SNAPSHOT_ONBOARDING_SHA256=""
+
+valid_handoff_id() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+}
+
+valid_required_commit() {
+    [[ "$1" =~ ^[0-9a-f]{40}$ || "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+valid_runtime_value() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
+}
+
+snapshot_handoff_metadata_is_valid() {
+    local state_file="$1"
+    local handoff_format
+
+    handoff_format="$(state_value "$state_file" handoff_format)"
+    SNAPSHOT_HANDOFF_FORMAT="$handoff_format"
+    SNAPSHOT_PROJECT=""
+    SNAPSHOT_LANE=""
+    SNAPSHOT_REQUIRED_COMMIT=""
+    SNAPSHOT_RUNTIME_PROFILE=""
+    SNAPSHOT_RUNTIME_VERSION=""
+    SNAPSHOT_RUNTIME_REVISION=""
+    SNAPSHOT_ONBOARDING_SHA256=""
+
+    # Format-1 snapshots created before lane handoff metadata remain readable.
+    [[ -n "$handoff_format" ]] || return 0
+    [[ "$handoff_format" == 1 ]] || return 1
+
+    SNAPSHOT_PROJECT="$(state_value "$state_file" project)"
+    SNAPSHOT_LANE="$(state_value "$state_file" lane)"
+    SNAPSHOT_REQUIRED_COMMIT="$(state_value "$state_file" required_commit)"
+    SNAPSHOT_RUNTIME_PROFILE="$(state_value "$state_file" runtime_profile)"
+    SNAPSHOT_RUNTIME_VERSION="$(state_value "$state_file" runtime_version)"
+    SNAPSHOT_RUNTIME_REVISION="$(state_value "$state_file" runtime_revision)"
+    SNAPSHOT_ONBOARDING_SHA256="$(state_value "$state_file" onboarding_sha256)"
+
+    valid_handoff_id "$SNAPSHOT_PROJECT" || return 1
+    valid_handoff_id "$SNAPSHOT_LANE" || return 1
+    valid_required_commit "$SNAPSHOT_REQUIRED_COMMIT" || return 1
+    valid_handoff_id "$SNAPSHOT_RUNTIME_PROFILE" || return 1
+    valid_runtime_value "$SNAPSHOT_RUNTIME_VERSION" || return 1
+    [[ "$SNAPSHOT_RUNTIME_REVISION" =~ ^[0-9a-f]{7,64}$ ]] || return 1
+    valid_hash "$SNAPSHOT_ONBOARDING_SHA256" || return 1
+}
 
 snapshot_metadata_is_valid() {
     local state_file="$1"
@@ -40,10 +96,12 @@ snapshot_metadata_is_valid() {
     valid_hash "$hash" || return 1
     [[ -n "$archive" && "$archive" != */* ]] || return 1
     [[ "$(basename "$state_file")" == "$archive.state" ]] || return 1
+    snapshot_handoff_metadata_is_valid "$state_file" || return 1
 
     SNAPSHOT_GENERATION=$((10#$generation))
     SNAPSHOT_HASH="$hash"
     SNAPSHOT_ARCHIVE="$archive"
+    SNAPSHOT_STATE_FILE="$state_file"
     return 0
 }
 

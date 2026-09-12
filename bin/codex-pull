@@ -9,6 +9,14 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-handoff"
 BASE_FILE="$STATE_DIR/base.state"
 CONTAINER_PROJECT="${CODEX_CONTAINER_PROJECT:-}"
 CONTAINER_LANE="${CODEX_CONTAINER_LANE:-}"
+HANDOFF_PROJECT="${CODEX_HANDOFF_PROJECT:-}"
+HANDOFF_LANE="${CODEX_HANDOFF_LANE:-}"
+HANDOFF_COMMIT="${CODEX_HANDOFF_COMMIT:-}"
+HANDOFF_RUNTIME_PROFILE="${CODEX_HANDOFF_RUNTIME_PROFILE:-}"
+HANDOFF_RUNTIME_VERSION="${CODEX_HANDOFF_RUNTIME_VERSION:-}"
+HANDOFF_RUNTIME_REVISION="${CODEX_HANDOFF_RUNTIME_REVISION:-}"
+HANDOFF_ONBOARDING_SHA256="${CODEX_HANDOFF_ONBOARDING_SHA256:-}"
+HANDOFF_READY="${CODEX_HANDOFF_READY:-}"
 
 usage() {
     cat <<'USAGE'
@@ -71,6 +79,48 @@ done
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=bin/codex-sync-lib
 source "$SCRIPT_DIR/codex-sync-lib"
+
+HANDOFF_ENABLED=false
+validate_handoff_context() {
+    local values=(
+        "$HANDOFF_PROJECT"
+        "$HANDOFF_LANE"
+        "$HANDOFF_COMMIT"
+        "$HANDOFF_RUNTIME_PROFILE"
+        "$HANDOFF_RUNTIME_VERSION"
+        "$HANDOFF_RUNTIME_REVISION"
+        "$HANDOFF_ONBOARDING_SHA256"
+        "$HANDOFF_READY"
+    )
+    local value present=0
+
+    for value in "${values[@]}"; do
+        [[ -z "$value" ]] || ((present += 1))
+    done
+    ((present > 0)) || return 0
+    ((present == ${#values[@]})) ||
+        die "Incomplete lane handoff context"
+
+    valid_handoff_id "$HANDOFF_PROJECT" || die "Invalid handoff project"
+    valid_handoff_id "$HANDOFF_LANE" || die "Invalid handoff lane"
+    valid_required_commit "$HANDOFF_COMMIT" ||
+        die "Invalid handoff required commit"
+    valid_handoff_id "$HANDOFF_RUNTIME_PROFILE" ||
+        die "Invalid handoff runtime profile"
+    valid_runtime_value "$HANDOFF_RUNTIME_VERSION" ||
+        die "Invalid handoff runtime version"
+    [[ "$HANDOFF_RUNTIME_REVISION" =~ ^[0-9a-f]{7,64}$ ]] ||
+        die "Invalid handoff runtime revision"
+    valid_hash "$HANDOFF_ONBOARDING_SHA256" ||
+        die "Invalid handoff onboarding contract hash"
+    [[ "$HANDOFF_READY" == 1 ]] ||
+        die "Destination lane onboarding is not ready for handoff"
+    HANDOFF_ENABLED=true
+}
+
+if [[ "$MODE" != list ]]; then
+    validate_handoff_context
+fi
 
 normalize_path() {
     local variable="$1"
@@ -249,12 +299,14 @@ load_latest_metadata() {
 
 SELECTED_ARCHIVE=""
 SELECTED_HASH=""
+SELECTED_STATE_FILE=""
 
 archive_is_valid() {
     local state_file="$1"
 
     snapshot_archive_is_valid "$state_file" "$SYNC_DIR" || return 1
     SELECTED_ARCHIVE="$SNAPSHOT_ARCHIVE_PATH"
+    SELECTED_STATE_FILE="$state_file"
 }
 
 select_snapshot() {
@@ -267,6 +319,7 @@ select_snapshot() {
 
     SELECTED_ARCHIVE=""
     SELECTED_HASH=""
+    SELECTED_STATE_FILE=""
 
     if ! shopt -q nullglob; then
         shopt -s nullglob
@@ -305,6 +358,33 @@ select_snapshot() {
     SELECTED_HASH="$expected_hash"
 }
 
+validate_selected_handoff() {
+    snapshot_metadata_is_valid "$SELECTED_STATE_FILE" ||
+        die "Selected snapshot metadata is invalid: $SELECTED_STATE_FILE"
+
+    if [[ -z "$SNAPSHOT_HANDOFF_FORMAT" ]]; then
+        if $HANDOFF_ENABLED; then
+            echo "WARNING: selected legacy snapshot has no lane handoff requirements." >&2
+        fi
+        return 0
+    fi
+
+    $HANDOFF_ENABLED ||
+        die "Snapshot contains lane handoff metadata; use the lane-aware run-codex command"
+    [[ "$SNAPSHOT_PROJECT" == "$HANDOFF_PROJECT" &&
+       "$SNAPSHOT_LANE" == "$HANDOFF_LANE" ]] ||
+        die "Snapshot belongs to project '$SNAPSHOT_PROJECT' lane '$SNAPSHOT_LANE'"
+    [[ "$SNAPSHOT_REQUIRED_COMMIT" == "$HANDOFF_COMMIT" ]] ||
+        die "Destination checkout must be at required commit $SNAPSHOT_REQUIRED_COMMIT (currently $HANDOFF_COMMIT)"
+    [[ "$SNAPSHOT_RUNTIME_PROFILE" == "$HANDOFF_RUNTIME_PROFILE" ]] ||
+        die "Destination runtime profile must be '$SNAPSHOT_RUNTIME_PROFILE'"
+    [[ "$SNAPSHOT_RUNTIME_VERSION" == "$HANDOFF_RUNTIME_VERSION" &&
+       "$SNAPSHOT_RUNTIME_REVISION" == "$HANDOFF_RUNTIME_REVISION" ]] ||
+        die "Destination runtime must match version $SNAPSHOT_RUNTIME_VERSION revision $SNAPSHOT_RUNTIME_REVISION"
+    [[ "$SNAPSHOT_ONBOARDING_SHA256" == "$HANDOFF_ONBOARDING_SHA256" ]] ||
+        die "Destination onboarding declarations do not match the snapshot handoff contract"
+}
+
 select_or_die() {
     local generation="$1"
     local result
@@ -323,7 +403,7 @@ select_or_die() {
 }
 
 list_snapshots() {
-    local state_file generation hash created host archive status
+    local state_file generation hash created host archive status requirements
     local restore_nullglob=false
 
     if ! shopt -q nullglob; then
@@ -340,8 +420,8 @@ list_snapshots() {
         return 0
     fi
 
-    printf '%-12s %-17s %-20s %-10s %s\n' \
-        "GENERATION" "CREATED" "HOST" "STATUS" "ARCHIVE"
+    printf '%-12s %-17s %-20s %-10s %-42s %s\n' \
+        "GENERATION" "CREATED" "HOST" "STATUS" "REQUIREMENTS" "ARCHIVE"
 
     while IFS= read -r state_file; do
         generation="$(state_value "$state_file" generation)"
@@ -350,14 +430,19 @@ list_snapshots() {
         host="$(state_value "$state_file" host)"
         archive="$(state_value "$state_file" archive)"
         status="INVALID"
+        requirements="-"
 
         if [[ "$generation" =~ ^[0-9]+$ ]] && valid_hash "$hash" &&
            archive_is_valid "$state_file"; then
             status="OK"
+            if [[ -n "$SNAPSHOT_HANDOFF_FORMAT" ]]; then
+                requirements="${SNAPSHOT_PROJECT}/${SNAPSHOT_LANE} ${SNAPSHOT_REQUIRED_COMMIT:0:12} ${SNAPSHOT_RUNTIME_PROFILE}:${SNAPSHOT_RUNTIME_VERSION}@${SNAPSHOT_RUNTIME_REVISION:0:12}"
+            fi
         fi
 
-        printf '%-12s %-17s %-20s %-10s %s\n' \
-            "${generation:--}" "${created:--}" "${host:--}" "$status" "${archive:--}"
+        printf '%-12s %-17s %-20s %-10s %-42s %s\n' \
+            "${generation:--}" "${created:--}" "${host:--}" "$status" \
+            "$requirements" "${archive:--}"
     done < <(printf '%s\n' "${files[@]}" | LC_ALL=C sort)
 }
 
@@ -443,9 +528,11 @@ if [[ "$MODE" == force ]]; then
     # Forced recovery depends only on the requested generation. The remote
     # head may still be arriving through the synchronization provider.
     select_or_die "$WANTED_GEN"
+    validate_selected_handoff
 else
     # The normal forward path must restore a complete, checksum-valid head.
     select_or_die "$REMOTE_GEN"
+    validate_selected_handoff
     LATEST_ARCHIVE="$SELECTED_ARCHIVE"
 
     if $HAVE_BASE; then

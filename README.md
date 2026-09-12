@@ -1290,6 +1290,17 @@ transactional archive, checksum, marker, database validation, divergence, and
 rollback implementation as `codex-push` and `codex-pull`. Code commits and
 checkout-local onboarding inputs remain separate from the Codex-state snapshot.
 
+Lane-aware pushes require a clean checkout, completed onboarding, and a locally
+available image. The snapshot marker records the exact required Git commit,
+project/lane identity, image profile plus immutable OCI version/revision, and a
+hash of the declared onboarding contract. Pull and forced recovery validate
+those requirements before replacing live state. The destination checkout path
+may differ, but it must be clean, checked out at the recorded commit, use the
+recorded runtime, carry the same onboarding declarations, and pass its local
+readiness checks. A mismatch is a resumable refusal: provision or rebind the
+destination and run the same pull again. Forced recovery does not bypass these
+code/runtime/onboarding requirements.
+
 ### Declare and provision checkout-local files
 
 A lane may require ignored configuration before normal work can start. Put a
@@ -1709,26 +1720,39 @@ Project registration is machine-local, so an existing Git checkout can be
 registered on machine B while Codex is still running on machine A:
 
 ```bash
-run-codex --init --profile cuda same-project /another/path
+run-codex --init --lane same-lane --profile cuda same-project /another/path
 ```
 
 This command only registers the checkout; it does not start Codex or hand off
-its state. There is no need to finish the current task on machine A, but before
-starting Codex on machine B, exit every Codex session and container on machine
-A, run `codex-push`, and wait for the snapshot directory to finish
-synchronizing. On a machine with no local synchronization baseline, inspect the
-available generations and explicitly adopt the newest one before launching the
-project:
+its state. Use the same project and lane names on both machines. Before
+switching ownership, commit and publish the lane's code, complete its onboarding
+check, exit its Codex container on machine A, and publish the contextual state:
 
 ```bash
-codex-pull --list
-codex-pull --force GENERATION
-run-codex same-project
+git -C /path/to/machine-a-checkout status --short
+run-codex same-project --lane same-lane --check
+run-codex same-project --lane same-lane --push-state
 ```
 
-After initial adoption, use ordinary `codex-pull` for later handoffs. Only one
-machine should actively modify the shared Codex state at a time. The snapshots
-contain `~/.codex`, not the project checkout, so transfer commits and any
+Wait for the snapshot provider to finish. On machine B, list the synchronized
+generations; the `REQUIREMENTS` column shows the abbreviated required commit and
+runtime. Fetch/check out that exact commit, install or select the same immutable
+image version, complete destination onboarding, and explicitly adopt the newest
+generation on first use:
+
+```bash
+run-codex same-project --lane same-lane --list-state
+git -C /another/path switch SAME_LANE_BRANCH
+git -C /another/path merge --ff-only REQUIRED_COMMIT
+run-codex same-project --lane same-lane --onboard
+run-codex same-project --lane same-lane --check
+run-codex same-project --lane same-lane --force-state GENERATION
+run-codex same-project --lane same-lane --new
+```
+
+For later forward handoffs, use `--pull-state` instead of `--force-state`.
+Only one machine should actively modify a lane's state at a time. The snapshots
+contain lane Codex state, not the project checkout, so transfer commits and any
 uncommitted working-tree changes separately.
 
 Protect the Seafile library with a strong, unique password. Snapshots can contain Codex authentication material and session history; keep the password separate from the repository and synchronized data.

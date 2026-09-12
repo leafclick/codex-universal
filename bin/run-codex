@@ -1969,6 +1969,8 @@ run_lane_state_sync() {
     local mode="$1"
     local launcher_source launcher_dir command
     local lane_sync_dir lane_state_dir
+    local handoff_commit="" onboarding_hash=""
+    local runtime_version="" runtime_revision=""
     local args=()
 
     launcher_source="$(realpath -e -- "${BASH_SOURCE[0]}")" ||
@@ -1997,11 +1999,49 @@ run_lane_state_sync() {
     [[ -x "$command" ]] ||
         die "Missing synchronization companion command: $command"
 
+    if [[ "$mode" != list-state ]]; then
+        [[ -z "$(git -C "$PROJECT_PATH" status --porcelain=v1 --untracked-files=all)" ]] ||
+            die "Preserve or remove checkout changes before handing off lane '$LANE'"
+        handoff_commit="$(git -C "$PROJECT_PATH" rev-parse --verify HEAD^{commit})" ||
+            die "Cannot resolve the lane's required Git commit"
+
+        need jq
+        need sha256sum
+        load_onboarding_manifests "$PROJECT" "$LANE"
+        if ! check_onboarding true; then
+            check_onboarding false || true
+            die "Complete destination-ready onboarding before handing off lane '$LANE'"
+        fi
+        onboarding_hash="$(onboarding_contract_hash)" ||
+            die "Cannot calculate the onboarding handoff contract"
+
+        need docker
+        docker info >/dev/null 2>&1 || die "Docker daemon is not available"
+        runtime_version="$(
+            docker image inspect --format \
+                '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+                "$IMAGE" 2>/dev/null
+        )" || die "Required handoff image is not available locally: $IMAGE"
+        runtime_revision="$(
+            docker image inspect --format \
+                '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                "$IMAGE" 2>/dev/null
+        )" || die "Cannot inspect handoff image revision: $IMAGE"
+    fi
+
     CODEX_DIR="$CODEX_HOST_HOME" \
     CODEX_SYNC_DIR="$lane_sync_dir" \
     CODEX_LOCK_FILE="$LOCK_FILE" \
     CODEX_CONTAINER_PROJECT="$PROJECT" \
     CODEX_CONTAINER_LANE="$LANE" \
+    CODEX_HANDOFF_PROJECT="$PROJECT" \
+    CODEX_HANDOFF_LANE="$LANE" \
+    CODEX_HANDOFF_COMMIT="$handoff_commit" \
+    CODEX_HANDOFF_RUNTIME_PROFILE="$PROFILE" \
+    CODEX_HANDOFF_RUNTIME_VERSION="$runtime_version" \
+    CODEX_HANDOFF_RUNTIME_REVISION="$runtime_revision" \
+    CODEX_HANDOFF_ONBOARDING_SHA256="$onboarding_hash" \
+    CODEX_HANDOFF_READY="$([[ "$mode" == list-state ]] || printf 1)" \
     XDG_STATE_HOME="$lane_state_dir" \
         exec "$command" "${args[@]}"
 }
@@ -2065,6 +2105,17 @@ load_onboarding_manifests() {
         need stat
         need install
     fi
+}
+
+onboarding_contract_hash() {
+    if ((${#ONBOARDING_MANIFESTS[@]} == 0)); then
+        printf '' | sha256sum | awk '{print $1}'
+        return
+    fi
+
+    for manifest in "${ONBOARDING_MANIFESTS[@]}"; do
+        jq -cS . "$manifest"
+    done | LC_ALL=C sort | sha256sum | awk '{print $1}'
 }
 
 safe_onboarding_file() {

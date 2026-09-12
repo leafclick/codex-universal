@@ -36,7 +36,7 @@ not a current handoff correctness defect.
 
 | ID | Type | Work item | Evidence | Status | Complexity | Reason |
 |---:|---|---|---|---|---|---|
-| 44 | New feature | Add project/lane isolation, independent state handoff, and cooperation between isolated agents. | SOURCE IMPLEMENTED (partial) | Local lanes now have distinct checkout/state/cache/container/lock identities, linked-worktree support, onboarding gates, per-lane snapshot namespaces, and fixed-revision Codex review with independent model/context. Second-machine acceptance, durable peer messaging, result import, and a future Claude adapter remain. See `docs/project-isolation-plan.md`. | H, phased | Preserve the user's IDEA checkout while enabling independent experiments and cross-machine work. |
+| 44 | New feature | Add project/lane isolation, independent state handoff, and cooperation between isolated agents. | SOURCE IMPLEMENTED (partial) | Local lanes now have distinct checkout/state/cache/container/lock identities, linked-worktree support, onboarding gates, contextual handoff markers that enforce commit/runtime/onboarding requirements before restore, and fixed-revision Codex review with independent model/context. Live second-machine acceptance, durable peer messaging, result import, and a future Claude adapter remain. See `docs/project-isolation-plan.md`. | H, phased | Preserve the user's IDEA checkout while enabling independent experiments and cross-machine work. |
 
 ### Selective synchronization design gate
 
