@@ -8,6 +8,7 @@ LANES_DIR="$CONFIG_ROOT/lanes"
 STATE_ROOT="$CONFIG_ROOT/state"
 LOCK_ROOT="$CONFIG_ROOT/locks"
 MAX_BODY_BYTES=65536
+MAX_RECORD_BYTES=$((MAX_BODY_BYTES * 6 + 8192))
 MAX_PENDING_MESSAGES=1000
 
 usage() {
@@ -18,6 +19,7 @@ Usage:
   codex-collab list PROJECT --lane LANE
   codex-collab read PROJECT --lane LANE MESSAGE_ID
   codex-collab ack PROJECT --lane LANE MESSAGE_ID
+  codex-collab prune PROJECT --lane LANE
 
 Kinds:
   question | interface-proposal | result-available | review-finding | integration-result
@@ -296,9 +298,24 @@ lock_lanes() {
 }
 
 pending_count() {
-    local dir="$1"
-    find "$dir" -mindepth 1 -maxdepth 1 -type f -name '*.json' -printf . |
-        wc -c
+    local records="$1"
+    local markers="$2"
+    local timestamp_key="$3"
+    local file name id digest count=0
+
+    while IFS= read -r -d '' file; do
+        name="${file##*/}"
+        id="${name%.json}"
+        if [[ -n "$markers" && ( -e "$markers/$id.json" || -L "$markers/$id.json" ) ]] &&
+            (validate_message_id "$id" &&
+             digest="$(message_hash "$file")" &&
+             validate_marker_file "$markers/$id.json" "$id" "$digest" "$timestamp_key") \
+                >/dev/null 2>&1; then
+            continue
+        fi
+        count=$((count + 1))
+    done < <(find "$records" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0)
+    printf '%s\n' "$count"
 }
 
 message_hash() {
@@ -315,7 +332,7 @@ validate_message_file() {
 
     [[ -f "$file" && ! -L "$file" ]] || die "Message is not a regular file: $file"
     size="$(stat -c %s -- "$file")" || die "Cannot inspect message: $file"
-    ((size <= MAX_BODY_BYTES + 8192)) || die "Message record is oversized: $file"
+    ((size <= MAX_RECORD_BYTES)) || die "Message record is oversized: $file"
     jq -e --argjson max "$MAX_BODY_BYTES" '
         type == "object" and
         keys == ["body","body_sha256","created_at","from_lane","id","kind","project","revision","to_lane","version"] and
@@ -372,7 +389,7 @@ command_send() {
     local revision="$5"
     local body_file="$6"
     local source_path source_common recipient_path recipient_common commit
-    local outbox id final tmp body_size body_hash created count
+    local outbox delivered id final tmp body_size body_hash created count
 
     validate_kind "$kind"
     validate_commit_id "$revision"
@@ -403,7 +420,8 @@ command_send() {
 
     lock_lanes "$project" "$from_lane"
     outbox="$(ensure_mailbox "$project" "$from_lane" outbox)"
-    count="$(pending_count "$outbox")"
+    delivered="$(ensure_mailbox "$project" "$from_lane" delivered)"
+    count="$(pending_count "$outbox" "$delivered" delivered_at)"
     ((count < MAX_PENDING_MESSAGES)) || die "Sender outbox message limit reached"
     id="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
     validate_message_id "$id"
@@ -442,8 +460,8 @@ command_deliver() {
     local from_lane="$2"
     local id="$3"
     local sender_path sender_common to_lane recipient_path recipient_common
-    local outbox inbox delivered quarantine source final tmp="" digest receipt receipt_tmp=""
-    local quarantine_tmp="" quarantine_final source_digest_before revision
+    local outbox inbox delivered acks quarantine source final tmp="" digest receipt receipt_tmp=""
+    local quarantine_final source_digest_before revision
 
     validate_message_id "$id"
     load_lane "$project" "$from_lane"
@@ -474,47 +492,45 @@ command_deliver() {
         trap - EXIT HUP INT TERM
         [[ -z "$tmp" ]] || rm -f -- "$tmp"
         [[ -z "$receipt_tmp" ]] || rm -f -- "$receipt_tmp"
-        [[ -z "$quarantine_tmp" ]] || rm -f -- "$quarantine_tmp"
         exit "$status"
     }
     trap cleanup_deliver EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    validate_message_file "$source" "$id"
-    [[ "$(message_hash "$source")" == "$source_digest_before" ]] ||
-        die "Message changed while delivery was being prepared: $id"
-    [[ "$(jq -r '.project' "$source")" == "$project" &&
-       "$(jq -r '.from_lane' "$source")" == "$from_lane" &&
-       "$(jq -r '.to_lane' "$source")" == "$to_lane" &&
-       "$(jq -r '.revision' "$source")" == "$revision" ]] ||
-        die "Message binding changed while delivery was being prepared: $id"
     inbox="$(ensure_mailbox "$project" "$to_lane" inbox)"
     delivered="$(ensure_mailbox "$project" "$from_lane" delivered)"
+    acks="$(ensure_mailbox "$project" "$to_lane" acks)"
+    tmp="$(mktemp "$inbox/.${id}.json.XXXXXX")"
+    install -m 600 -- "$source" "$tmp"
+    validate_message_file "$tmp" "$id"
+    digest="$(message_hash "$tmp")"
+    [[ "$digest" == "$source_digest_before" ]] ||
+        die "Message changed while delivery was being prepared: $id"
+    [[ "$(jq -r '.project' "$tmp")" == "$project" &&
+       "$(jq -r '.from_lane' "$tmp")" == "$from_lane" &&
+       "$(jq -r '.to_lane' "$tmp")" == "$to_lane" &&
+       "$(jq -r '.revision' "$tmp")" == "$revision" ]] ||
+        die "Message binding changed while delivery was being prepared: $id"
     final="$inbox/$id.json"
-    digest="$(message_hash "$source")"
     receipt="$delivered/$id.json"
     if [[ -e "$receipt" || -L "$receipt" ]]; then
         validate_marker_file "$receipt" "$id" "$digest" delivered_at
     fi
     if [[ -e "$final" || -L "$final" ]]; then
-        if [[ -f "$final" && ! -L "$final" ]] && cmp -s -- "$source" "$final"; then
-            :
+        if [[ -f "$final" && ! -L "$final" ]] && cmp -s -- "$tmp" "$final"; then
+            rm -f -- "$tmp"
+            tmp=""
         else
             quarantine="$(ensure_mailbox "$project" "$to_lane" quarantine)"
             quarantine_final="$quarantine/$id.conflict.$$.json"
-            quarantine_tmp="$(mktemp "$quarantine/.${id}.conflict.XXXXXX")"
-            install -m 600 -- "$source" "$quarantine_tmp"
-            mv -T -- "$quarantine_tmp" "$quarantine_final"
-            quarantine_tmp=""
+            mv -T -- "$tmp" "$quarantine_final"
+            tmp=""
             die "DIVERGENCE: recipient already has different message ID $id"
         fi
     else
-        (($(pending_count "$inbox") < MAX_PENDING_MESSAGES)) ||
+        (($(pending_count "$inbox" "$acks" acknowledged_at) < MAX_PENDING_MESSAGES)) ||
             die "Recipient inbox message limit reached"
-        tmp="$(mktemp "$inbox/.${id}.json.XXXXXX")"
-        install -m 600 -- "$source" "$tmp"
-        validate_message_file "$tmp" "$id"
         mv -T -- "$tmp" "$final"
         tmp=""
     fi
@@ -640,8 +656,132 @@ command_ack() {
     echo "Acknowledged $id."
 }
 
+PRUNE_COUNT=0
+PRUNE_HOLD_DIR=""
+PRUNE_HELD_MARKER=""
+PRUNE_ORIGINAL_MARKER=""
+PRUNE_RECORD=""
+
+clear_prune_hold() {
+    PRUNE_HOLD_DIR=""
+    PRUNE_HELD_MARKER=""
+    PRUNE_ORIGINAL_MARKER=""
+    PRUNE_RECORD=""
+}
+
+restore_prune_hold() {
+    local preserved=""
+
+    [[ -n "$PRUNE_HOLD_DIR" ]] || return 0
+    if [[ -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ]]; then
+        if [[ -e "$PRUNE_RECORD" || -L "$PRUNE_RECORD" ]]; then
+            if [[ ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]]; then
+                mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
+            else
+                preserved="$PRUNE_HELD_MARKER"
+            fi
+        else
+            rm -f -- "$PRUNE_HELD_MARKER"
+        fi
+    fi
+    rmdir -- "$PRUNE_HOLD_DIR" 2>/dev/null || true
+    clear_prune_hold
+    if [[ -n "$preserved" ]]; then
+        echo "Preserved conflicting prune marker at $preserved" >&2
+        return 1
+    fi
+}
+
+prune_completed_mailbox() {
+    local records="$1"
+    local markers="$2"
+    local timestamp_key="$3"
+    local binding_key="$4"
+    local binding_value="$5"
+    local project="$6"
+    local file id marker digest invalid=false
+
+    [[ -n "$records" && -n "$markers" ]] || return 0
+    while IFS= read -r -d '' file; do
+        id="$(basename -- "$file" .json)"
+        marker="$markers/$id.json"
+        [[ -e "$marker" || -L "$marker" ]] || continue
+        if ! (validate_message_id "$id" &&
+              validate_message_file "$file" "$id" &&
+              [[ "$(jq -r '.project' "$file")" == "$project" ]] &&
+              [[ "$(jq -r ".$binding_key" "$file")" == "$binding_value" ]] &&
+              digest="$(message_hash "$file")" &&
+              validate_marker_file "$marker" "$id" "$digest" "$timestamp_key") \
+                >/dev/null 2>&1; then
+            echo "INVALID completed collaboration record: $file" >&2
+            invalid=true
+            continue
+        fi
+        digest="$(message_hash "$file")"
+        PRUNE_HOLD_DIR="$(mktemp -d "$markers/.${id}.prune.XXXXXX")"
+        PRUNE_HELD_MARKER="$PRUNE_HOLD_DIR/marker.json"
+        PRUNE_ORIGINAL_MARKER="$marker"
+        PRUNE_RECORD="$file"
+        mv -T -- "$marker" "$PRUNE_HELD_MARKER"
+        if ! (validate_message_file "$file" "$id" &&
+              [[ "$(message_hash "$file")" == "$digest" ]] &&
+              validate_marker_file "$PRUNE_HELD_MARKER" "$id" "$digest" \
+                  "$timestamp_key") >/dev/null 2>&1; then
+            echo "Collaboration record changed while pruning: $file" >&2
+            restore_prune_hold || true
+            invalid=true
+            continue
+        fi
+        rm -f -- "$file"
+        rm -f -- "$PRUNE_HELD_MARKER"
+        rmdir -- "$PRUNE_HOLD_DIR"
+        clear_prune_hold
+        PRUNE_COUNT=$((PRUNE_COUNT + 1))
+    done < <(find "$records" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0)
+    ! $invalid
+}
+
+command_prune() {
+    local project="$1"
+    local lane="$2"
+    local outbox delivered inbox acks invalid=false
+
+    load_lane "$project" "$lane"
+    lock_lanes "$project" "$lane"
+    cleanup_prune() {
+        local status=$?
+        trap - EXIT HUP INT TERM
+        restore_prune_hold || true
+        exit "$status"
+    }
+    trap cleanup_prune EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    resolve_existing_mailbox "$project" "$lane" outbox
+    outbox="$MAILBOX_DIR"
+    resolve_existing_mailbox "$project" "$lane" delivered
+    delivered="$MAILBOX_DIR"
+    resolve_existing_mailbox "$project" "$lane" inbox
+    inbox="$MAILBOX_DIR"
+    resolve_existing_mailbox "$project" "$lane" acks
+    acks="$MAILBOX_DIR"
+    PRUNE_COUNT=0
+    if ! prune_completed_mailbox "$outbox" "$delivered" delivered_at \
+        from_lane "$lane" "$project"; then
+        invalid=true
+    fi
+    if ! prune_completed_mailbox "$inbox" "$acks" acknowledged_at \
+        to_lane "$lane" "$project"; then
+        invalid=true
+    fi
+    echo "Pruned $PRUNE_COUNT completed collaboration record(s) from $project/$lane."
+    trap - EXIT HUP INT TERM
+    ! $invalid
+}
+
 for command in git realpath jq flock find stat sha256sum mktemp date od tr sort \
-    install cmp wc basename mkdir mv chmod rm; do
+    install cmp basename mkdir rmdir mv chmod rm; do
     need "$command"
 done
 
@@ -676,7 +816,7 @@ case "$ACTION" in
            -n "$REVISION" && -n "$BODY_FILE" ]] || die "send requires --lane, --to, --kind, --revision, and --body-file"
         command_send "$PROJECT" "$FROM_LANE" "$TO_LANE" "$KIND" "$REVISION" "$BODY_FILE"
         ;;
-    deliver|list|read|ack)
+    deliver|list|read|ack|prune)
         (($# >= 1)) || die "$ACTION requires PROJECT"
         PROJECT="$1"
         shift
@@ -691,9 +831,9 @@ case "$ACTION" in
         done
         [[ -n "$LANE" ]] || die "$ACTION requires --lane"
         case "$ACTION" in
-            list)
-                ((${#POSITIONAL[@]} == 0)) || die "list accepts no message ID"
-                command_list "$PROJECT" "$LANE"
+            list|prune)
+                ((${#POSITIONAL[@]} == 0)) || die "$ACTION accepts no message ID"
+                "command_$ACTION" "$PROJECT" "$LANE"
                 ;;
             deliver|read|ack)
                 ((${#POSITIONAL[@]} == 1)) || die "$ACTION requires one MESSAGE_ID"

@@ -12,7 +12,27 @@ base="$(git -C "$repo" rev-parse HEAD)"; git -C "$repo" worktree add -q -b revie
 printf 'path=%s\nprofile=generic\nclojure_mcp=off\nlane=default\nstate=isolated\nagent=codex\n' "$repo" > "$T/config/run-codex/projects/collab-project"
 printf 'path=%s\nprofile=generic\nclojure_mcp=off\nlane=review\nstate=isolated\nagent=codex\n' "$T/review" > "$T/config/run-codex/lanes/collab-project/review"
 run(){ env HOME="$T/home" XDG_CONFIG_HOME="$T/config" "$ROOT/bin/codex-collab" "$@"; }
-h="$(run --help)"; for c in send deliver list read ack; do [[ "$h" == *"$c"* ]] || fail "help omits $c"; done
+generate_records(){
+    local template="$1" destination="$2" first="$3" last="$4"
+    awk -v destination="$destination" -v first="$first" -v last="$last" '
+        { template[NR] = $0 }
+        END {
+            for (n = first; n <= last; n++) {
+                id = sprintf("%032x", n)
+                file = destination "/" id ".json"
+                for (line_number = 1; line_number <= NR; line_number++) {
+                    line = template[line_number]
+                    if (line ~ /^  "id":/) {
+                        line = "  \"id\": \"" id "\","
+                    }
+                    print line > file
+                }
+                close(file)
+            }
+        }
+    ' "$template"
+}
+h="$(run --help)"; for c in send deliver list read ack prune; do [[ "$h" == *"$c"* ]] || fail "help omits $c"; done
 body="$T/body"; printf '%s\n' question > "$body"
 if run send collab-project --lane default --to review --kind question --revision "${base:0:12}" --body-file "$body" >/dev/null 2>&1; then fail abbreviated; fi
 run send collab-project --lane default --to review --kind question --revision "$base" --body-file "$body" > "$T/id"
@@ -56,6 +76,99 @@ jq -n --arg id "$mismatch_id" --arg hash "$mismatch_body_hash" \
     > "$T/config/run-codex/state/mismatch/default/collaboration/outbox/$mismatch_id.json"
 if run deliver mismatch --lane default "$mismatch_id" >/dev/null 2>&1; then fail git-metadata-mismatch; fi
 grep -Fq 'share project Git metadata' <(run deliver mismatch --lane default "$mismatch_id" 2>&1) || fail mismatch-diagnostic
+
+body_exact="$T/body-exact"
+awk 'BEGIN { for (i = 0; i < 32768; i++) printf "x\n" }' > "$body_exact"
+[[ "$(stat -c %s "$body_exact")" == 65536 ]] || fail exact-body-fixture
+run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$body_exact" >/dev/null || fail exact-body-rejected
+
+delivered_dir="$T/config/run-codex/state/collab-project/default/collaboration/delivered"
+acks_dir="$T/config/run-codex/state/collab-project/review/collaboration/acks"
+bulk_completed="$T/bulk-completed"
+bulk_unresolved="$T/bulk-unresolved"
+mkdir -p "$delivered_dir" "$acks_dir" "$bulk_completed" "$bulk_unresolved"
+generate_records "$T/original.json" "$bulk_completed" 1 1000
+cp -- "$bulk_completed"/*.json "$out/"
+cp -- "$bulk_completed"/*.json "$in/"
+sha256sum "$bulk_completed"/*.json | while read -r digest file; do
+    extra_id="${file##*/}"
+    extra_id="${extra_id%.json}"
+    printf '{"version":1,"message_id":"%s","message_sha256":"%s","delivered_at":"2026-01-01T00:00:00Z"}\n' \
+        "$extra_id" "$digest" > "$delivered_dir/$extra_id.json"
+    printf '{"version":1,"message_id":"%s","message_sha256":"%s","acknowledged_at":"2026-01-01T00:00:00Z"}\n' \
+        "$extra_id" "$digest" > "$acks_dir/$extra_id.json"
+done
+printf '%s\n' pending > "$T/pending-body"
+run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$T/pending-body" > "$T/capacity-id" || fail "delivered outbox records consumed pending limit"
+capacity_id="$(<"$T/capacity-id")"
+run deliver collab-project --lane default "$capacity_id" >/dev/null ||
+    fail "acknowledged inbox records consumed pending limit"
+generate_records "$T/original.json" "$bulk_unresolved" 1001 1999
+cp -- "$bulk_unresolved"/*.json "$out/"
+cp -- "$bulk_unresolved/$(printf '%032x' 1001).json" "$in/"
+if run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$T/pending-body" >/dev/null 2>&1; then fail "unresolved outbox records did not consume pending limit"; fi
+rm -- "$out"/0000000000000000000000000000*.json
+rm -- "$in"/0000000000000000000000000000*.json
+rm -- "$delivered_dir"/0000000000000000000000000000*.json
+rm -- "$acks_dir"/0000000000000000000000000000*.json
+
+atomic_body="$T/atomic-body"; printf atomic > "$atomic_body"
+run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$atomic_body" > "$T/atomic-id"
+atomic_id="$(<"$T/atomic-id")"; atomic_source="$out/$atomic_id.json"
+atomic_bin="$T/atomic-bin"; mkdir -p "$atomic_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${3:-}" == -- && "${4:-}" == "'$atomic_source'" ]]; then' \
+    '    jq ''.to_lane="default"'' "$4" > "$4.replaced"' \
+    '    mv -- "$4.replaced" "$4"' \
+    'fi' \
+    'exec /bin/install "$@"' > "$atomic_bin/install"
+chmod 755 "$atomic_bin/install"
+if PATH="$atomic_bin:$PATH" run deliver collab-project --lane default "$atomic_id" >/dev/null 2>&1; then
+    fail "delivery accepted an atomically replaced source"
+fi
+[[ ! -e "$in/$atomic_id.json" ]] || fail "replaced source was published to inbox"
+run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$T/pending-body" > "$T/prune-race-id"
+prune_race_id="$(<"$T/prune-race-id")"
+run deliver collab-project --lane default "$prune_race_id" >/dev/null
+prune_race_record="$out/$prune_race_id.json"
+prune_race_marker="$delivered_dir/$prune_race_id.json"
+prune_bin="$T/prune-bin"; mkdir -p "$prune_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${1:-}" == -T && "${2:-}" == -- && "${3:-}" == "'$prune_race_marker'" ]]; then' \
+    '    /bin/mv "$@"' \
+    '    printf " " >> "'$prune_race_record'"' \
+    '    exit 0' \
+    'fi' \
+    'exec /bin/mv "$@"' > "$prune_bin/mv"
+chmod 755 "$prune_bin/mv"
+if PATH="$prune_bin:$PATH" run prune collab-project --lane default >/dev/null 2>&1; then
+    fail "prune accepted a record changed after marker hold"
+fi
+[[ -f "$prune_race_record" && -f "$prune_race_marker" ]] ||
+    fail "failed prune did not restore its completion marker"
+rm -- "$prune_race_record" "$prune_race_marker"
+run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$T/pending-body" > "$T/prune-id"
+prune_id="$(<"$T/prune-id")"
+run deliver collab-project --lane default "$prune_id" >/dev/null
+run ack collab-project --lane review "$prune_id" >/dev/null
+run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$T/pending-body" > "$T/unresolved-id"
+unresolved_id="$(<"$T/unresolved-id")"
+run prune collab-project --lane default >/dev/null
+run prune collab-project --lane review >/dev/null
+[[ ! -e "$out/$prune_id.json" && -e "$out/$unresolved_id.json" ]] ||
+    fail "prune mishandled completed/unresolved outbox records"
+[[ ! -e "$in/$prune_id.json" && -e "$in/$capacity_id.json" ]] ||
+    fail "prune mishandled acknowledged/unresolved inbox records"
+
 outside="$T/outside-mailbox"; mkdir -p "$outside"; printf outside > "$outside/marker"
 collab_state="$T/config/run-codex/state/collab-project/review/collaboration"
 rm -rf "$collab_state"; ln -s "$outside" "$collab_state"

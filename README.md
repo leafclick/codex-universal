@@ -1284,6 +1284,8 @@ codex-collab deliver my-project --lane review "$message_id"
 codex-collab list my-project --lane default
 codex-collab read my-project --lane default "$message_id"
 codex-collab ack my-project --lane default "$message_id"
+codex-collab prune my-project --lane review
+codex-collab prune my-project --lane default
 ```
 
 `send` writes only an immutable record in the selected source lane's host-side
@@ -1295,6 +1297,12 @@ to 64 KiB, and never authorize commands, approvals, wakeups, Git operations, or
 merges. The controller supports `question`, `interface-proposal`,
 `result-available`, `review-finding`, and `integration-result`; importing an
 accepted result remains the separate explicit `run-codex --import` operation.
+Capacity is limited to 1,000 unresolved records per inbox or outbox; valid
+delivery and acknowledgment markers remove completed records from that count.
+Records remain available for audit until the host operator explicitly runs
+`prune` for each participating lane. Pruning removes only outbox records with a
+valid delivery receipt and inbox records with a valid acknowledgment; malformed,
+unresolved, or concurrently changed records are retained and reported.
 
 This first controller slice is local to one host's registered linked-worktree
 lanes. It does not yet broker messages across machines or automatically wake an
