@@ -428,6 +428,11 @@ fi
 grep -Fq 'Wait for your sync provider to report synchronized' \
     "$ROOT/bin/codex-push" ||
     fail "codex-push lacks provider-neutral synchronization guidance"
+for sync_command in "$ROOT/bin/codex-push" "$ROOT/bin/codex-pull"; do
+    grep -Fq 'label=codex-universal.project=$CONTAINER_PROJECT' "$sync_command" &&
+        grep -Fq 'label=codex-universal.lane=$CONTAINER_LANE' "$sync_command" ||
+        fail "$(basename "$sync_command") lacks lane-scoped running-container checks"
+done
 grep -Fq 'Snapshot listing is intentionally lock-free' \
     "$ROOT/docs/codex-sync.md" ||
     fail "snapshot documentation omits the lock-free listing contract"
@@ -1004,6 +1009,7 @@ launcher_env=(
     "XDG_CONFIG_HOME=$TEST_ROOT/launcher-config"
     "CODEX_IMAGE_SLUG=example/codex-universal"
     "CODEX_IMAGE_TAG=test-version"
+    "CODEX_SYNC_ROOT=$TEST_ROOT/lane-sync"
     "CODEX_GIT_USER_NAME=host-smoke"
     "CODEX_GIT_USER_EMAIL=host-smoke.invalid"
     "CODEX_TEST_SKIP_IDEA_MCP_RELAY=1"
@@ -1024,6 +1030,7 @@ for documented_env in \
     CODEX_CONTAINER_HOME \
     CODEX_WORKSPACE_ROOT \
     CODEX_LOCK_FILE \
+    CODEX_SYNC_ROOT \
     CODEX_UNIVERSAL_WORKFLOW \
     CODEX_GIT_USER_NAME \
     CODEX_GIT_USER_EMAIL; do
@@ -1031,17 +1038,59 @@ for documented_env in \
 done
 assert_contains "$launcher_help" "reasoning=minimal|low|medium|high|xhigh"
 assert_contains "$launcher_help" "image=PROJECT_PATH"
-assert_contains "$launcher_help" "run-codex [PROJECT] --sessions"
-assert_contains "$launcher_help" "run-codex [PROJECT] --resume QUERY"
+assert_contains "$launcher_help" "run-codex [PROJECT] [--lane LANE] --sessions"
+assert_contains "$launcher_help" "run-codex [PROJECT] [--lane LANE] --resume QUERY"
 assert_contains "$launcher_help" "--image-version VERSION"
 
-if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
-    --init linked-project "$TEST_ROOT/repo-linked" \
-    >"$TEST_ROOT/linked-worktree.out" 2>&1; then
-    fail "launcher registered a linked Git worktree"
+linked_init_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+        --init linked-project "$TEST_ROOT/repo-linked"
+)"
+assert_contains "$linked_init_output" "Git layout:  linked-worktree"
+linked_config="$TEST_ROOT/launcher-config/run-codex/projects/linked-project"
+grep -Fxq "path=$TEST_ROOT/repo-linked" "$linked_config" ||
+    fail "linked worktree registration did not retain its exact checkout path"
+
+linked_launch_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" linked-project --new
+)"
+assert_contains "$linked_launch_output" \
+    "$TEST_ROOT/repo-linked:$TEST_ROOT/repo-linked"
+assert_contains "$linked_launch_output" \
+    "$TEST_ROOT/repo/.git:$TEST_ROOT/repo/.git"
+
+mkdir -p "$TEST_ROOT/bootstrap-repo" "$TEST_ROOT/bootstrap-codex-home"
+git -C "$TEST_ROOT/bootstrap-repo" init -q
+printf '%s\n' '{"token":"fixture"}' > "$TEST_ROOT/bootstrap-codex-home/auth.json"
+printf '%s\n' 'model = "fixture"' > "$TEST_ROOT/bootstrap-codex-home/profile.config.toml"
+printf '%s\n' 'must-not-copy' > "$TEST_ROOT/bootstrap-codex-home/history.jsonl"
+ln -s profile.config.toml "$TEST_ROOT/bootstrap-codex-home/config.toml"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" --init \
+    --bootstrap-codex-home "$TEST_ROOT/bootstrap-codex-home" \
+    bootstrap-project "$TEST_ROOT/bootstrap-repo" \
+    >"$TEST_ROOT/bootstrap-symlink.out" 2>&1; then
+    fail "Codex-home bootstrap accepted a symlink input"
 fi
-assert_contains "$(<"$TEST_ROOT/linked-worktree.out")" \
-    "Git worktrees/submodules with a .git pointer file are not supported yet"
+grep -Fq 'must be a regular file, not a symlink' \
+    "$TEST_ROOT/bootstrap-symlink.out" ||
+    fail "Codex-home bootstrap symlink rejection was not useful"
+test ! -e "$TEST_ROOT/launcher-config/run-codex/projects/bootstrap-project" ||
+    fail "failed Codex-home bootstrap left a registered project"
+rm "$TEST_ROOT/bootstrap-codex-home/config.toml"
+printf '%s\n' 'approval_policy = "on-request"' \
+    > "$TEST_ROOT/bootstrap-codex-home/config.toml"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" --init \
+    --bootstrap-codex-home "$TEST_ROOT/bootstrap-codex-home" \
+    bootstrap-project "$TEST_ROOT/bootstrap-repo" >/dev/null
+bootstrap_destination="$TEST_ROOT/launcher-config/run-codex/state/bootstrap-project/default/codex-home"
+test -f "$bootstrap_destination/auth.json" &&
+    test -f "$bootstrap_destination/config.toml" &&
+    test -f "$bootstrap_destination/profile.config.toml" ||
+    fail "Codex-home bootstrap omitted an allowlisted file"
+test ! -e "$bootstrap_destination/history.jsonl" ||
+    fail "Codex-home bootstrap copied session history"
+[[ "$(stat -c '%a' "$bootstrap_destination/auth.json")" == 600 ]] ||
+    fail "Codex-home bootstrap did not make authentication state private"
 
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     --init --profile generic smoke-project "$TEST_ROOT/repo" >/dev/null
@@ -1049,6 +1098,8 @@ assert_contains "$(<"$TEST_ROOT/linked-worktree.out")" \
 project_config="$TEST_ROOT/launcher-config/run-codex/projects/smoke-project"
 grep -Fxq 'clojure_mcp=auto' "$project_config" ||
     fail "new project config does not default Clojure MCP to auto"
+grep -Fxq 'state=isolated' "$project_config" ||
+    fail "new default project config does not select isolated Codex state"
 config_before="$(<"$project_config")"
 init_again_output="$(
     "${launcher_env[@]}" "$ROOT/bin/run-codex" \
@@ -1058,15 +1109,226 @@ assert_contains "$init_again_output" "already initialized"
 [[ "$(<"$project_config")" == "$config_before" ]] ||
     fail "repeated project initialization changed its configuration"
 
+default_review_codex_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/codex-home"
+mkdir -p -- "$default_review_codex_home"
+printf '%s\n' '{"token":"default-lane-fixture"}' \
+    > "$default_review_codex_home/auth.json"
+printf '%s\n' 'approval_policy = "on-request"' \
+    > "$default_review_codex_home/config.toml"
+printf '%s\n' 'must-not-copy' > "$default_review_codex_home/history.jsonl"
+
+managed_review_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --lane auto-review --review HEAD 2>&1
+)"
+managed_review_path="$TEST_ROOT/launcher-config/run-codex/worktrees/smoke-project/auto-review"
+managed_review_config="$TEST_ROOT/launcher-config/run-codex/lanes/smoke-project/auto-review"
+managed_review_codex_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/auto-review/codex-home"
+assert_contains "$managed_review_output" "Creating managed review lane 'auto-review'"
+assert_contains "$managed_review_output" \
+    "Starting codex reviewer for 'smoke-project' lane 'auto-review'"
+grep -Fxq "path=$managed_review_path" "$managed_review_config" &&
+    grep -Fxq 'profile=generic' "$managed_review_config" &&
+    grep -Fxq 'clojure_mcp=auto' "$managed_review_config" &&
+    grep -Fxq 'state=isolated' "$managed_review_config" ||
+    fail "automatic review lane registration is incomplete"
+grep -Fxq '{"token":"default-lane-fixture"}' \
+    "$managed_review_codex_home/auth.json" &&
+    grep -Fxq 'approval_policy = "on-request"' \
+        "$managed_review_codex_home/config.toml" ||
+    fail "automatic review lane omitted allowlisted Codex login/config state"
+[[ "$(stat -c '%a' "$managed_review_codex_home/auth.json")" == 600 ]] ||
+    fail "automatic review lane did not make authentication state private"
+[[ ! -e "$managed_review_codex_home/history.jsonl" ]] ||
+    fail "automatic review lane copied Codex session history"
+[[ "$(git -C "$managed_review_path" rev-parse HEAD)" == \
+   "$(git -C "$TEST_ROOT/repo" rev-parse HEAD)" ]] ||
+    fail "automatic review lane did not check out the requested commit"
+managed_review_config_before="$(<"$managed_review_config")"
+rm -- "$managed_review_codex_home/auth.json"
+printf '%s\n' 'preserve-runtime-state' \
+    > "$managed_review_codex_home/runtime-marker"
+managed_review_reuse_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --lane auto-review --review HEAD
+)"
+assert_contains "$managed_review_reuse_output" \
+    "Starting codex reviewer for 'smoke-project' lane 'auto-review'"
+[[ "$(<"$managed_review_config")" == "$managed_review_config_before" ]] ||
+    fail "reusing an automatic review lane rewrote its registration"
+grep -Fxq '{"token":"default-lane-fixture"}' \
+    "$managed_review_codex_home/auth.json" ||
+    fail "reused automatic review lane did not restore missing authentication state"
+grep -Fxq 'preserve-runtime-state' "$managed_review_codex_home/runtime-marker" ||
+    fail "seeding a reused automatic review lane replaced unrelated state"
+
+managed_conflict_path="$TEST_ROOT/launcher-config/run-codex/worktrees/smoke-project/conflict-review"
+mkdir -p -- "$managed_conflict_path"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --lane conflict-review --review HEAD \
+    >"$TEST_ROOT/managed-review-conflict.out" 2>&1; then
+    fail "automatic review lane accepted a conflicting managed path"
+fi
+grep -Fq "Managed review worktree path already exists" \
+    "$TEST_ROOT/managed-review-conflict.out" ||
+    fail "automatic review lane path conflict was not useful"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --lane missing-non-review --new \
+    >"$TEST_ROOT/missing-non-review-lane.out" 2>&1; then
+    fail "non-review launch automatically created a missing lane"
+fi
+[[ ! -e "$TEST_ROOT/launcher-config/run-codex/lanes/smoke-project/missing-non-review" ]] ||
+    fail "non-review launch registered a missing lane"
+
+git -C "$TEST_ROOT/repo" worktree add -q -b smoke-review \
+    "$TEST_ROOT/repo-review"
+review_init_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+        --init --lane review smoke-project "$TEST_ROOT/repo-review"
+)"
+assert_contains "$review_init_output" "Initialized project 'smoke-project' lane 'review'"
+review_config="$TEST_ROOT/launcher-config/run-codex/lanes/smoke-project/review"
+grep -Fxq "path=$TEST_ROOT/repo-review" "$review_config" ||
+    fail "lane registration did not retain its checkout path"
+grep -Fxq 'state=isolated' "$review_config" ||
+    fail "non-default lane did not select isolated Codex state"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set profile cuda >/dev/null
+grep -Fxq 'profile=cuda' "$review_config" ||
+    fail "lane-specific profile setter did not update the selected lane"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set profile generic >/dev/null
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set model gpt-5.6-sol >/dev/null
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set reasoning high >/dev/null
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set profile cuda >/dev/null
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set profile generic >/dev/null
+grep -Fxq 'model=gpt-5.6-sol' "$review_config" &&
+    grep -Fxq 'reasoning=high' "$review_config" ||
+    fail "lane-specific Codex presets were not persisted"
+mkdir -p "$TEST_ROOT/unrelated-lane-repo"
+git -C "$TEST_ROOT/unrelated-lane-repo" init -q
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" --init --lane unrelated \
+    smoke-project "$TEST_ROOT/unrelated-lane-repo" \
+    >"$TEST_ROOT/unrelated-lane.out" 2>&1; then
+    fail "launcher accepted an unrelated repository as a project lane"
+fi
+grep -Fq 'must be a linked worktree of project' \
+    "$TEST_ROOT/unrelated-lane.out" ||
+    fail "unrelated lane rejection was not useful"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" --rebind \
+    smoke-project "$TEST_ROOT/unrelated-lane-repo" \
+    >"$TEST_ROOT/unrelated-default-rebind.out" 2>&1; then
+    fail "launcher rebound a default lane away from its registered worktrees"
+fi
+grep -Fq 'Cannot rebind the default lane away from registered lane' \
+    "$TEST_ROOT/unrelated-default-rebind.out" ||
+    fail "inconsistent default-lane rebind rejection was not useful"
+
+lane_list_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --list)"
+assert_contains "$lane_list_output" "smoke-project"
+assert_contains "$lane_list_output" "review"
+assert_contains "$lane_list_output" "$TEST_ROOT/repo-review"
+assert_contains "$lane_list_output" "MODEL"
+assert_contains "$lane_list_output" "REASONING"
+assert_contains "$lane_list_output" "gpt-5.6-sol"
+assert_contains "$lane_list_output" "high"
+
+review_preset_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --lane review --new
+)"
+assert_contains "$review_preset_output" "--model gpt-5.6-sol"
+assert_contains "$review_preset_output" 'model_reasoning_effort="high"'
+default_preset_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new
+)"
+assert_not_contains "$default_preset_output" "--model gpt-5.6-sol"
+assert_not_contains "$default_preset_output" 'model_reasoning_effort="high"'
+
+review_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --lane review --review HEAD \
+        --codex-option model=gpt-5.6-terra \
+        --codex-option reasoning=low
+)"
+assert_contains "$review_output" "Starting codex reviewer for 'smoke-project' lane 'review'"
+assert_contains "$review_output" "--model gpt-5.6-terra"
+assert_contains "$review_output" 'model_reasoning_effort="low"'
+assert_not_contains "$review_output" "--model gpt-5.6-sol"
+assert_not_contains "$review_output" 'model_reasoning_effort="high"'
+assert_contains "$review_output" "Review immutable Git commit"
+assert_contains "$review_output" "codex-universal.project=smoke-project"
+assert_contains "$review_output" "codex-universal.lane=review"
+assert_contains "$review_output" "$TEST_ROOT/repo-review:$TEST_ROOT/repo-review"
+assert_contains "$review_output" "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/codex-home:/home/codex/.codex"
+assert_contains "$review_output" "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/m2:/home/codex/.m2"
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --review HEAD >"$TEST_ROOT/default-review.out" 2>&1; then
+    fail "reviewer launch accepted the default lane"
+fi
+assert_contains "$(<"$TEST_ROOT/default-review.out")" \
+    "--review requires a non-default isolated lane selected with --lane"
+
 list_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --list)"
 assert_contains "$list_output" "smoke-project"
 assert_contains "$list_output" "generic"
 assert_contains "$list_output" "CLOJURE-MCP"
+assert_contains "$list_output" "MODEL"
+assert_contains "$list_output" "REASONING"
 assert_contains "$list_output" "auto"
 assert_contains "$list_output" "OK"
 
-mkdir -p -- "$TEST_ROOT/launcher-home/.codex"
-session_db="$TEST_ROOT/launcher-home/.codex/state_5.sqlite"
+isolated_codex_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/codex-home"
+isolated_m2_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/m2"
+mkdir -p -- "$isolated_codex_home"
+printf '%s\n' default-state > "$isolated_codex_home/lane-marker"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --push-state >/dev/null
+compgen -G "$TEST_ROOT/lane-sync/projects/smoke-project/lanes/default/codex-g*.tar.zst.state" >/dev/null ||
+    fail "default lane state push did not use its independent snapshot namespace"
+printf '%s\n' review-state > \
+    "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/codex-home/lane-marker"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --lane review --push-state >/dev/null
+compgen -G "$TEST_ROOT/lane-sync/projects/smoke-project/lanes/review/codex-g*.tar.zst.state" >/dev/null ||
+    fail "review lane state push did not use its independent snapshot namespace"
+review_handoff_state="$(find \
+    "$TEST_ROOT/lane-sync/projects/smoke-project/lanes/review" \
+    -maxdepth 1 -name '*.state' -print -quit)"
+[[ -n "$review_handoff_state" ]] ||
+    fail "review lane state push did not publish handoff metadata"
+review_required_commit="$(git -C "$TEST_ROOT/repo-linked" rev-parse HEAD)"
+grep -Fxq 'handoff_format=1' "$review_handoff_state" ||
+    fail "review lane state omitted handoff format"
+grep -Fxq 'project=smoke-project' "$review_handoff_state" ||
+    fail "review lane state omitted project handoff field"
+grep -Fxq 'lane=review' "$review_handoff_state" ||
+    fail "review lane state omitted lane handoff field"
+grep -Fxq "required_commit=$review_required_commit" "$review_handoff_state" ||
+    fail "review lane state omitted required HEAD commit"
+grep -Fxq 'runtime_profile=generic' "$review_handoff_state" ||
+    fail "review lane state omitted runtime profile"
+grep -Fxq 'runtime_version=test-version' "$review_handoff_state" ||
+    fail "review lane state omitted runtime version"
+grep -Fxq 'runtime_revision=0123456789abcdef' "$review_handoff_state" ||
+    fail "review lane state omitted runtime revision"
+grep -Eq '^onboarding_sha256=[0-9a-f]{64}$' "$review_handoff_state" ||
+    fail "review lane state omitted a valid onboarding contract hash"
+pass "lane state publishes contextual handoff requirements"
+lane_state_list="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+        smoke-project --lane review --list-state
+)"
+assert_contains "$lane_state_list" "GENERATION"
+assert_contains "$lane_state_list" "OK"
+test -f "$TEST_ROOT/launcher-home/.local/state/run-codex/projects/smoke-project/lanes/default/codex-handoff/base.state" ||
+    fail "default lane did not receive an independent local sync baseline"
+test -f "$TEST_ROOT/launcher-home/.local/state/run-codex/projects/smoke-project/lanes/review/codex-handoff/base.state" ||
+    fail "review lane did not receive an independent local sync baseline"
+session_db="$isolated_codex_home/state_5.sqlite"
 sqlite3 "$session_db" <<'SQL'
 CREATE TABLE threads (
     id TEXT PRIMARY KEY,
@@ -1104,7 +1366,7 @@ fi
 assert_contains "$(<"$TEST_ROOT/session-image-version.out")" \
     "--sessions cannot be combined with launch options"
 
-session_handoff_lock="$TEST_ROOT/launcher-home/.cache/codex-handoff.lock"
+session_handoff_lock="$TEST_ROOT/launcher-config/run-codex/locks/smoke-project/default.handoff.lock"
 session_lock_stdout="$TEST_ROOT/session-lock.out"
 session_lock_stderr="$TEST_ROOT/session-lock.err"
 mkdir -p -- "$(dirname "$session_handoff_lock")"
@@ -1142,7 +1404,7 @@ flock -u 7
 exec 7>&-
 wait "$session_lock_pid" || fail "session listing failed after handoff lock release"
 assert_contains "$(<"$session_lock_stdout")" 'Created while handoff locked'
-pass "session reads wait for the shared state handoff lock"
+pass "session reads wait for the lane state handoff lock"
 activity "launcher doctor installation"
 
 ambiguous_docker_log="$TEST_ROOT/ambiguous-sessions-docker-argv.log"
@@ -1178,7 +1440,7 @@ unique_output="$(
         "$ROOT/bin/run-codex" smoke-project --resume vErIfIcAtIoN
 )"
 assert_contains "$unique_output" \
-    "Resuming Codex session 'Release verification' for 'smoke-project'"
+    "Resuming codex session 'Release verification' for 'smoke-project' lane 'default'"
 assert_contains "$unique_output" "resume $unique_session_id"
 assert_not_contains "$unique_output" 'resume --last'
 grep -Fxq -- 'resume' "$unique_docker_log" ||
@@ -1193,7 +1455,7 @@ exact_uuid_output="$(
         --resume 11111111-1111-4111-8111-111111111111
 )"
 assert_contains "$exact_uuid_output" \
-    "Resuming Codex session 'GPU tuning baseline' for 'smoke-project'"
+    "Resuming codex session 'GPU tuning baseline' for 'smoke-project' lane 'default'"
 grep -Fxq -- '11111111-1111-4111-8111-111111111111' \
     "$exact_uuid_docker_log" ||
     fail "exact session UUID was not passed to Codex"
@@ -1346,6 +1608,7 @@ for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "--security-opt apparmor=codex-universal"
     assert_contains "$output" "--security-opt seccomp=$ROOT/security/seccomp/codex-bwrap.json"
     assert_contains "$output" "--user $(id -u):$(id -g)"
+    assert_contains "$output" "CODEX_HOME=/home/codex/.codex"
     assert_contains "$output" "--sandbox workspace-write"
     assert_contains "$output" "--ask-for-approval on-request"
     assert_contains "$output" 'approvals_reviewer="user"'
@@ -1360,6 +1623,8 @@ for output in "$new_output" "$resume_output"; do
     assert_not_contains "$output" '"run_tests"'
     assert_contains "$output" 'mcp_servers.clojure_lsp.default_tools_approval_mode="writes"'
     assert_contains "$output" "Clojure MCP: enabled (auto-detected Clojure project)"
+    assert_contains "$output" "$isolated_codex_home:/home/codex/.codex"
+    assert_contains "$output" "$isolated_m2_home:/home/codex/.m2"
     assert_contains "$output" "$TEST_ROOT/repo:/workspace/smoke-project"
     assert_contains "$output" "example/codex-universal-generic:test-version"
 done
@@ -1563,6 +1828,26 @@ grep -Fxq -- 'example/codex-universal-cuda:test-version' "$idea_dispatch_argv" &
     grep -Fxq -- "$TEST_ROOT/non-clojure-repo:$TEST_ROOT/non-clojure-repo" \
         "$idea_dispatch_argv" ||
     fail "IDEA dispatcher did not launch the registered project profile and mount"
+
+review_idea_dispatch_argv="$TEST_ROOT/review-idea-dispatch.argv"
+review_idea_dispatch_request="$TEST_ROOT/review-idea-dispatch-request.json"
+review_idea_session_request="$(
+    jq -cn --arg cwd "$TEST_ROOT/repo-review" \
+        '{jsonrpc:"2.0",id:4,method:"session/new",params:{cwd:$cwd,mcpServers:[]}}'
+)"
+printf '%s\n' "$idea_initialize_request" "$review_idea_session_request" |
+    "${launcher_env[@]}" \
+    "CODEX_TEST_DOCKER_ACP=1" \
+    "CODEX_TEST_DOCKER_ARGV_LOG=$review_idea_dispatch_argv" \
+    "CODEX_TEST_DOCKER_ACP_REQUEST_LOG=$review_idea_dispatch_request" \
+    "$ROOT/bin/run-codex" --idea >/dev/null
+grep -Fxq -- 'codex-universal.project=smoke-project' "$review_idea_dispatch_argv" &&
+    grep -Fxq -- 'codex-universal.lane=review' "$review_idea_dispatch_argv" &&
+    grep -Fxq -- "$TEST_ROOT/repo-review:$TEST_ROOT/repo-review" \
+        "$review_idea_dispatch_argv" &&
+    grep -Fxq -- "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/codex-home:/home/codex/.codex" \
+        "$review_idea_dispatch_argv" ||
+    fail "IDEA dispatcher did not select the exact registered review lane"
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     plain-project --set profile generic >/dev/null
 
@@ -1596,14 +1881,26 @@ if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     plain-project --set unknown value >"$set_error" 2>&1; then
     fail "project setter accepted an unknown setting"
 fi
-grep -Fq "Supported settings: profile, clojure-mcp" "$set_error" ||
+grep -Fq "Supported settings: profile, clojure-mcp, model, reasoning" "$set_error" ||
     fail "unknown project setting error does not list supported settings"
 if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     plain-project --set profile >"$set_error" 2>&1; then
     fail "project setter accepted a missing value"
 fi
-grep -Fq "Usage: run-codex PROJECT --set profile|clojure-mcp VALUE" \
+grep -Fq "Usage: run-codex PROJECT --set profile|clojure-mcp|model|reasoning VALUE" \
     "$set_error" || fail "project setter arity error is not useful"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set model '../unsafe' >"$set_error" 2>&1; then
+    fail "project setter accepted an invalid Codex model"
+fi
+grep -Fq "Invalid Codex model '../unsafe'" "$set_error" ||
+    fail "invalid persistent model error is not useful"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set reasoning extreme >"$set_error" 2>&1; then
+    fail "project setter accepted an invalid reasoning effort"
+fi
+grep -Fq "Supported values: minimal, low, medium, high, xhigh" "$set_error" ||
+    fail "invalid persistent reasoning error is not useful"
 
 plain_env_output="$(
     "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=1 \
@@ -1611,6 +1908,79 @@ plain_env_output="$(
 )"
 assert_contains "$plain_env_output" "mcp_servers.clojure_lsp.enabled=true"
 assert_contains "$plain_env_output" "Clojure MCP: enabled (environment override: on)"
+
+# Project onboarding declares checkout-local files that are intentionally not
+# committed. Templates may seed ordinary configuration, while secret files
+# can be copied from a separately provisioned checkout and must remain private.
+onboarding_manifest="$TEST_ROOT/repo/.codex-universal/onboarding.json"
+mkdir -p -- "$(dirname -- "$onboarding_manifest")" "$TEST_ROOT/repo/config"
+printf '%s\n' '{"version":1,"files":[{"path":".git/config","template":"config/local.conf.template"}]}' > "$onboarding_manifest"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --onboard \
+    >"$TEST_ROOT/onboard-protected.out" 2>&1; then
+    fail "onboarding accepted a protected Git metadata destination"
+fi
+grep -Fq "Unsafe onboarding path '.git/config'" \
+    "$TEST_ROOT/onboard-protected.out" ||
+    fail "protected onboarding destination rejection was not useful"
+printf '%s\n' '{"version":1,"files":[{"path":"config/local.conf","template":"config/local.conf.template","placeholders":["CHANGE_ME"]},{"path":"secrets/token","secret":true,"mode":"0600"}]}' > "$onboarding_manifest"
+printf '%s\n' 'endpoint=https://example.invalid' 'token=CHANGE_ME' \
+    > "$TEST_ROOT/repo/config/local.conf.template"
+
+onboarding_check_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --check || true
+)"
+assert_contains "$onboarding_check_output" "MISSING     config/local.conf"
+assert_contains "$onboarding_check_output" "NEEDS-SETUP project 'smoke-project' lane 'default'"
+
+set +e
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --onboard \
+    >"$TEST_ROOT/onboard-template.out" 2>&1
+onboard_template_status=$?
+set -e
+(( onboard_template_status != 0 )) ||
+    fail "template-only onboarding unexpectedly reported readiness"
+assert_contains "$(<"$TEST_ROOT/onboard-template.out")" \
+    "Provisioned config/local.conf from template"
+grep -Fxq 'token=CHANGE_ME' "$TEST_ROOT/repo/config/local.conf" ||
+    fail "onboarding did not provision the declared template"
+assert_contains "$(<"$TEST_ROOT/onboard-template.out")" "MISSING     secrets/token"
+
+mkdir -p -- "$TEST_ROOT/onboarding-source/secrets"
+printf '%s\n' 'review-secret' > "$TEST_ROOT/onboarding-source/secrets/token"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --onboard \
+    --from "$TEST_ROOT/onboarding-source" \
+    >"$TEST_ROOT/onboard-source.out" 2>&1 || true
+assert_contains "$(<"$TEST_ROOT/onboard-source.out")" \
+    "Provisioned secrets/token from source-checkout"
+[[ "$(stat -c '%a' "$TEST_ROOT/repo/secrets/token")" == 600 ]] ||
+    fail "onboarding did not apply secret file mode 0600"
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new \
+    >"$TEST_ROOT/onboarding-readiness.out" 2>&1; then
+    fail "normal launch ignored unresolved onboarding input"
+fi
+assert_contains "$(<"$TEST_ROOT/onboarding-readiness.out")" \
+    "NEEDS-INPUT config/local.conf"
+setup_session_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --setup
+)"
+assert_contains "$setup_session_output" \
+    "Starting new codex session for 'smoke-project' lane 'default'"
+printf '%s\n' 'endpoint=https://example.invalid' 'token=filled' \
+    > "$TEST_ROOT/repo/config/local.conf"
+chmod 0644 "$TEST_ROOT/repo/secrets/token"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --check \
+    >"$TEST_ROOT/onboarding-permissions.out" 2>&1; then
+    fail "onboarding check accepted a world-readable secret"
+fi
+assert_contains "$(<"$TEST_ROOT/onboarding-permissions.out")" \
+    "PERMISSIONS secrets/token"
+chmod 0600 "$TEST_ROOT/repo/secrets/token"
+onboarding_ready_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --check
+)"
+assert_contains "$onboarding_ready_output" "READY       project 'smoke-project' lane 'default'"
+pass "project onboarding manifest and readiness gate"
 
 # Registrations written by older launchers have no clojure_mcp field and must
 # acquire the new auto behavior without being rewritten merely by launching.
@@ -1621,10 +1991,27 @@ printf 'path=%s\nprofile=generic\n' "$TEST_ROOT/legacy-repo" > "$legacy_config"
 legacy_before="$(<"$legacy_config")"
 legacy_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" legacy-project --new)"
 assert_not_contains "$legacy_output" "mcp_servers.clojure_lsp"
+assert_not_contains "$legacy_output" "--model"
+assert_not_contains "$legacy_output" "model_reasoning_effort"
 assert_contains "$legacy_output" \
     "Clojure MCP: disabled (no Clojure project signals detected)"
+assert_contains "$legacy_output" \
+    "$TEST_ROOT/launcher-home/.codex:/home/codex/.codex"
 [[ "$(<"$legacy_config")" == "$legacy_before" ]] ||
     fail "launching rewrote a legacy project registration"
+
+mkdir -p "$TEST_ROOT/one-line-legacy-repo"
+git -C "$TEST_ROOT/one-line-legacy-repo" init -q
+one_line_legacy_config="$TEST_ROOT/launcher-config/run-codex/projects/one-line-legacy"
+printf '%s\n' "$TEST_ROOT/one-line-legacy-repo" > "$one_line_legacy_config"
+one_line_legacy_before="$(<"$one_line_legacy_config")"
+one_line_legacy_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" one-line-legacy --new
+)"
+assert_not_contains "$one_line_legacy_output" "--model"
+assert_not_contains "$one_line_legacy_output" "model_reasoning_effort"
+[[ "$(<"$one_line_legacy_config")" == "$one_line_legacy_before" ]] ||
+    fail "launching rewrote a one-line legacy project registration"
 
 # IDEA may terminate the attached ACP launcher abruptly. Verify that the host
 # launcher retains ownership of the container and removes its exact ID when
@@ -1805,6 +2192,368 @@ if env PATH="$TEST_ROOT/no-jq-bin" \
 fi
 grep -Fxq 'ERROR: Missing command: jq' "$TEST_ROOT/no-jq.err" ||
     fail "IDEA launcher did not report missing jq"
+cli_root="$TEST_ROOT/phase4-cli"
+cli_repo="$cli_root/repo"
+cli_config="$cli_root/config"
+cli_sync="$cli_root/sync"
+mkdir -p "$cli_repo" "$cli_root/home"
+git -C "$cli_repo" init -q -b main
+printf '%s\n' base > "$cli_repo/payload"
+mkdir -p "$cli_repo/.codex-universal"
+printf '%s\n' \
+    '{"version":1,"files":[{"path":"local-input","template":"local-input.template"}]}' \
+    > "$cli_repo/.codex-universal/onboarding.json"
+printf '%s\n' template > "$cli_repo/local-input.template"
+printf '%s\n' '*.ignored' > "$cli_repo/.gitignore"
+git -C "$cli_repo" add payload .gitignore
+git -C "$cli_repo" add .codex-universal/onboarding.json local-input.template
+git -C "$cli_repo" -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid commit -qm base
+cli_base_commit="$(git -C "$cli_repo" rev-parse HEAD)"
+
+cli_env=(
+    env
+    "HOME=$cli_root/home"
+    "XDG_CONFIG_HOME=$cli_config"
+    "CODEX_IMAGE_SLUG=example/codex-universal"
+    "CODEX_IMAGE_TAG=test-version"
+    "CODEX_SYNC_ROOT=$cli_sync"
+    "CODEX_GIT_USER_NAME=host-smoke"
+    "CODEX_GIT_USER_EMAIL=host-smoke.invalid"
+    "CODEX_TEST_SKIP_IDEA_MCP_RELAY=1"
+    "CODEX_SECCOMP_PROFILE=$ROOT/security/seccomp/codex-bwrap.json"
+    "PATH=$TEST_ROOT/fake-bin:$PATH"
+)
+cli_run() {
+    "${cli_env[@]}" "$ROOT/bin/run-codex" "$@"
+}
+cli_project_config="$cli_config/run-codex/projects/cli-project"
+cli_lane_dir="$cli_config/run-codex/lanes/cli-project"
+cli_managed_path="$cli_config/run-codex/worktrees/cli-project/managed"
+cli_managed_config="$cli_lane_dir/managed"
+cli_managed_branch='codex/cli-project/managed'
+
+cli_help="$(cli_run --help)"
+assert_contains "$cli_help" "PROJECT --lane LANE --create REVISION"
+assert_contains "$cli_help" "PROJECT --lane LANE --import REVISION"
+assert_contains "$cli_help" "PROJECT --lane LANE --remove"
+cli_run --init cli-project "$cli_repo" >/dev/null
+cli_project_config_before="$(<"$cli_project_config")"
+printf '%s\n' dirty >> "$cli_repo/payload"
+if cli_run cli-project --lane managed --create "$cli_base_commit" \
+    >"$cli_root/create-dirty.log" 2>&1; then
+    fail "managed lane creation accepted a dirty default checkout"
+fi
+assert_contains "$(<"$cli_root/create-dirty.log")" \
+    "Default lane must be clean before creating a managed lane"
+[[ "$(<"$cli_project_config")" == "$cli_project_config_before" &&
+   ! -e "$cli_managed_config" && ! -e "$cli_managed_path" ]] ||
+    fail "dirty managed lane creation mutated path or registry"
+git -C "$cli_repo" checkout -q -- payload
+
+cli_from_lane_config="$cli_config/run-codex/lanes/cli-project/from-reject"
+cli_from_lane_path="$cli_config/run-codex/worktrees/cli-project/from-reject"
+if cli_run cli-project --lane from-reject --create HEAD --from "$cli_repo" \
+    >"$cli_root/create-from.log" 2>&1; then
+    fail "managed lane creation accepted an onboarding source"
+fi
+assert_contains "$(<"$cli_root/create-from.log")" \
+    "--from is valid only with --onboard"
+[[ ! -e "$cli_from_lane_config" && ! -e "$cli_from_lane_path" ]] ||
+    fail "--create --from mutated managed lane path or registration"
+git -C "$cli_repo" show-ref --verify --quiet \
+    refs/heads/codex/cli-project/from-reject &&
+    fail "--create --from created a managed branch"
+
+cli_default_before="$(git -C "$cli_repo" rev-parse HEAD)"
+cli_create_lock="$cli_config/run-codex/locks/cli-project/default.handoff.lock"
+mkdir -p -- "$(dirname -- "$cli_create_lock")"
+exec 8>"$cli_create_lock"
+flock -n -x 8 || fail "could not acquire default lane creation lock"
+if cli_run cli-project --lane managed --create "$cli_base_commit" \
+    >"$cli_root/create-lock.log" 2>&1; then
+    fail "managed lane creation ignored an active default lock"
+fi
+assert_contains "$(<"$cli_root/create-lock.log")" \
+    "Stop project 'cli-project' default lane"
+[[ ! -e "$cli_managed_config" && ! -e "$cli_managed_path" ]] ||
+    fail "locked managed lane creation mutated path or registry"
+exec 8>&-
+cli_run cli-project --lane managed --create "$cli_base_commit" \
+    >"$cli_root/create.log" 2>&1
+[[ "$(git -C "$cli_repo" rev-parse HEAD)" == "$cli_default_before" &&
+   "$(git -C "$cli_managed_path" rev-parse HEAD)" == "$cli_base_commit" ]] ||
+    fail "managed lane creation changed the default or used the wrong commit"
+grep -Fxq "path=$cli_managed_path" "$cli_managed_config" ||
+    fail "managed lane creation omitted its canonical registration"
+
+cli_rollback_path="$cli_config/run-codex/worktrees/cli-project/rollback"
+cli_rollback_config="$cli_config/run-codex/lanes/cli-project/rollback"
+cli_rollback_state="$cli_config/run-codex/state/cli-project/rollback"
+cli_rollback_branch='codex/cli-project/rollback'
+cli_default_codex_home="$cli_config/run-codex/state/cli-project/default/codex-home"
+mkdir -p "$cli_default_codex_home"
+printf '%s\n' bootstrap-auth > "$cli_default_codex_home/auth.json"
+cli_rollback_bin="$cli_root/rollback-bin"
+mkdir -p "$cli_rollback_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${3:-}" == "'$cli_rollback_config'" || "${3:-}" == "'$cli_config/run-codex/lanes/cli-project/rollback-preserve'" ]]; then exit 1; fi' \
+    'exec /bin/mv "$@"' > "$cli_rollback_bin/mv"
+chmod 755 "$cli_rollback_bin/mv"
+cli_rollback_env=(
+    "${cli_env[@]}"
+    "PATH=$cli_rollback_bin:$TEST_ROOT/fake-bin:$PATH"
+)
+cli_run_rollback() {
+    "${cli_rollback_env[@]}" "$ROOT/bin/run-codex" "$@"
+}
+if cli_run_rollback cli-project --lane rollback --create "$cli_base_commit" \
+    >"$cli_root/create-rollback.log" 2>&1; then
+    fail "managed lane creation ignored post-worktree registration failure"
+fi
+[[ ! -e "$cli_rollback_path" && ! -e "$cli_rollback_config" ]] ||
+    fail "failed managed lane creation left checkout or registration"
+[[ ! -e "$cli_rollback_state" ]] ||
+    fail "failed managed lane creation left newly created lane state"
+git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_rollback_branch" &&
+    fail "failed managed lane creation left its managed branch"
+cli_run cli-project --lane rollback --create "$cli_base_commit" >/dev/null 2>&1
+[[ -e "$cli_rollback_path" && -f "$cli_rollback_config" &&
+   "$(git -C "$cli_rollback_path" rev-parse HEAD)" == "$cli_base_commit" &&
+   -d "$cli_rollback_state/codex-home" &&
+   "$(<"$cli_rollback_state/codex-home/auth.json")" == bootstrap-auth &&
+   ! -e "$cli_rollback_state/.run-codex-create-owner" ]] ||
+    fail "managed lane creation did not succeed after rollback retry"
+
+cli_preserve_state="$cli_config/run-codex/state/cli-project/rollback-preserve"
+mkdir -p "$cli_preserve_state"
+printf '%s\n' pre-existing-state > "$cli_preserve_state/marker"
+cli_preserve_marker_before="$(<"$cli_preserve_state/marker")"
+if cli_run_rollback cli-project --lane rollback-preserve --create "$cli_base_commit" \
+    >"$cli_root/create-rollback-preserve.log" 2>&1; then
+    fail "managed lane creation ignored post-worktree failure with existing state"
+fi
+[[ "$(<"$cli_preserve_state/marker")" == "$cli_preserve_marker_before" &&
+   ! -e "$cli_preserve_state/codex-home/auth.json" &&
+   ! -e "$cli_config/run-codex/worktrees/cli-project/rollback-preserve" &&
+   ! -e "$cli_config/run-codex/lanes/cli-project/rollback-preserve" ]] ||
+    fail "failed managed lane creation changed pre-existing lane state"
+git -C "$cli_repo" show-ref --verify --quiet \
+    refs/heads/codex/cli-project/rollback-preserve &&
+    fail "failed managed lane creation with existing state left its branch"
+cli_run cli-project --lane rollback-preserve --create "$cli_base_commit" \
+    >/dev/null 2>&1
+[[ "$(<"$cli_preserve_state/marker")" == "$cli_preserve_marker_before" &&
+   "$(<"$cli_preserve_state/codex-home/auth.json")" == bootstrap-auth &&
+   -e "$cli_config/run-codex/worktrees/cli-project/rollback-preserve" &&
+   -f "$cli_config/run-codex/lanes/cli-project/rollback-preserve" ]] ||
+    fail "successful retry did not seed preserved lane state"
+
+cli_signal_lane='signal'
+cli_signal_path="$cli_config/run-codex/worktrees/cli-project/$cli_signal_lane"
+cli_signal_config="$cli_config/run-codex/lanes/cli-project/$cli_signal_lane"
+cli_signal_state="$cli_config/run-codex/state/cli-project/$cli_signal_lane"
+cli_signal_branch="codex/cli-project/$cli_signal_lane"
+mkdir -p "$cli_signal_state"
+printf '%s\n' pre-existing-signal-state > "$cli_signal_state/marker"
+cli_signal_marker_before="$(<"$cli_signal_state/marker")"
+cli_signal_bin="$cli_root/signal-bin"
+mkdir -p "$cli_signal_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    '/bin/ln "$@"' \
+    'status=$?' \
+    'if ((status == 0)); then kill -TERM "$PPID"; fi' \
+    'exit "$status"' > "$cli_signal_bin/ln"
+chmod 755 "$cli_signal_bin/ln"
+cli_signal_env=(
+    "${cli_env[@]}"
+    "PATH=$cli_signal_bin:$TEST_ROOT/fake-bin:$PATH"
+)
+cli_run_signal() {
+    "${cli_signal_env[@]}" "$ROOT/bin/run-codex" "$@"
+}
+set +e
+cli_run_signal cli-project --lane "$cli_signal_lane" --create "$cli_base_commit" \
+    >"$cli_root/create-signal.log" 2>&1
+cli_signal_status=$?
+set -e
+(( cli_signal_status == 143 )) ||
+    fail "signal-interrupted lane creation returned $cli_signal_status, not 143"
+[[ ! -e "$cli_signal_path" && ! -e "$cli_signal_config" ]] ||
+    fail "signal-interrupted creation left checkout or registration"
+git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_signal_branch" &&
+    fail "signal-interrupted creation left its managed branch"
+[[ ! -e "$cli_signal_state/codex-home/auth.json" &&
+   "$(<"$cli_signal_state/marker")" == "$cli_signal_marker_before" ]] ||
+    fail "signal-interrupted creation published auth or changed lane state"
+
+cli_sparse_lane='sparse'
+cli_sparse_path="$cli_config/run-codex/worktrees/cli-project/$cli_sparse_lane"
+cli_sparse_config="$cli_config/run-codex/lanes/cli-project/$cli_sparse_lane"
+cli_sparse_state="$cli_config/run-codex/state/cli-project/$cli_sparse_lane"
+cli_sparse_branch="codex/cli-project/$cli_sparse_lane"
+printf '%s\n' bootstrap-config > "$cli_default_codex_home/config.toml"
+mkdir -p "$cli_sparse_state"
+printf '%s\n' pre-existing-sparse-state > "$cli_sparse_state/marker"
+cli_sparse_marker_before="$(<"$cli_sparse_state/marker")"
+cli_sparse_bin="$cli_root/sparse-bin"
+mkdir -p "$cli_sparse_bin"
+printf '%s\n' 0 > "$cli_sparse_bin/ln-count"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'count=$(<"'$cli_sparse_bin'/ln-count")' \
+    'count=$((count + 1))' \
+    'printf "%s\\n" "$count" > "'$cli_sparse_bin'/ln-count"' \
+    'if [[ "${3##*/}" == config.toml ]]; then : > "${3:?}"; exit 1; fi' \
+    'exec /bin/ln "$@"' > "$cli_sparse_bin/ln"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${3:-}" == "'$cli_sparse_config'" ]]; then exit 1; fi' \
+    'exec /bin/mv "$@"' > "$cli_sparse_bin/mv"
+chmod 755 "$cli_sparse_bin/ln" "$cli_sparse_bin/mv"
+cli_sparse_env=(
+    "${cli_env[@]}"
+    "PATH=$cli_sparse_bin:$TEST_ROOT/fake-bin:$PATH"
+)
+cli_run_sparse() {
+    "${cli_sparse_env[@]}" "$ROOT/bin/run-codex" "$@"
+}
+if cli_run_sparse cli-project --lane "$cli_sparse_lane" --create "$cli_base_commit" \
+    >"$cli_root/create-sparse.log" 2>&1; then
+    fail "sparse bootstrap failure was accepted"
+fi
+[[ "$(<"$cli_sparse_bin/ln-count")" == 2 ]] ||
+    fail "sparse bootstrap fixture did not reach its second input"
+[[ ! -e "$cli_sparse_path" && ! -e "$cli_sparse_config" ]] ||
+    fail "sparse bootstrap rollback left checkout or registration"
+git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_sparse_branch" &&
+    fail "sparse bootstrap rollback left its managed branch"
+[[ ! -e "$cli_sparse_state/codex-home/auth.json" &&
+   -f "$cli_sparse_state/codex-home/config.toml" &&
+   ! -L "$cli_sparse_state/codex-home/config.toml" &&
+   "$(<"$cli_sparse_state/marker")" == "$cli_sparse_marker_before" ]] ||
+    fail "sparse bootstrap rollback mishandled linked or regular files"
+
+printf '%s\n' feature > "$cli_managed_path/feature"
+git -C "$cli_managed_path" add feature
+git -C "$cli_managed_path" -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid commit -qm feature
+cli_feature_commit="$(git -C "$cli_managed_path" rev-parse HEAD)"
+
+if cli_run cli-project --lane managed --import "${cli_feature_commit:0:12}" \
+    >"$cli_root/import-abbrev.log" 2>&1; then
+    fail "lane import accepted an abbreviated commit"
+fi
+assert_contains "$(<"$cli_root/import-abbrev.log")" \
+    "full immutable commit ID"
+if cli_run cli-project --lane managed --import "$cli_base_commit" \
+    >"$cli_root/import-nonhead.log" 2>&1; then
+    fail "lane import accepted a non-HEAD source commit"
+fi
+assert_contains "$(<"$cli_root/import-nonhead.log")" \
+    "must equal lane 'managed' HEAD"
+printf '%s\n' dirty > "$cli_managed_path/dirty"
+if cli_run cli-project --lane managed --import "$cli_feature_commit" \
+    >"$cli_root/import-source-dirty.log" 2>&1; then
+    fail "lane import accepted a dirty source checkout"
+fi
+assert_contains "$(<"$cli_root/import-source-dirty.log")" \
+    "Source lane 'managed' must be clean"
+rm -- "$cli_managed_path/dirty"
+printf '%s\n' dirty >> "$cli_repo/payload"
+if cli_run cli-project --lane managed --import "$cli_feature_commit" \
+    >"$cli_root/import-default-dirty.log" 2>&1; then
+    fail "lane import accepted a dirty default checkout"
+fi
+assert_contains "$(<"$cli_root/import-default-dirty.log")" \
+    "Default lane must be clean before importing"
+git -C "$cli_repo" checkout -q -- payload
+cli_run cli-project --lane managed --import "$cli_feature_commit" >/dev/null
+[[ "$(git -C "$cli_repo" rev-parse HEAD)" == "$cli_feature_commit" ]] ||
+    fail "clean lane import did not fast-forward default to the exact source HEAD"
+
+cli_run cli-project --lane nonff --create "$cli_feature_commit" >/dev/null 2>&1
+printf '%s\n' source-two > "$cli_config/run-codex/worktrees/cli-project/nonff/source-two"
+git -C "$cli_config/run-codex/worktrees/cli-project/nonff" add source-two
+git -C "$cli_config/run-codex/worktrees/cli-project/nonff" \
+    -c user.name=host-smoke -c user.email=host-smoke.invalid commit -qm source-two
+cli_nonff_commit="$(git -C "$cli_config/run-codex/worktrees/cli-project/nonff" rev-parse HEAD)"
+printf '%s\n' default-two > "$cli_repo/default-two"
+git -C "$cli_repo" add default-two
+git -C "$cli_repo" -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid commit -qm default-two
+cli_default_divergent="$(git -C "$cli_repo" rev-parse HEAD)"
+if cli_run cli-project --lane nonff --import "$cli_nonff_commit" \
+    >"$cli_root/import-nonff.log" 2>&1; then
+    fail "lane import accepted a non-fast-forward result"
+fi
+assert_contains "$(<"$cli_root/import-nonff.log")" "does not fast-forward default HEAD"
+[[ "$(git -C "$cli_repo" rev-parse HEAD)" == "$cli_default_divergent" ]] ||
+    fail "rejected non-fast-forward import changed default HEAD"
+
+cli_managed_state="$cli_config/run-codex/state/cli-project/managed"
+cli_managed_sync="$cli_sync/projects/cli-project/lanes/managed"
+mkdir -p "$cli_managed_state" "$cli_managed_sync"
+printf '%s\n' lane-state > "$cli_managed_state/marker"
+printf '%s\n' snapshot-history > "$cli_managed_sync/marker"
+cli_remove_lock="$cli_config/run-codex/locks/cli-project/managed.handoff.lock"
+exec 8>"$cli_remove_lock"
+flock -n -x 8 || fail "could not acquire managed lane removal lock"
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-lock.log" 2>&1; then
+    fail "managed lane removal ignored an active lock"
+fi
+assert_contains "$(<"$cli_root/remove-lock.log")" "Stop project 'cli-project' lane 'managed'"
+exec 8>&-
+printf '%s\n' unintegrated > "$cli_managed_path/unintegrated"
+git -C "$cli_managed_path" add unintegrated
+git -C "$cli_managed_path" -c user.name=host-smoke \
+    -c user.email=host-smoke.invalid commit -qm unintegrated
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-unintegrated.log" 2>&1; then
+    fail "managed lane removal accepted unintegrated commits"
+fi
+assert_contains "$(<"$cli_root/remove-unintegrated.log")" "commits not integrated"
+git -C "$cli_managed_path" reset -q --hard "$cli_feature_commit"
+printf '%s\n' dirty > "$cli_managed_path/dirty"
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-dirty.log" 2>&1; then
+    fail "managed lane removal accepted dirty or untracked files"
+fi
+assert_contains "$(<"$cli_root/remove-dirty.log")" "uncommitted or untracked files"
+rm -- "$cli_managed_path/dirty"
+printf '%s\n' ignored > "$cli_managed_path/local.ignored"
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-ignored.log" 2>&1; then
+    fail "managed lane removal accepted ignored files"
+fi
+assert_contains "$(<"$cli_root/remove-ignored.log")" "ignored files"
+rm -- "$cli_managed_path/local.ignored"
+printf '%s\n' local > "$cli_managed_path/local-input"
+if cli_run cli-project --lane managed --remove >"$cli_root/remove-local.log" 2>&1; then
+    fail "managed lane removal accepted a declared local input"
+fi
+assert_contains "$(<"$cli_root/remove-local.log")" "declared local input"
+rm -- "$cli_managed_path/local-input"
+
+cli_adopted_path="$cli_config/run-codex/worktrees/cli-project/adopted"
+cli_run cli-project --lane adopted --create "$cli_default_divergent" >/dev/null 2>&1
+sed -i "s#^path=.*#path=$cli_repo#" \
+    "$cli_config/run-codex/lanes/cli-project/adopted"
+if cli_run cli-project --lane adopted --remove >"$cli_root/remove-adopted.log" 2>&1; then
+    fail "managed lane removal accepted an adopted checkout path"
+fi
+assert_contains "$(<"$cli_root/remove-adopted.log")" "adopted checkout"
+[[ -e "$cli_adopted_path" ]] || fail "adopted lane fixture disappeared after rejection"
+
+cli_run cli-project --lane managed --remove >"$cli_root/remove-success.log" 2>&1
+[[ ! -e "$cli_managed_path" && ! -e "$cli_managed_config" ]] ||
+    fail "successful managed lane removal retained checkout or registry"
+git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_managed_branch" &&
+    fail "successful managed lane removal retained its safe branch"
+[[ -f "$cli_managed_state/marker" && -f "$cli_managed_sync/marker" ]] ||
+    fail "managed lane removal deleted lane state or snapshot history"
+pass "managed lane create, import, and removal lifecycle"
 pass "project registry and launcher policy"
 activity "JetBrains ACP configuration"
 

@@ -7,6 +7,16 @@ SYNC_DIR="${CODEX_SYNC_DIR:-$HOME/Seafile/CodexSync}"
 LOCK_FILE="${CODEX_LOCK_FILE:-$HOME/.cache/codex-handoff.lock}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-handoff"
 BASE_FILE="$STATE_DIR/base.state"
+CONTAINER_PROJECT="${CODEX_CONTAINER_PROJECT:-}"
+CONTAINER_LANE="${CODEX_CONTAINER_LANE:-}"
+HANDOFF_PROJECT="${CODEX_HANDOFF_PROJECT:-}"
+HANDOFF_LANE="${CODEX_HANDOFF_LANE:-}"
+HANDOFF_COMMIT="${CODEX_HANDOFF_COMMIT:-}"
+HANDOFF_RUNTIME_PROFILE="${CODEX_HANDOFF_RUNTIME_PROFILE:-}"
+HANDOFF_RUNTIME_VERSION="${CODEX_HANDOFF_RUNTIME_VERSION:-}"
+HANDOFF_RUNTIME_REVISION="${CODEX_HANDOFF_RUNTIME_REVISION:-}"
+HANDOFF_ONBOARDING_SHA256="${CODEX_HANDOFF_ONBOARDING_SHA256:-}"
+HANDOFF_READY="${CODEX_HANDOFF_READY:-}"
 
 usage() {
     cat <<'USAGE'
@@ -44,6 +54,46 @@ done
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=bin/codex-sync-lib
 source "$SCRIPT_DIR/codex-sync-lib"
+
+HANDOFF_ENABLED=false
+validate_handoff_context() {
+    local values=(
+        "$HANDOFF_PROJECT"
+        "$HANDOFF_LANE"
+        "$HANDOFF_COMMIT"
+        "$HANDOFF_RUNTIME_PROFILE"
+        "$HANDOFF_RUNTIME_VERSION"
+        "$HANDOFF_RUNTIME_REVISION"
+        "$HANDOFF_ONBOARDING_SHA256"
+        "$HANDOFF_READY"
+    )
+    local value present=0
+
+    for value in "${values[@]}"; do
+        [[ -z "$value" ]] || ((present += 1))
+    done
+    ((present > 0)) || return 0
+    ((present == ${#values[@]})) ||
+        die "Incomplete lane handoff context"
+
+    valid_handoff_id "$HANDOFF_PROJECT" || die "Invalid handoff project"
+    valid_handoff_id "$HANDOFF_LANE" || die "Invalid handoff lane"
+    valid_required_commit "$HANDOFF_COMMIT" ||
+        die "Invalid handoff required commit"
+    valid_handoff_id "$HANDOFF_RUNTIME_PROFILE" ||
+        die "Invalid handoff runtime profile"
+    valid_runtime_value "$HANDOFF_RUNTIME_VERSION" ||
+        die "Invalid handoff runtime version"
+    [[ "$HANDOFF_RUNTIME_REVISION" =~ ^[0-9a-f]{7,64}$ ]] ||
+        die "Invalid handoff runtime revision"
+    valid_hash "$HANDOFF_ONBOARDING_SHA256" ||
+        die "Invalid handoff onboarding contract hash"
+    [[ "$HANDOFF_READY" == 1 ]] ||
+        die "Lane onboarding is not ready for handoff"
+    HANDOFF_ENABLED=true
+}
+
+validate_handoff_context
 
 normalize_path() {
     local variable="$1"
@@ -190,6 +240,7 @@ REMOTE_STATE_FILE=""
 load_latest_remote() {
     local best_gen=-1
     local best_hash=""
+    local best_handoff=""
     local best_file=""
     local found=false
     local restore_nullglob=false
@@ -204,8 +255,7 @@ load_latest_remote() {
     fi
 
     for state_file in "${files[@]}"; do
-        local generation
-        local hash
+        local generation hash handoff
 
         generation="$(state_value "$state_file" generation)"
         hash="$(state_value "$state_file" sha256)"
@@ -214,16 +264,24 @@ load_latest_remote() {
         valid_hash "$hash" || continue
 
         generation=$((10#$generation))
+        if snapshot_handoff_identity "$state_file"; then
+            handoff="$SNAPSHOT_HANDOFF_IDENTITY"
+        else
+            handoff="invalid"
+        fi
 
         if (( generation > best_gen )); then
             best_gen="$generation"
             best_hash="$hash"
+            best_handoff="$handoff"
             best_file="$state_file"
             found=true
 
         elif (( generation == best_gen )); then
             [[ "$hash" == "$best_hash" ]] ||
                 die "DIVERGENCE: generation $generation has multiple different hashes"
+            [[ "$handoff" == "$best_handoff" ]] ||
+                die "DIVERGENCE: generation $generation has conflicting handoff metadata"
         fi
     done
 
@@ -243,6 +301,30 @@ verify_remote_snapshot() {
         die "Remote snapshot metadata, archive, or checksum is invalid: $state_file"
 }
 
+REMOTE_HANDOFF_CURRENT=false
+verify_remote_handoff() {
+    local state_file="$1"
+
+    snapshot_metadata_is_valid "$state_file" ||
+        die "Remote snapshot metadata is invalid: $state_file"
+    if [[ -z "$SNAPSHOT_HANDOFF_FORMAT" ]]; then
+        return 0
+    fi
+    $HANDOFF_ENABLED ||
+        die "Remote snapshot contains lane handoff metadata; use the lane-aware run-codex command"
+    [[ "$SNAPSHOT_PROJECT" == "$HANDOFF_PROJECT" &&
+       "$SNAPSHOT_LANE" == "$HANDOFF_LANE" ]] ||
+        die "Remote snapshot belongs to project '$SNAPSHOT_PROJECT' lane '$SNAPSHOT_LANE'"
+
+    if [[ "$SNAPSHOT_REQUIRED_COMMIT" == "$HANDOFF_COMMIT" &&
+          "$SNAPSHOT_RUNTIME_PROFILE" == "$HANDOFF_RUNTIME_PROFILE" &&
+          "$SNAPSHOT_RUNTIME_VERSION" == "$HANDOFF_RUNTIME_VERSION" &&
+          "$SNAPSHOT_RUNTIME_REVISION" == "$HANDOFF_RUNTIME_REVISION" &&
+          "$SNAPSHOT_ONBOARDING_SHA256" == "$HANDOFF_ONBOARDING_SHA256" ]]; then
+        REMOTE_HANDOFF_CURRENT=true
+    fi
+}
+
 publish_file() {
     local source="$1"
     local destination_name="$2"
@@ -257,8 +339,18 @@ publish_file() {
 
 running_codex_containers() {
     command -v docker >/dev/null 2>&1 || return 0
-    docker ps --format '{{.Names}}' 2>/dev/null |
-        grep '^codex-' || true
+    if [[ -n "$CONTAINER_PROJECT" || -n "$CONTAINER_LANE" ]]; then
+        [[ "$CONTAINER_PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ &&
+           "$CONTAINER_LANE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+            die "CODEX_CONTAINER_PROJECT and CODEX_CONTAINER_LANE must both be safe non-empty identifiers"
+        docker ps \
+            --filter "label=codex-universal.project=$CONTAINER_PROJECT" \
+            --filter "label=codex-universal.lane=$CONTAINER_LANE" \
+            --format '{{.Names}}' 2>/dev/null || true
+    else
+        docker ps --format '{{.Names}}' 2>/dev/null |
+            grep '^codex-' || true
+    fi
 }
 
 report_running_codex_containers() {
@@ -325,6 +417,7 @@ fi
 if load_latest_remote; then
     HAVE_REMOTE=true
     verify_remote_snapshot "$REMOTE_STATE_FILE"
+    verify_remote_handoff "$REMOTE_STATE_FILE"
 else
     HAVE_REMOTE=false
 fi
@@ -377,11 +470,16 @@ if $HAVE_BASE; then
             die "DIVERGENCE: remote generation $REMOTE_GEN differs from local baseline."
 
         if [[ "$LOCAL_HASH" == "$BASE_HASH" ]]; then
-            echo "No changes. Codex state already matches synchronized generation $REMOTE_GEN."
-            exit 0
+            if $HANDOFF_ENABLED && ! $REMOTE_HANDOFF_CURRENT; then
+                echo "Codex state is unchanged; publishing updated lane handoff requirements."
+                NEXT_GEN=$((REMOTE_GEN + 1))
+            else
+                echo "No changes. Codex state already matches synchronized generation $REMOTE_GEN."
+                exit 0
+            fi
+        else
+            NEXT_GEN=$((REMOTE_GEN + 1))
         fi
-
-        NEXT_GEN=$((REMOTE_GEN + 1))
     fi
 
 else
@@ -392,20 +490,25 @@ else
     if $HAVE_REMOTE; then
 
         if [[ "$LOCAL_HASH" == "$REMOTE_HASH" ]]; then
-            write_base "$REMOTE_GEN" "$REMOTE_HASH"
+            if $HANDOFF_ENABLED && ! $REMOTE_HANDOFF_CURRENT; then
+                echo "Codex state matches; publishing lane handoff requirements."
+                NEXT_GEN=$((REMOTE_GEN + 1))
+            else
+                write_base "$REMOTE_GEN" "$REMOTE_HASH"
 
-            echo "No changes."
-            echo "Adopted synchronized generation $REMOTE_GEN as local baseline."
-            exit 0
+                echo "No changes."
+                echo "Adopted synchronized generation $REMOTE_GEN as local baseline."
+                exit 0
+            fi
+        else
+            die "Remote generation $REMOTE_GEN exists but this machine has no baseline. Run 'codex-pull --force $REMOTE_GEN' if the remote state should win."
         fi
-
-        die "Remote generation $REMOTE_GEN exists but this machine has no baseline. Run 'codex-pull --force $REMOTE_GEN' if the remote state should win."
+    else
+        #
+        # Completely fresh synchronization setup.
+        #
+        NEXT_GEN=1
     fi
-
-    #
-    # Completely fresh synchronization setup.
-    #
-    NEXT_GEN=1
 fi
 
 #
@@ -442,7 +545,8 @@ archive_hash="$(sha256sum "$archive" | awk '{print $1}')"
 printf '%s\n' "$archive_hash" \
     > "$tmpdir/$archive_name.sha256"
 
-cat > "$tmpdir/$archive_name.state" <<EOF
+{
+    cat <<EOF
 format=1
 generation=$NEXT_GEN
 sha256=$LOCAL_HASH
@@ -450,6 +554,19 @@ created=$timestamp
 host=$host
 archive=$archive_name
 EOF
+    if $HANDOFF_ENABLED; then
+        cat <<EOF
+handoff_format=1
+project=$HANDOFF_PROJECT
+lane=$HANDOFF_LANE
+required_commit=$HANDOFF_COMMIT
+runtime_profile=$HANDOFF_RUNTIME_PROFILE
+runtime_version=$HANDOFF_RUNTIME_VERSION
+runtime_revision=$HANDOFF_RUNTIME_REVISION
+onboarding_sha256=$HANDOFF_ONBOARDING_SHA256
+EOF
+    fi
+} > "$tmpdir/$archive_name.state"
 
 #
 # Check that synchronized state did not change while we were creating

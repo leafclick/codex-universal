@@ -4,7 +4,12 @@ umask 077
 
 CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/run-codex"
 PROJECTS_DIR="$CONFIG_ROOT/projects"
+LANES_DIR="$CONFIG_ROOT/lanes"
+LANE_STATE_ROOT="$CONFIG_ROOT/state"
+ONBOARDING_DIR="$CONFIG_ROOT/onboarding"
 LOCK_FILE="${CODEX_LOCK_FILE:-$HOME/.cache/codex-handoff.lock}"
+SYNC_ROOT="${CODEX_SYNC_ROOT:-${CODEX_SYNC_DIR:-$HOME/Seafile/CodexSync}}"
+LOCAL_SYNC_STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/run-codex"
 
 CONTAINER_HOME="${CODEX_CONTAINER_HOME:-/home/codex}"
 WORKSPACE_ROOT="${CODEX_WORKSPACE_ROOT:-/workspace}"
@@ -68,17 +73,34 @@ CLOJURE_LSP_MCP_ALLOWED_TOOLS='[
 usage() {
     cat <<'USAGE'
 Usage:
-  run-codex [PROJECT] [--new] [--image-version VERSION] [--codex-option OPTION]...
-  run-codex --new [PROJECT] [--image-version VERSION] [--codex-option OPTION]...
-  run-codex [PROJECT] --sessions
-  run-codex [PROJECT] --resume QUERY [--image-version VERSION] [--codex-option OPTION]...
+  run-codex [PROJECT] [--lane LANE] [--new] [--image-version VERSION] [--codex-option OPTION]...
+  run-codex --new [PROJECT] [--lane LANE] [--image-version VERSION] [--codex-option OPTION]...
+  run-codex [PROJECT] [--lane LANE] --sessions
+  run-codex [PROJECT] [--lane LANE] --resume QUERY [--image-version VERSION] [--codex-option OPTION]...
+  run-codex PROJECT --lane LANE --review REVISION [--codex-option model=MODEL]...
   run-codex --idea
   run-codex --idea PROJECT  # compatibility/direct project launch
 
-  run-codex --init [--profile generic|cuda] [--clojure-mcp auto|on|off] [PROJECT [PATH]]
-  run-codex --rebind PROJECT [PATH]
+  run-codex --init [--lane LANE] [--profile generic|cuda] [--clojure-mcp auto|on|off] [--bootstrap-codex-home DIR] [PROJECT [PATH]]
+  run-codex --rebind PROJECT [PATH] [--lane LANE]
+  run-codex PROJECT --lane LANE --create REVISION
+  run-codex PROJECT --lane LANE --import REVISION
+  run-codex PROJECT --lane LANE --remove
+  run-codex PROJECT [--lane LANE] --check
+  run-codex PROJECT [--lane LANE] --onboard [--from CHECKOUT]
+  run-codex PROJECT [--lane LANE] --setup
+  run-codex PROJECT [--lane LANE] --push-state
+  run-codex PROJECT [--lane LANE] --pull-state
+  run-codex PROJECT [--lane LANE] --list-state
+  run-codex PROJECT [--lane LANE] --force-state GENERATION
   run-codex PROJECT --set profile generic|cuda
   run-codex PROJECT --set clojure-mcp auto|on|off
+  run-codex PROJECT --set model MODEL
+  run-codex PROJECT --set reasoning minimal|low|medium|high|xhigh
+  run-codex PROJECT --lane LANE --set profile generic|cuda
+  run-codex PROJECT --lane LANE --set clojure-mcp auto|on|off
+  run-codex PROJECT --lane LANE --set model MODEL
+  run-codex PROJECT --lane LANE --set reasoning minimal|low|medium|high|xhigh
   run-codex --doctor [PROJECT]
   run-codex --list
 
@@ -101,6 +123,8 @@ Examples:
   run-codex cortex --new --image-version 0.5.5-2-g2594e2265f3
   run-codex cortex --sessions
   run-codex cortex --resume gpu-tuning
+  run-codex cortex --lane review --new --codex-option model=gpt-5.6-sol
+  run-codex cortex --lane review --review origin/main --codex-option model=gpt-5.6-sol
   run-codex cortex --new --codex-option model=gpt-5.6-sol --codex-option reasoning=high
   run-codex cortex --codex-option no-alt-screen
   run-codex --idea
@@ -115,7 +139,8 @@ Environment:
   CODEX_DEFAULT_PROFILE=generic
   CODEX_CONTAINER_HOME=/home/codex
   CODEX_WORKSPACE_ROOT=/workspace
-  CODEX_LOCK_FILE=~/.cache/codex-handoff.lock
+  CODEX_LOCK_FILE=PATH       Override scoped handoff lock (legacy default: ~/.cache/codex-handoff.lock)
+  CODEX_SYNC_ROOT=~/Seafile/CodexSync
   CODEX_APPARMOR_PROFILE=codex-universal
   CODEX_SECCOMP_PROFILE=~/.config/run-codex/security/codex-bwrap.json
   CODEX_CLOJURE_LSP_MCP=VALUE  Override project setting: auto, on/off, or 1/0
@@ -460,6 +485,12 @@ validate_project_name() {
         die "Invalid project name '$name'. Use letters, digits, '.', '_' or '-'."
 }
 
+validate_lane_name() {
+    local name="$1"
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+        die "Invalid lane name '$name'. Use letters, digits, '.', '_' or '-'."
+}
+
 validate_profile() {
     case "$1" in
         generic|cuda) ;;
@@ -489,6 +520,18 @@ normalize_clojure_mcp_setting() {
     esac
 }
 
+validate_codex_model() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*$ ]] ||
+        die "Invalid Codex model '$1'"
+}
+
+validate_codex_reasoning() {
+    case "$1" in
+        minimal|low|medium|high|xhigh) ;;
+        *) die "Invalid Codex reasoning effort '$1'. Supported values: minimal, low, medium, high, xhigh" ;;
+    esac
+}
+
 CODEX_FORWARD_ARGS=()
 CODEX_IMAGE_REQUESTS=()
 CODEX_INITIAL_PROMPT=""
@@ -498,6 +541,18 @@ CODEX_SEARCH_SET=false
 CODEX_NO_ALT_SCREEN_SET=false
 CODEX_STRICT_CONFIG_SET=false
 CODEX_PROMPT_SET=false
+LANE="default"
+LANE_SET=false
+REVIEW_REVISION=""
+REVIEW_REVISION_SET=false
+ONBOARD_CHECK_MODE=false
+ONBOARD_APPLY_MODE=false
+ONBOARD_SOURCE=""
+SETUP_SESSION=false
+STATE_SYNC_MODE=""
+STATE_SYNC_GENERATION=""
+LANE_MANAGEMENT_MODE=""
+LANE_MANAGEMENT_REVISION=""
 
 add_codex_option() {
     local option="$1"
@@ -514,18 +569,14 @@ add_codex_option() {
             ;;
         model=*)
             value="${option#model=}"
-            [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*$ ]] ||
-                die "Invalid Codex model '$value'"
+            validate_codex_model "$value"
             ! $CODEX_MODEL_SET || die "Codex option 'model' may be specified only once"
             CODEX_MODEL_SET=true
             CODEX_FORWARD_ARGS+=(--model "$value")
             ;;
         reasoning=*)
             value="${option#reasoning=}"
-            case "$value" in
-                minimal|low|medium|high|xhigh) ;;
-                *) die "Invalid Codex reasoning effort '$value'. Supported values: minimal, low, medium, high, xhigh" ;;
-            esac
+            validate_codex_reasoning "$value"
             ! $CODEX_REASONING_SET ||
                 die "Codex option 'reasoning' may be specified only once"
             CODEX_REASONING_SET=true
@@ -615,6 +666,91 @@ parse_launch_args() {
                 RESUME_QUERY="${1#--resume=}"
                 shift
                 ;;
+            --lane)
+                (($# >= 2)) || die "--lane requires a lane name"
+                ! $LANE_SET || die "--lane may be specified only once"
+                LANE="$2"
+                validate_lane_name "$LANE"
+                LANE_SET=true
+                shift 2
+                ;;
+            --lane=*)
+                ! $LANE_SET || die "--lane may be specified only once"
+                LANE="${1#--lane=}"
+                validate_lane_name "$LANE"
+                LANE_SET=true
+                shift
+                ;;
+            --review)
+                (($# >= 2)) || die "--review requires a Git revision"
+                ! $REVIEW_REVISION_SET || die "--review may be specified only once"
+                REVIEW_REVISION="$2"
+                REVIEW_REVISION_SET=true
+                shift 2
+                ;;
+            --review=*)
+                ! $REVIEW_REVISION_SET || die "--review may be specified only once"
+                REVIEW_REVISION="${1#--review=}"
+                REVIEW_REVISION_SET=true
+                shift
+                ;;
+            --create|--import)
+                (($# >= 2)) || die "$1 requires an immutable Git revision"
+                [[ -z "$LANE_MANAGEMENT_MODE" ]] ||
+                    die "Only one lane management action may be specified"
+                LANE_MANAGEMENT_MODE="${1#--}"
+                LANE_MANAGEMENT_REVISION="$2"
+                shift 2
+                ;;
+            --remove)
+                [[ -z "$LANE_MANAGEMENT_MODE" ]] ||
+                    die "Only one lane management action may be specified"
+                LANE_MANAGEMENT_MODE="remove"
+                shift
+                ;;
+            --check)
+                ! $ONBOARD_CHECK_MODE || die "--check may be specified only once"
+                ONBOARD_CHECK_MODE=true
+                shift
+                ;;
+            --onboard)
+                ! $ONBOARD_APPLY_MODE || die "--onboard may be specified only once"
+                ONBOARD_APPLY_MODE=true
+                shift
+                ;;
+            --from)
+                (($# >= 2)) || die "--from requires a source checkout"
+                [[ -z "$ONBOARD_SOURCE" ]] || die "--from may be specified only once"
+                ONBOARD_SOURCE="$2"
+                shift 2
+                ;;
+            --from=*)
+                [[ -z "$ONBOARD_SOURCE" ]] || die "--from may be specified only once"
+                ONBOARD_SOURCE="${1#--from=}"
+                shift
+                ;;
+            --setup)
+                ! $SETUP_SESSION || die "--setup may be specified only once"
+                SETUP_SESSION=true
+                NEW_SESSION=true
+                shift
+                ;;
+            --push-state|--pull-state|--list-state)
+                [[ -z "$STATE_SYNC_MODE" ]] ||
+                    die "Only one state synchronization action may be specified"
+                STATE_SYNC_MODE="${1#--}"
+                shift
+                ;;
+            --force-state)
+                (($# >= 2)) || die "--force-state requires a generation"
+                [[ -z "$STATE_SYNC_MODE" ]] ||
+                    die "Only one state synchronization action may be specified"
+                [[ "$2" =~ ^[0-9]+$ ]] && ((10#$2 > 0)) ||
+                    die "--force-state generation must be a positive integer"
+                STATE_SYNC_MODE="force-state"
+                STATE_SYNC_GENERATION="$((10#$2))"
+                shift 2
+                ;;
             --codex-option)
                 (($# >= 2)) || die "--codex-option requires a value"
                 add_codex_option "$2"
@@ -663,7 +799,8 @@ RESOLVED_SESSION_NAME=""
 
 load_project_sessions() {
     local container_cwd="$1"
-    local state_db="$HOME/.codex/state_5.sqlite"
+    local codex_home="$2"
+    local state_db="$codex_home/state_5.sqlite"
     local rows=""
 
     need jq
@@ -775,17 +912,65 @@ git_root_for() {
     canonical_dir "$root"
 }
 
-check_supported_repo() {
+GIT_LAYOUT="ordinary"
+GIT_COMMON_DIR=""
+
+inspect_git_layout() {
     local root="$1"
+    local git_dir common_dir raw_git_dir raw_common_dir pointer_line back_pointer
+
+    raw_git_dir="$(git -C "$root" rev-parse --path-format=absolute --git-dir 2>/dev/null)" ||
+        die "Cannot resolve Git metadata for: $root"
+    raw_common_dir="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
+        die "Cannot resolve common Git metadata for: $root"
+    git_dir="$(realpath -e -- "$raw_git_dir")" ||
+        die "Git metadata path does not exist: $raw_git_dir"
+    common_dir="$(realpath -e -- "$raw_common_dir")" ||
+        die "Common Git metadata path does not exist: $raw_common_dir"
 
     if [[ -f "$root/.git" ]]; then
-        die "Git worktrees/submodules with a .git pointer file are not supported yet: $root"
+        [[ "$git_dir" != "$common_dir" ]] ||
+            die "Git submodules with a .git pointer file are not supported: $root"
+        IFS= read -r pointer_line < "$root/.git" ||
+            die "Cannot read linked-worktree pointer: $root/.git"
+        [[ "$pointer_line" == "gitdir: $git_dir" &&
+           "$raw_git_dir" == "$git_dir" &&
+           "$raw_common_dir" == "$common_dir" ]] ||
+            die "Linked worktree uses non-canonical Git pointer paths; recreate it from canonical checkout paths: $root"
+        [[ -f "$git_dir/gitdir" && ! -L "$git_dir/gitdir" ]] ||
+            die "Linked worktree has no safe Git back-pointer: $git_dir/gitdir"
+        IFS= read -r back_pointer < "$git_dir/gitdir" ||
+            die "Cannot read linked-worktree Git back-pointer: $git_dir/gitdir"
+        [[ "$back_pointer" == "$root/.git" ]] ||
+            die "Linked worktree Git back-pointer does not match its canonical checkout: $root"
+        GIT_LAYOUT="linked-worktree"
+    else
+        [[ -d "$root/.git" && "$git_dir" == "$common_dir" ]] ||
+            die "Unsupported Git repository layout: $root"
+        GIT_LAYOUT="ordinary"
     fi
+    GIT_COMMON_DIR="$common_dir"
 }
 
 CONFIG_PATH=""
 CONFIG_PROFILE=""
 CONFIG_CLOJURE_MCP=""
+CONFIG_MODEL=""
+CONFIG_REASONING=""
+CONFIG_LANE="default"
+CONFIG_STATE_MODE="legacy-global"
+CONFIG_AGENT="codex"
+
+registry_file_for() {
+    local project="$1"
+    local lane="$2"
+
+    if [[ "$lane" == default ]]; then
+        printf '%s\n' "$PROJECTS_DIR/$project"
+    else
+        printf '%s\n' "$LANES_DIR/$project/$lane"
+    fi
+}
 
 read_project_config() {
     local file="$1"
@@ -793,6 +978,11 @@ read_project_config() {
     local path=""
     local profile=""
     local clojure_mcp=""
+    local model=""
+    local reasoning=""
+    local lane=""
+    local state_mode=""
+    local agent=""
 
     [[ -f "$file" ]] || return 1
     IFS= read -r first < "$file" || true
@@ -815,6 +1005,21 @@ read_project_config() {
                 clojure_mcp=*)
                     clojure_mcp="${line#clojure_mcp=}"
                     ;;
+                model=*)
+                    model="${line#model=}"
+                    ;;
+                reasoning=*)
+                    reasoning="${line#reasoning=}"
+                    ;;
+                lane=*)
+                    lane="${line#lane=}"
+                    ;;
+                state=*)
+                    state_mode="${line#state=}"
+                    ;;
+                agent=*)
+                    agent="${line#agent=}"
+                    ;;
                 ''|'#'*)
                     ;;
                 *)
@@ -827,60 +1032,622 @@ read_project_config() {
     [[ -n "$path" ]] || die "Project config has no path: $file"
     profile="${profile:-generic}"
     clojure_mcp="${clojure_mcp:-auto}"
+    lane="${lane:-default}"
+    state_mode="${state_mode:-legacy-global}"
+    agent="${agent:-codex}"
     validate_profile "$profile"
     validate_clojure_mcp_setting "$clojure_mcp"
+    [[ -z "$model" ]] || validate_codex_model "$model"
+    [[ -z "$reasoning" ]] || validate_codex_reasoning "$reasoning"
+    validate_lane_name "$lane"
+    case "$state_mode" in
+        isolated|legacy-global) ;;
+        *) die "Invalid state mode '$state_mode' in $file" ;;
+    esac
+    case "$agent" in
+        codex) ;;
+        *) die "Unsupported agent adapter '$agent' in $file" ;;
+    esac
 
     CONFIG_PATH="$path"
     CONFIG_PROFILE="$profile"
     CONFIG_CLOJURE_MCP="$clojure_mcp"
+    CONFIG_MODEL="$model"
+    CONFIG_REASONING="$reasoning"
+    CONFIG_LANE="$lane"
+    CONFIG_STATE_MODE="$state_mode"
+    CONFIG_AGENT="$agent"
 }
 
 write_project_config() {
     local name="$1"
-    local path="$2"
-    local profile="$3"
-    local clojure_mcp="$4"
-    local file="$PROJECTS_DIR/$name"
+    local lane="$2"
+    local path="$3"
+    local profile="$4"
+    local clojure_mcp="$5"
+    local state_mode="${6:-isolated}"
+    local agent="${7:-codex}"
+    local model="${8:-}"
+    local reasoning="${9:-}"
+    local file
+    file="$(registry_file_for "$name" "$lane")"
     local tmp="$file.tmp.$$"
 
     validate_project_name "$name"
+    validate_lane_name "$lane"
     validate_profile "$profile"
     validate_clojure_mcp_setting "$clojure_mcp"
+    [[ -z "$model" ]] || validate_codex_model "$model"
+    [[ -z "$reasoning" ]] || validate_codex_reasoning "$reasoning"
+    [[ "$state_mode" == isolated || "$state_mode" == legacy-global ]] ||
+        die "Invalid lane state mode '$state_mode'"
+    [[ "$agent" == codex ]] || die "Unsupported agent adapter '$agent'"
+
+    mkdir -p -- "$(dirname -- "$file")"
 
     {
         printf 'path=%s\n' "$path"
         printf 'profile=%s\n' "$profile"
         printf 'clojure_mcp=%s\n' "$clojure_mcp"
+        [[ -z "$model" ]] || printf 'model=%s\n' "$model"
+        [[ -z "$reasoning" ]] || printf 'reasoning=%s\n' "$reasoning"
+        printf 'lane=%s\n' "$lane"
+        printf 'state=%s\n' "$state_mode"
+        printf 'agent=%s\n' "$agent"
     } > "$tmp"
 
     mv -- "$tmp" "$file"
 }
 
-find_name_for_path() {
+provision_missing_review_lane() {
+    local name="$1"
+    local lane="$2"
+    local revision="$3"
+    local default_file lane_file default_root commit
+    local profile clojure_mcp agent managed_parent managed_path
+    local provision_lock provision_lock_fd
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    [[ "$lane" != default ]] || return 0
+    [[ -n "$revision" && "$revision" != -* &&
+       "$revision" != *$'\n'* && "$revision" != *$'\r'* ]] ||
+        die "--review requires a valid Git revision"
+
+    lane_file="$(registry_file_for "$name" "$lane")"
+    [[ ! -f "$lane_file" ]] || return 0
+
+    default_file="$(registry_file_for "$name" default)"
+    [[ -f "$default_file" ]] || print_missing_project_help "$name"
+    read_project_config "$default_file"
+    [[ "$CONFIG_LANE" == default ]] ||
+        die "Lane config identity mismatch in $default_file"
+    default_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Default lane for project '$name' is no longer a Git repository: $CONFIG_PATH"
+    [[ "$default_root" == "$CONFIG_PATH" ]] ||
+        die "Registered path for '$name' is not its Git repository root: $CONFIG_PATH"
+    commit="$(
+        git -C "$default_root" rev-parse --verify "${revision}^{commit}" 2>/dev/null
+    )" || die "Review revision is not a commit in project '$name': $revision"
+
+    profile="$CONFIG_PROFILE"
+    clojure_mcp="$CONFIG_CLOJURE_MCP"
+    agent="$CONFIG_AGENT"
+    managed_parent="$(realpath -m -- "$CONFIG_ROOT/worktrees/$name")" ||
+        die "Cannot resolve managed review worktree directory"
+    managed_path="$managed_parent/$lane"
+    if [[ "$managed_path" == "$default_root" ||
+          "$managed_path" == "$default_root/"* ||
+          "$default_root" == "$managed_path/"* ]]; then
+        die "Managed review worktree path overlaps the default checkout: $managed_path"
+    fi
+    provision_lock="$CONFIG_ROOT/locks/$name/$lane.provision.lock"
+    mkdir -p -- "$(dirname -- "$provision_lock")"
+    exec {provision_lock_fd}>"$provision_lock"
+    flock -x "$provision_lock_fd"
+
+    # Another launcher may have completed provisioning while this invocation
+    # waited for the project/lane provisioning lock.
+    if [[ -f "$lane_file" ]]; then
+        exec {provision_lock_fd}>&-
+        return 0
+    fi
+    [[ ! -e "$managed_path" && ! -L "$managed_path" ]] ||
+        die "Managed review worktree path already exists without a lane registration: $managed_path"
+
+    mkdir -p -- "$managed_parent"
+    echo "Creating managed review lane '$lane' at $managed_path" >&2
+    git -C "$default_root" worktree add --detach "$managed_path" "$commit" >&2
+    write_project_config "$name" "$lane" "$managed_path" "$profile" \
+        "$clojure_mcp" isolated "$agent"
+    exec {provision_lock_fd}>&-
+}
+
+managed_lane_path() {
+    local name="$1"
+    local lane="$2"
+    realpath -m -- "$CONFIG_ROOT/worktrees/$name/$lane"
+}
+
+managed_lane_branch() {
+    printf 'codex/%s/%s\n' "$1" "$2"
+}
+
+lane_handoff_lock() {
+    local name="$1"
+    local lane="$2"
+    local lock_path
+
+    if [[ -n "${CODEX_LOCK_FILE:-}" ]]; then
+        [[ "$CODEX_LOCK_FILE" == /* ]] ||
+            die "CODEX_LOCK_FILE must be an absolute path"
+        lock_path="$(realpath -m -- "$CODEX_LOCK_FILE")" || return 1
+    else
+        lock_path="$(realpath -m -- "$CONFIG_ROOT/locks/$name/$lane.handoff.lock")" ||
+            return 1
+    fi
+    [[ "$lock_path" != / ]] || die "CODEX_LOCK_FILE must not be the filesystem root"
+    printf '%s\n' "$lock_path"
+}
+
+create_managed_lane() {
+    local name="$1"
+    local lane="$2"
+    local revision="$3"
+    local default_file lane_file default_root commit profile clojure_mcp agent
+    local default_state_mode
+    local managed_parent managed_path branch lock_file lock_fd
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    [[ "$lane" != default ]] || die "--create requires a non-default lane"
+    [[ -n "$revision" && "$revision" != -* &&
+       "$revision" != *$'\n'* && "$revision" != *$'\r'* ]] ||
+        die "--create requires a valid Git revision"
+
+    default_file="$(registry_file_for "$name" default)"
+    lane_file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$default_file" ]] ||
+        die "Initialize project '$name' default lane before creating lane '$lane'"
+    [[ ! -e "$lane_file" && ! -L "$lane_file" ]] ||
+        die "Project '$name' lane '$lane' is already registered"
+
+    read_project_config "$default_file"
+    [[ "$CONFIG_LANE" == default ]] ||
+        die "Lane config identity mismatch in $default_file"
+    default_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Default lane for project '$name' is no longer a Git repository: $CONFIG_PATH"
+    [[ "$default_root" == "$CONFIG_PATH" ]] ||
+        die "Registered path for '$name' is not its Git repository root: $CONFIG_PATH"
+    [[ -z "$(git -C "$default_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Default lane must be clean before creating a managed lane"
+    commit="$(
+        git -C "$default_root" rev-parse --verify "${revision}^{commit}" 2>/dev/null
+    )" || die "Create revision is not a commit in project '$name': $revision"
+
+    profile="$CONFIG_PROFILE"
+    clojure_mcp="$CONFIG_CLOJURE_MCP"
+    agent="$CONFIG_AGENT"
+    default_state_mode="$CONFIG_STATE_MODE"
+    managed_path="$(managed_lane_path "$name" "$lane")" ||
+        die "Cannot resolve managed lane path"
+    managed_parent="$(dirname -- "$managed_path")"
+    [[ "$managed_path" != "$default_root" &&
+       "$managed_path" != "$default_root/"* &&
+       "$default_root" != "$managed_path/"* ]] ||
+        die "Managed lane path overlaps the default checkout: $managed_path"
+    [[ ! -e "$managed_path" && ! -L "$managed_path" ]] ||
+        die "Managed lane path already exists without a registration: $managed_path"
+
+    branch="$(managed_lane_branch "$name" "$lane")"
+    git check-ref-format --branch "$branch" >/dev/null 2>&1 ||
+        die "Invalid managed lane branch: $branch"
+    ! git -C "$default_root" show-ref --verify --quiet "refs/heads/$branch" ||
+        die "Managed lane branch already exists: $branch"
+
+    lock_file="$(lane_handoff_lock "$name" default)" ||
+        die "Cannot resolve default lane lock"
+    mkdir -p -- "$(dirname -- "$lock_file")"
+    exec {lock_fd}>"$lock_file"
+    flock -n -x "$lock_fd" ||
+        die "Stop project '$name' default lane before creating lane '$lane'"
+    [[ ! -e "$lane_file" && ! -L "$lane_file" ]] ||
+        die "Project '$name' lane '$lane' was registered while waiting for its lock"
+    [[ ! -e "$managed_path" && ! -L "$managed_path" ]] ||
+        die "Managed lane path appeared while waiting for its lock: $managed_path"
+    ! git -C "$default_root" show-ref --verify --quiet "refs/heads/$branch" ||
+        die "Managed lane branch appeared while waiting for its lock: $branch"
+    [[ -z "$(git -C "$default_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Default lane changed while preparing managed lane '$lane'"
+
+    (
+        local rollback_pending=true
+        local temp_worktree_created=false
+        local registration_created=false
+        local branch_created=false
+        local temp_path=""
+        local state_created=false
+        local state_root=""
+        local lane_state_path=""
+        local state_owner=""
+        local state_owner_file=""
+        local state_quarantine=""
+        local state_project_path=""
+        local state_stage_path=""
+        local state_stage_created=false
+        local lane_codex_home=""
+        local codex_home_created=false
+        local m2_created=false
+        local seed_source seed_destination seed_name seed_index seed_intent_index
+        local seeded_sources=()
+        local seeded_destinations=()
+
+        rollback_managed_lane_create() {
+            local status=$?
+            local worktree_removed=true
+
+            trap - EXIT HUP INT TERM
+            if $rollback_pending && [[ -e "$managed_path" || -L "$managed_path" ]]; then
+                echo "WARNING: managed lane reached its final path before interruption; preserving path '$managed_path', registration '$lane_file', and branch '$branch' for inspection." >&2
+                exit "$status"
+            fi
+            if $rollback_pending && $temp_worktree_created; then
+                set +e
+                echo "Rolling back incomplete managed lane '$lane'" >&2
+                if [[ -e "$temp_path" || -L "$temp_path" ]]; then
+                    git -C "$default_root" worktree remove "$temp_path" \
+                        >/dev/null 2>&1 || worktree_removed=false
+                fi
+                rm -f -- "$lane_file.tmp.$$"
+                $registration_created && rm -f -- "$lane_file"
+                if $worktree_removed && $branch_created; then
+                    git -C "$default_root" update-ref -d \
+                        "refs/heads/$branch" "$commit" >/dev/null 2>&1 || true
+                fi
+                if ! $state_created; then
+                    for seed_index in "${!seeded_destinations[@]}"; do
+                        seed_destination="${seeded_destinations[$seed_index]}"
+                        seed_source="${seeded_sources[$seed_index]}"
+                        if [[ -f "$seed_destination" && ! -L "$seed_destination" &&
+                              -f "$seed_source" && ! -L "$seed_source" &&
+                              "$seed_destination" -ef "$seed_source" ]]; then
+                            rm -f -- "$seed_destination"
+                        fi
+                    done
+                    $codex_home_created && rmdir -- "$lane_state_path/codex-home" \
+                        2>/dev/null || true
+                    $m2_created && rmdir -- "$lane_state_path/m2" \
+                        2>/dev/null || true
+                fi
+                if $state_created; then
+                    if [[ -d "$lane_state_path" && ! -L "$lane_state_path" &&
+                          -f "$state_owner_file" && ! -L "$state_owner_file" &&
+                          "$(<"$state_owner_file")" == "$state_owner" ]]; then
+                        state_quarantine="$lane_state_path.rollback.$state_owner"
+                        if [[ ! -e "$state_quarantine" && ! -L "$state_quarantine" ]] &&
+                           mv -T -- "$lane_state_path" "$state_quarantine"; then
+                            if [[ -f "$state_quarantine/.run-codex-create-owner" &&
+                                  ! -L "$state_quarantine/.run-codex-create-owner" &&
+                                  "$(<"$state_quarantine/.run-codex-create-owner")" == "$state_owner" ]]; then
+                                rm -rf -- "$state_quarantine"
+                            else
+                                echo "WARNING: quarantined lane state ownership changed; preserving '$state_quarantine' for inspection." >&2
+                            fi
+                        else
+                            echo "WARNING: could not quarantine owned lane state; preserving '$lane_state_path' for inspection." >&2
+                        fi
+                    else
+                        echo "WARNING: managed lane state ownership changed; preserving '$lane_state_path' for inspection." >&2
+                    fi
+                fi
+                if $state_stage_created; then
+                    if [[ -d "$state_stage_path" && ! -L "$state_stage_path" &&
+                          "$state_stage_path" == "$state_project_path/"* ]]; then
+                        rm -rf -- "$state_stage_path"
+                    else
+                        echo "WARNING: bootstrap staging ownership changed; preserving '$state_stage_path' for inspection." >&2
+                    fi
+                fi
+                if [[ -e "$temp_path" || -L "$temp_path" ||
+                      -e "$managed_path" || -L "$managed_path" ||
+                      -e "$lane_file" || -L "$lane_file" ||
+                      ( "$state_stage_created" == true &&
+                        ( -e "$state_stage_path" || -L "$state_stage_path" ) ) ||
+                      ( "$state_created" == true &&
+                        ( -e "$lane_state_path" || -e "$state_quarantine" ) ) ]] ||
+                   git -C "$default_root" show-ref --verify --quiet \
+                       "refs/heads/$branch"; then
+                    echo "WARNING: incomplete lane artifacts remain; inspect temporary path '$temp_path', final path '$managed_path', registration '$lane_file', branch '$branch', and state '$lane_state_path'." >&2
+                fi
+            fi
+            exit "$status"
+        }
+
+        trap rollback_managed_lane_create EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
+        need mktemp
+        mkdir -p -- "$managed_parent"
+        temp_path="$(mktemp -d "$managed_parent/.${lane}.create.XXXXXX")"
+        rmdir -- "$temp_path"
+        echo "Creating managed lane '$lane' at $managed_path" >&2
+        git -C "$default_root" worktree add --detach "$temp_path" "$commit" >&2
+        temp_worktree_created=true
+        mkdir -p -- "$LANE_STATE_ROOT"
+        state_root="$(realpath -e -- "$LANE_STATE_ROOT")" ||
+            die "Cannot resolve lane state root: $LANE_STATE_ROOT"
+        mkdir -p -- "$state_root/$name"
+        state_project_path="$(realpath -e -- "$state_root/$name")" ||
+            die "Cannot resolve project lane state root"
+        [[ "$state_project_path" == "$state_root/"* ]] ||
+            die "Project lane state root escapes its managed root: $state_project_path"
+        state_stage_path="$(mktemp -d \
+            "$state_project_path/.${lane}.bootstrap.XXXXXX")"
+        state_stage_created=true
+        stage_managed_lane_codex_home "$name" "$lane" \
+            "$default_state_mode" "$state_stage_path"
+        lane_state_path="$(realpath -m -- "$state_root/$name/$lane")" ||
+            die "Cannot resolve managed lane state path"
+        [[ "$lane_state_path" == "$state_root/"* ]] ||
+            die "Managed lane state path escapes its root: $lane_state_path"
+        if [[ -e "$lane_state_path" || -L "$lane_state_path" ]]; then
+            [[ -d "$lane_state_path" && ! -L "$lane_state_path" ]] ||
+                die "Managed lane state must be a directory, not a symlink: $lane_state_path"
+        else
+            mkdir -p -- "$lane_state_path"
+            state_owner="$(basename -- "$temp_path")"
+            state_owner_file="$lane_state_path/.run-codex-create-owner"
+            printf '%s\n' "$state_owner" > "$state_owner_file"
+            state_created=true
+        fi
+        [[ -e "$lane_state_path/codex-home" ||
+           -L "$lane_state_path/codex-home" ]] || codex_home_created=true
+        [[ -e "$lane_state_path/m2" || -L "$lane_state_path/m2" ]] ||
+            m2_created=true
+        resolve_lane_codex_home "$name" "$lane" isolated
+        lane_codex_home="$CODEX_HOST_HOME"
+        need ln
+        while IFS= read -r -d '' seed_source; do
+            seed_name="$(basename -- "$seed_source")"
+            seed_destination="$lane_codex_home/$seed_name"
+            if [[ -e "$seed_destination" || -L "$seed_destination" ]]; then
+                [[ -f "$seed_destination" && ! -L "$seed_destination" ]] ||
+                    die "Codex bootstrap destination must be a regular file, not a symlink: $seed_destination"
+                continue
+            fi
+            seed_intent_index="${#seeded_destinations[@]}"
+            seeded_sources+=("$seed_source")
+            seeded_destinations+=("$seed_destination")
+            if ! ln -- "$seed_source" "$seed_destination"; then
+                if [[ -f "$seed_destination" && ! -L "$seed_destination" ]]; then
+                    unset 'seeded_sources[seed_intent_index]'
+                    unset 'seeded_destinations[seed_intent_index]'
+                else
+                    die "Cannot publish Codex bootstrap file: $seed_destination"
+                fi
+            fi
+        done < <(find "$state_stage_path/codex-home" -mindepth 1 -maxdepth 1 \
+            -type f -print0)
+        write_project_config "$name" "$lane" "$managed_path" "$profile" \
+            "$clojure_mcp" isolated "$agent"
+        registration_created=true
+        git -C "$temp_path" switch -c "$branch" >&2
+        branch_created=true
+        git -C "$default_root" worktree move "$temp_path" "$managed_path"
+
+        rollback_pending=false
+        trap - EXIT HUP INT TERM
+        if $state_created && ! rm -f -- "$state_owner_file"; then
+            echo "WARNING: retained managed lane creation marker: $state_owner_file" >&2
+        fi
+        if $state_stage_created && ! rm -rf -- "$state_stage_path"; then
+            echo "WARNING: retained managed lane bootstrap staging directory: $state_stage_path" >&2
+        fi
+        echo "Created project '$name' lane '$lane':"
+        echo "  path:   $managed_path"
+        echo "  branch: $branch"
+        echo "  commit: $commit"
+        echo "Complete local inputs with:"
+        echo "  run-codex '$name' --lane '$lane' --onboard --from '$default_root'"
+    )
+}
+
+import_lane_result() {
+    local name="$1"
+    local lane="$2"
+    local revision="$3"
+    local default_file lane_file default_root lane_root commit lane_head default_head
+    local default_common lane_common default_lock lane_lock default_lock_fd lane_lock_fd
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    [[ "$lane" != default ]] || die "--import requires a non-default source lane"
+    [[ "$revision" =~ ^[0-9a-f]{40}$ || "$revision" =~ ^[0-9a-f]{64}$ ]] ||
+        die "--import requires a full immutable commit ID"
+    default_file="$(registry_file_for "$name" default)"
+    lane_file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$default_file" && -f "$lane_file" ]] ||
+        die "Project '$name' default lane and source lane '$lane' must both be registered"
+
+    read_project_config "$default_file"
+    default_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Default lane checkout is unavailable: $CONFIG_PATH"
+    inspect_git_layout "$default_root"
+    default_common="$GIT_COMMON_DIR"
+    read_project_config "$lane_file"
+    lane_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Source lane checkout is unavailable: $CONFIG_PATH"
+    inspect_git_layout "$lane_root"
+    lane_common="$GIT_COMMON_DIR"
+    [[ "$default_common" == "$lane_common" ]] ||
+        die "Source lane '$lane' no longer shares project '$name' Git metadata"
+
+    commit="$(git -C "$lane_root" rev-parse --verify "${revision}^{commit}" 2>/dev/null)" ||
+        die "Import commit is unavailable in lane '$lane': $revision"
+    [[ "$commit" == "$revision" ]] ||
+        die "--import requires the canonical full commit ID: $commit"
+    lane_head="$(git -C "$lane_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot resolve source lane HEAD"
+    [[ "$lane_head" == "$commit" ]] ||
+        die "Import commit must equal lane '$lane' HEAD ($lane_head)"
+
+    default_lock="$(lane_handoff_lock "$name" default)" ||
+        die "Cannot resolve default lane lock"
+    lane_lock="$(lane_handoff_lock "$name" "$lane")" ||
+        die "Cannot resolve source lane lock"
+    mkdir -p -- "$(dirname -- "$default_lock")" "$(dirname -- "$lane_lock")"
+    exec {default_lock_fd}>"$default_lock"
+    flock -n -x "$default_lock_fd" ||
+        die "Stop project '$name' default lane before importing"
+    if [[ "$lane_lock" != "$default_lock" ]]; then
+        exec {lane_lock_fd}>"$lane_lock"
+        flock -n -x "$lane_lock_fd" ||
+            die "Stop project '$name' lane '$lane' before importing"
+    fi
+
+    [[ -z "$(git -C "$default_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Default lane must be clean before importing"
+    [[ -z "$(git -C "$lane_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Source lane '$lane' must be clean before importing"
+    lane_head="$(git -C "$lane_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot recheck source lane HEAD"
+    [[ "$lane_head" == "$commit" ]] ||
+        die "Source lane HEAD changed while preparing import"
+    [[ -n "$(git -C "$default_root" symbolic-ref -q HEAD)" ]] ||
+        die "Default lane must be on a branch before importing"
+    default_head="$(git -C "$default_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot resolve default lane HEAD"
+    git -C "$default_root" merge-base --is-ancestor "$default_head" "$commit" ||
+        die "Import commit $commit does not fast-forward default HEAD $default_head"
+
+    if [[ "$default_head" == "$commit" ]]; then
+        echo "No changes. Default lane already contains $commit."
+        return 0
+    fi
+    [[ "$(git -C "$default_root" rev-parse --verify HEAD^{commit})" == "$default_head" ]] ||
+        die "Default lane HEAD changed while preparing import"
+    git -C "$default_root" merge --ff-only "$commit"
+    echo "Imported project '$name' lane '$lane' result at $commit."
+}
+
+remove_managed_lane() {
+    local name="$1"
+    local lane="$2"
+    local default_file lane_file default_root lane_root expected_path lane_head default_head
+    local branch expected_branch lock_file lock_fd manifest entry path
+    local default_common lane_common
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    [[ "$lane" != default ]] || die "The default lane cannot be removed"
+    default_file="$(registry_file_for "$name" default)"
+    lane_file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$default_file" && -f "$lane_file" ]] ||
+        die "Project '$name' lane '$lane' is not registered"
+
+    read_project_config "$default_file"
+    default_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Default lane checkout is unavailable: $CONFIG_PATH"
+    inspect_git_layout "$default_root"
+    default_common="$GIT_COMMON_DIR"
+    read_project_config "$lane_file"
+    lane_root="$(git_root_for "$CONFIG_PATH")" ||
+        die "Lane '$lane' checkout is unavailable: $CONFIG_PATH"
+    inspect_git_layout "$lane_root"
+    lane_common="$GIT_COMMON_DIR"
+    [[ "$default_common" == "$lane_common" ]] ||
+        die "Lane '$lane' no longer shares project '$name' Git metadata"
+    expected_path="$(managed_lane_path "$name" "$lane")" ||
+        die "Cannot resolve managed lane path"
+    [[ "$lane_root" == "$expected_path" ]] ||
+        die "Refusing to remove adopted checkout $lane_root; only managed lanes can be removed"
+
+    lock_file="$(lane_handoff_lock "$name" "$lane")" ||
+        die "Cannot resolve lane lock"
+    mkdir -p -- "$(dirname -- "$lock_file")"
+    exec {lock_fd}>"$lock_file"
+    flock -n -x "$lock_fd" ||
+        die "Stop project '$name' lane '$lane' before removing it"
+
+    PROJECT="$name"
+    LANE="$lane"
+    PROJECT_PATH="$lane_root"
+    need jq
+    load_onboarding_manifests "$name" "$lane"
+    for manifest in "${ONBOARDING_MANIFESTS[@]}"; do
+        while IFS= read -r entry; do
+            path="$(jq -r '.path' <<<"$entry")"
+            if [[ -e "$lane_root/$path" || -L "$lane_root/$path" ]]; then
+                die "Lane '$lane' still contains declared local input '$path'; preserve or remove it before cleanup"
+            fi
+        done < <(jq -c '.files[]' "$manifest")
+    done
+
+    [[ -z "$(git -C "$lane_root" status --porcelain=v1 --untracked-files=all)" ]] ||
+        die "Lane '$lane' has uncommitted or untracked files; preserve them before cleanup"
+    [[ -z "$(git -C "$lane_root" status --porcelain=v1 --ignored=matching --untracked-files=all)" ]] ||
+        die "Lane '$lane' has ignored files; preserve or remove them before cleanup"
+    lane_head="$(git -C "$lane_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot resolve lane '$lane' HEAD"
+    default_head="$(git -C "$default_root" rev-parse --verify HEAD^{commit})" ||
+        die "Cannot resolve default lane HEAD"
+    git -C "$default_root" merge-base --is-ancestor "$lane_head" "$default_head" ||
+        die "Lane '$lane' has commits not integrated into the default lane"
+
+    branch="$(git -C "$lane_root" symbolic-ref --short -q HEAD || true)"
+    expected_branch="$(managed_lane_branch "$name" "$lane")"
+    git -C "$default_root" worktree remove "$lane_root"
+    rm -- "$lane_file"
+    if [[ "$branch" == "$expected_branch" ]] &&
+       ! git -C "$default_root" branch -d "$branch" >/dev/null 2>&1; then
+        echo "WARNING: retained managed branch '$branch'; remove it after inspection." >&2
+    fi
+
+    echo "Removed managed checkout and registration for project '$name' lane '$lane'."
+    echo "Retained lane state: $CONFIG_ROOT/state/$name/$lane"
+    echo "Retained synchronization history: $SYNC_ROOT/projects/$name/lanes/$lane"
+}
+
+FOUND_PROJECT=""
+FOUND_LANE=""
+
+find_binding_for_path() {
     local root="$1"
-    local matched=""
-    local file
+    local file project lane
     local restore_nullglob=false
+
+    FOUND_PROJECT=""
+    FOUND_LANE=""
 
     if ! shopt -q nullglob; then
         shopt -s nullglob
         restore_nullglob=true
     fi
-    for file in "$PROJECTS_DIR"/*; do
+    for file in "$PROJECTS_DIR"/* "$LANES_DIR"/*/*; do
         [[ -f "$file" ]] || continue
         read_project_config "$file"
 
         if [[ "$CONFIG_PATH" == "$root" ]]; then
-            [[ -z "$matched" ]] ||
-                die "Repository $root is registered under multiple project names"
-            matched="$(basename "$file")"
+            [[ -z "$FOUND_PROJECT" ]] ||
+                die "Checkout $root is registered to multiple project lanes"
+            if [[ "$file" == "$PROJECTS_DIR/"* ]]; then
+                project="$(basename -- "$file")"
+                lane="default"
+            else
+                project="$(basename -- "$(dirname -- "$file")")"
+                lane="$(basename -- "$file")"
+            fi
+            [[ "$CONFIG_LANE" == "$lane" ]] ||
+                die "Lane config identity mismatch in $file"
+            FOUND_PROJECT="$project"
+            FOUND_LANE="$lane"
         fi
     done
     if $restore_nullglob; then
         shopt -u nullglob
     fi
-
-    printf '%s\n' "$matched"
 }
 
 project_uses_clojure() {
@@ -944,6 +1711,9 @@ init_project() {
     local profile_explicit=false
     local clojure_mcp="auto"
     local clojure_mcp_explicit=false
+    local lane="default"
+    local agent="codex"
+    local bootstrap_codex_home=""
     local positional=()
 
     while (($#)); do
@@ -970,6 +1740,37 @@ init_project() {
                 clojure_mcp_explicit=true
                 shift
                 ;;
+            --lane)
+                (($# >= 2)) || die "--lane requires a lane name"
+                lane="$2"
+                shift 2
+                ;;
+            --lane=*)
+                lane="${1#--lane=}"
+                shift
+                ;;
+            --agent)
+                (($# >= 2)) || die "--agent requires an adapter name"
+                agent="$2"
+                shift 2
+                ;;
+            --agent=*)
+                agent="${1#--agent=}"
+                shift
+                ;;
+            --bootstrap-codex-home)
+                (($# >= 2)) || die "--bootstrap-codex-home requires a directory"
+                [[ -z "$bootstrap_codex_home" ]] ||
+                    die "--bootstrap-codex-home may be specified only once"
+                bootstrap_codex_home="$2"
+                shift 2
+                ;;
+            --bootstrap-codex-home=*)
+                [[ -z "$bootstrap_codex_home" ]] ||
+                    die "--bootstrap-codex-home may be specified only once"
+                bootstrap_codex_home="${1#--bootstrap-codex-home=}"
+                shift
+                ;;
             --)
                 shift
                 positional+=("$@")
@@ -987,12 +1788,16 @@ init_project() {
 
     validate_profile "$profile"
     validate_clojure_mcp_setting "$clojure_mcp"
+    validate_lane_name "$lane"
+    [[ "$agent" == codex ]] ||
+        die "Unsupported agent adapter '$agent'. Available adapters: codex"
     ((${#positional[@]} <= 2)) ||
-        die "Usage: run-codex --init [--profile generic|cuda] [--clojure-mcp auto|on|off] [PROJECT [PATH]]"
+        die "Usage: run-codex --init [--lane LANE] [--profile generic|cuda] [--clojure-mcp auto|on|off] [--bootstrap-codex-home DIR] [PROJECT [PATH]]"
 
     local requested_name="${positional[0]:-}"
     local requested_path="${positional[1]:-$PWD}"
     local path root name file
+    local candidate_git_layout candidate_git_common_dir default_file default_root
 
     need git
     need realpath
@@ -1004,19 +1809,44 @@ init_project() {
     root="$(git_root_for "$path")" ||
         die "$path is not inside a Git repository"
 
-    check_supported_repo "$root"
+    inspect_git_layout "$root"
+    candidate_git_layout="$GIT_LAYOUT"
+    candidate_git_common_dir="$GIT_COMMON_DIR"
 
     name="${requested_name:-$(basename "$root")}"
     validate_project_name "$name"
-    file="$PROJECTS_DIR/$name"
+    file="$(registry_file_for "$name" "$lane")"
+
+    if [[ "$lane" != default ]]; then
+        default_file="$(registry_file_for "$name" default)"
+        [[ -f "$default_file" ]] ||
+            die "Initialize project '$name' default lane before adding lane '$lane'"
+        read_project_config "$default_file"
+        default_root="$(git_root_for "$CONFIG_PATH")" ||
+            die "Default lane for project '$name' is no longer a Git repository: $CONFIG_PATH"
+        inspect_git_layout "$default_root"
+        [[ "$GIT_COMMON_DIR" == "$candidate_git_common_dir" ]] ||
+            die "Lane '$lane' must be a linked worktree of project '$name' in this initial implementation"
+        if ! $profile_explicit; then
+            profile="$CONFIG_PROFILE"
+        fi
+        if ! $clojure_mcp_explicit; then
+            clojure_mcp="$CONFIG_CLOJURE_MCP"
+        fi
+        GIT_LAYOUT="$candidate_git_layout"
+        GIT_COMMON_DIR="$candidate_git_common_dir"
+    fi
 
     if [[ -f "$file" ]]; then
         read_project_config "$file"
 
+        [[ "$CONFIG_LANE" == "$lane" ]] ||
+            die "Lane config identity mismatch in $file"
+
         if [[ "$CONFIG_PATH" == "$root" ]]; then
             if { ! $profile_explicit || [[ "$CONFIG_PROFILE" == "$profile" ]]; } &&
                { ! $clojure_mcp_explicit || [[ "$CONFIG_CLOJURE_MCP" == "$clojure_mcp" ]]; }; then
-                echo "Project '$name' is already initialized:"
+                echo "Project '$name' lane '$lane' is already initialized:"
                 echo "  path:    $root"
                 echo "  profile: $CONFIG_PROFILE"
                 echo "  Clojure MCP: $CONFIG_CLOJURE_MCP"
@@ -1028,44 +1858,59 @@ init_project() {
             echo "  Clojure MCP: $CONFIG_CLOJURE_MCP" >&2
             if $profile_explicit && [[ "$CONFIG_PROFILE" != "$profile" ]]; then
                 echo "Change its profile with:" >&2
-                echo "  run-codex '$name' --set profile '$profile'" >&2
+                echo "  run-codex '$name' --lane '$lane' --set profile '$profile'" >&2
             fi
             if $clojure_mcp_explicit && [[ "$CONFIG_CLOJURE_MCP" != "$clojure_mcp" ]]; then
                 echo "Change its Clojure MCP setting with:" >&2
-                echo "  run-codex '$name' --set clojure-mcp '$clojure_mcp'" >&2
+                echo "  run-codex '$name' --lane '$lane' --set clojure-mcp '$clojure_mcp'" >&2
             fi
             exit 1
         fi
 
-        echo "Project '$name' is already registered as:" >&2
+        echo "Project '$name' lane '$lane' is already registered as:" >&2
         echo "  $CONFIG_PATH" >&2
         echo >&2
         echo "To intentionally change its local checkout path:" >&2
-        echo "  run-codex --rebind '$name' '$root'" >&2
+        echo "  run-codex --rebind '$name' '$root' --lane '$lane'" >&2
         exit 1
     fi
 
-    local other
-    other="$(find_name_for_path "$root")"
-    [[ -z "$other" ]] || die "$root is already registered as project '$other'"
+    find_binding_for_path "$root"
+    [[ -z "$FOUND_PROJECT" ]] ||
+        die "$root is already registered as project '$FOUND_PROJECT' lane '$FOUND_LANE'"
 
-    write_project_config "$name" "$root" "$profile" "$clojure_mcp"
+    if [[ -n "$bootstrap_codex_home" ]]; then
+        bootstrap_lane_codex_home "$name" "$lane" "$bootstrap_codex_home"
+    fi
+    write_project_config "$name" "$lane" "$root" "$profile" "$clojure_mcp" isolated "$agent"
 
-    echo "Initialized project '$name':"
+    echo "Initialized project '$name' lane '$lane':"
     echo "  path:        $root"
     echo "  profile:     $profile"
     echo "  Clojure MCP: $clojure_mcp"
+    echo "  agent:       $agent"
+    echo "  state:       isolated"
+    echo "  Git layout:  $GIT_LAYOUT"
     echo "  image:       $(profile_image "$profile")"
-    echo "  container:   $WORKSPACE_ROOT/$name"
+    if [[ "$lane" == default ]]; then
+        echo "  container:   $WORKSPACE_ROOT/$name"
+    else
+        echo "  container:   $WORKSPACE_ROOT/$name--$lane"
+    fi
 }
 
 rebind_project() {
     local name="$1"
     local requested_path="${2:-$PWD}"
-    local file="$PROJECTS_DIR/$name"
-    local path root other profile clojure_mcp
+    local lane="${3:-default}"
+    local file
+    local path root profile clojure_mcp model reasoning state_mode agent
+    local candidate_git_layout candidate_git_common_dir default_file default_root
+    local lane_file lane_root restore_nullglob=false
 
     validate_project_name "$name"
+    validate_lane_name "$lane"
+    file="$(registry_file_for "$name" "$lane")"
     [[ -f "$file" ]] || die "Project '$name' is not registered. Use --init instead."
 
     need git
@@ -1074,6 +1919,10 @@ rebind_project() {
     read_project_config "$file"
     profile="$CONFIG_PROFILE"
     clojure_mcp="$CONFIG_CLOJURE_MCP"
+    model="$CONFIG_MODEL"
+    reasoning="$CONFIG_REASONING"
+    state_mode="$CONFIG_STATE_MODE"
+    agent="$CONFIG_AGENT"
 
     path="$(canonical_dir "$requested_path")" ||
         die "Directory does not exist: $requested_path"
@@ -1081,16 +1930,53 @@ rebind_project() {
     root="$(git_root_for "$path")" ||
         die "$path is not inside a Git repository"
 
-    check_supported_repo "$root"
+    inspect_git_layout "$root"
+    candidate_git_layout="$GIT_LAYOUT"
+    candidate_git_common_dir="$GIT_COMMON_DIR"
 
-    other="$(find_name_for_path "$root")"
-    if [[ -n "$other" && "$other" != "$name" ]]; then
-        die "$root is already registered as project '$other'"
+    if [[ "$lane" != default ]]; then
+        default_file="$(registry_file_for "$name" default)"
+        [[ -f "$default_file" ]] ||
+            die "Project '$name' default lane is not registered"
+        read_project_config "$default_file"
+        default_root="$(git_root_for "$CONFIG_PATH")" ||
+            die "Default lane for project '$name' is no longer a Git repository: $CONFIG_PATH"
+        inspect_git_layout "$default_root"
+        [[ "$GIT_COMMON_DIR" == "$candidate_git_common_dir" ]] ||
+            die "Lane '$lane' must be a linked worktree of project '$name' in this initial implementation"
+        GIT_LAYOUT="$candidate_git_layout"
+        GIT_COMMON_DIR="$candidate_git_common_dir"
+    else
+        if ! shopt -q nullglob; then
+            shopt -s nullglob
+            restore_nullglob=true
+        fi
+        for lane_file in "$LANES_DIR/$name"/*; do
+            [[ -f "$lane_file" ]] || continue
+            read_project_config "$lane_file"
+            lane_root="$(git_root_for "$CONFIG_PATH")" ||
+                die "Registered lane '${CONFIG_LANE}' for project '$name' is no longer a Git repository: $CONFIG_PATH"
+            inspect_git_layout "$lane_root"
+            [[ "$GIT_COMMON_DIR" == "$candidate_git_common_dir" ]] ||
+                die "Cannot rebind the default lane away from registered lane '${CONFIG_LANE}'; re-create the project lane set together"
+        done
+        if $restore_nullglob; then
+            shopt -u nullglob
+        fi
+        GIT_LAYOUT="$candidate_git_layout"
+        GIT_COMMON_DIR="$candidate_git_common_dir"
     fi
 
-    write_project_config "$name" "$root" "$profile" "$clojure_mcp"
+    find_binding_for_path "$root"
+    if [[ -n "$FOUND_PROJECT" ]] &&
+       { [[ "$FOUND_PROJECT" != "$name" ]] || [[ "$FOUND_LANE" != "$lane" ]]; }; then
+        die "$root is already registered as project '$FOUND_PROJECT' lane '$FOUND_LANE'"
+    fi
 
-    echo "Rebound project '$name':"
+    write_project_config "$name" "$lane" "$root" "$profile" "$clojure_mcp" \
+        "$state_mode" "$agent" "$model" "$reasoning"
+
+    echo "Rebound project '$name' lane '$lane':"
     echo "  path:        $root"
     echo "  profile:     $profile"
     echo "  Clojure MCP: $clojure_mcp"
@@ -1098,59 +1984,112 @@ rebind_project() {
 
 set_profile() {
     local name="$1"
-    local profile="$2"
-    local file="$PROJECTS_DIR/$name"
+    local lane="$2"
+    local profile="$3"
+    local file
 
     validate_project_name "$name"
+    validate_lane_name "$lane"
     validate_profile "$profile"
+    file="$(registry_file_for "$name" "$lane")"
     [[ -f "$file" ]] || die "Project '$name' is not registered"
 
     read_project_config "$file"
-    write_project_config "$name" "$CONFIG_PATH" "$profile" "$CONFIG_CLOJURE_MCP"
+    write_project_config "$name" "$lane" "$CONFIG_PATH" "$profile" \
+        "$CONFIG_CLOJURE_MCP" "$CONFIG_STATE_MODE" "$CONFIG_AGENT" \
+        "$CONFIG_MODEL" "$CONFIG_REASONING"
 
-    echo "Project '$name' now uses profile '$profile':"
+    echo "Project '$name' lane '$lane' now uses profile '$profile':"
     echo "  $(profile_image "$profile")"
 }
 
 set_clojure_mcp() {
     local name="$1"
-    local clojure_mcp="$2"
-    local file="$PROJECTS_DIR/$name"
+    local lane="$2"
+    local clojure_mcp="$3"
+    local file
 
     validate_project_name "$name"
+    validate_lane_name "$lane"
     validate_clojure_mcp_setting "$clojure_mcp"
+    file="$(registry_file_for "$name" "$lane")"
     [[ -f "$file" ]] || die "Project '$name' is not registered"
 
     read_project_config "$file"
-    write_project_config "$name" "$CONFIG_PATH" "$CONFIG_PROFILE" "$clojure_mcp"
+    write_project_config "$name" "$lane" "$CONFIG_PATH" "$CONFIG_PROFILE" \
+        "$clojure_mcp" "$CONFIG_STATE_MODE" "$CONFIG_AGENT" \
+        "$CONFIG_MODEL" "$CONFIG_REASONING"
 
-    echo "Project '$name' now uses Clojure MCP setting '$clojure_mcp'."
+    echo "Project '$name' lane '$lane' now uses Clojure MCP setting '$clojure_mcp'."
+}
+
+set_model() {
+    local name="$1"
+    local lane="$2"
+    local model="$3"
+    local file
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    validate_codex_model "$model"
+    file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$file" ]] || die "Project '$name' is not registered"
+
+    read_project_config "$file"
+    write_project_config "$name" "$lane" "$CONFIG_PATH" "$CONFIG_PROFILE" \
+        "$CONFIG_CLOJURE_MCP" "$CONFIG_STATE_MODE" "$CONFIG_AGENT" \
+        "$model" "$CONFIG_REASONING"
+
+    echo "Project '$name' lane '$lane' now uses Codex model '$model'."
+}
+
+set_reasoning() {
+    local name="$1"
+    local lane="$2"
+    local reasoning="$3"
+    local file
+
+    validate_project_name "$name"
+    validate_lane_name "$lane"
+    validate_codex_reasoning "$reasoning"
+    file="$(registry_file_for "$name" "$lane")"
+    [[ -f "$file" ]] || die "Project '$name' is not registered"
+
+    read_project_config "$file"
+    write_project_config "$name" "$lane" "$CONFIG_PATH" "$CONFIG_PROFILE" \
+        "$CONFIG_CLOJURE_MCP" "$CONFIG_STATE_MODE" "$CONFIG_AGENT" \
+        "$CONFIG_MODEL" "$reasoning"
+
+    echo "Project '$name' lane '$lane' now uses Codex reasoning effort '$reasoning'."
 }
 
 set_project_value() {
     local name="$1"
-    local key="$2"
-    local value="$3"
+    local lane="$2"
+    local key="$3"
+    local value="$4"
 
     case "$key" in
-        profile) set_profile "$name" "$value" ;;
-        clojure-mcp) set_clojure_mcp "$name" "$value" ;;
-        *) die "Unknown project setting '$key'. Supported settings: profile, clojure-mcp" ;;
+        profile) set_profile "$name" "$lane" "$value" ;;
+        clojure-mcp) set_clojure_mcp "$name" "$lane" "$value" ;;
+        model) set_model "$name" "$lane" "$value" ;;
+        reasoning) set_reasoning "$name" "$lane" "$value" ;;
+        *) die "Unknown project setting '$key'. Supported settings: profile, clojure-mcp, model, reasoning" ;;
     esac
 }
 
 list_projects() {
     mkdir -p "$PROJECTS_DIR"
 
-    printf '%-20s %-10s %-12s %-10s %s\n' \
-        "PROJECT" "PROFILE" "CLOJURE-MCP" "STATUS" "PATH"
+    printf '%-20s %-16s %-10s %-12s %-24s %-10s %-10s %s\n' \
+        "PROJECT" "LANE" "PROFILE" "CLOJURE-MCP" "MODEL" "REASONING" "STATUS" "PATH"
 
     local restore_nullglob=false
     if ! shopt -q nullglob; then
         shopt -s nullglob
         restore_nullglob=true
     fi
-    local files=("$PROJECTS_DIR"/*)
+    local files=("$PROJECTS_DIR"/* "$LANES_DIR"/*/*)
     if $restore_nullglob; then
         shopt -u nullglob
     fi
@@ -1160,15 +2099,25 @@ list_projects() {
         return 0
     fi
 
-    local file name path profile clojure_mcp status actual_root
+    local file name lane path profile clojure_mcp model reasoning status actual_root
 
     for file in "${files[@]}"; do
         [[ -f "$file" ]] || continue
-        name="$(basename "$file")"
+        if [[ "$file" == "$PROJECTS_DIR/"* ]]; then
+            name="$(basename -- "$file")"
+            lane="default"
+        else
+            name="$(basename -- "$(dirname -- "$file")")"
+            lane="$(basename -- "$file")"
+        fi
         read_project_config "$file"
+        [[ "$CONFIG_LANE" == "$lane" ]] ||
+            die "Lane config identity mismatch in $file"
         path="$CONFIG_PATH"
         profile="$CONFIG_PROFILE"
         clojure_mcp="$CONFIG_CLOJURE_MCP"
+        model="${CONFIG_MODEL:--}"
+        reasoning="${CONFIG_REASONING:--}"
 
         if [[ ! -d "$path" ]]; then
             status="MISSING"
@@ -1178,8 +2127,9 @@ list_projects() {
             status="NOT-GIT"
         fi
 
-        printf '%-20s %-10s %-12s %-10s %s\n' \
-            "$name" "$profile" "$clojure_mcp" "$status" "$path"
+        printf '%-20s %-16s %-10s %-12s %-24s %-10s %-10s %s\n' \
+            "$name" "$lane" "$profile" "$clojure_mcp" "$model" \
+            "$reasoning" "$status" "$path"
     done
 }
 
@@ -1214,17 +2164,31 @@ RESOLVED_NAME=""
 RESOLVED_PATH=""
 RESOLVED_PROFILE=""
 RESOLVED_CLOJURE_MCP=""
+RESOLVED_MODEL=""
+RESOLVED_REASONING=""
+RESOLVED_LANE="default"
+RESOLVED_STATE_MODE="legacy-global"
+RESOLVED_AGENT="codex"
+RESOLVED_GIT_LAYOUT="ordinary"
+RESOLVED_GIT_COMMON_DIR=""
 
 resolve_project() {
     local requested_name="${1:-}"
-    local file root current_root name
+    local requested_lane="${2:-default}"
+    local file root current_root name lane
+    local lane_profile lane_clojure_mcp lane_model lane_reasoning
+    local lane_state_mode lane_agent
+    local candidate_git_layout candidate_git_common_dir default_file default_root
 
     if [[ -n "$requested_name" ]]; then
         validate_project_name "$requested_name"
-        file="$PROJECTS_DIR/$requested_name"
+        validate_lane_name "$requested_lane"
+        file="$(registry_file_for "$requested_name" "$requested_lane")"
         [[ -f "$file" ]] || print_missing_project_help "$requested_name"
 
         read_project_config "$file"
+        [[ "$CONFIG_LANE" == "$requested_lane" ]] ||
+            die "Lane config identity mismatch in $file"
 
         if [[ ! -d "$CONFIG_PATH" ]]; then
             echo "ERROR: Project '$requested_name' path does not exist:" >&2
@@ -1241,12 +2205,39 @@ resolve_project() {
         [[ "$root" == "$CONFIG_PATH" ]] ||
             die "Registered path for '$requested_name' is not its Git repository root: $CONFIG_PATH"
 
-        check_supported_repo "$root"
+        inspect_git_layout "$root"
+
+        lane_profile="$CONFIG_PROFILE"
+        lane_clojure_mcp="$CONFIG_CLOJURE_MCP"
+        lane_model="$CONFIG_MODEL"
+        lane_reasoning="$CONFIG_REASONING"
+        lane_state_mode="$CONFIG_STATE_MODE"
+        lane_agent="$CONFIG_AGENT"
+        candidate_git_layout="$GIT_LAYOUT"
+        candidate_git_common_dir="$GIT_COMMON_DIR"
+        if [[ "$requested_lane" != default ]]; then
+            default_file="$(registry_file_for "$requested_name" default)"
+            [[ -f "$default_file" ]] ||
+                die "Project '$requested_name' default lane is not registered"
+            read_project_config "$default_file"
+            default_root="$(git_root_for "$CONFIG_PATH")" ||
+                die "Default lane for project '$requested_name' is no longer a Git repository: $CONFIG_PATH"
+            inspect_git_layout "$default_root"
+            [[ "$GIT_COMMON_DIR" == "$candidate_git_common_dir" ]] ||
+                die "Lane '$requested_lane' no longer belongs to project '$requested_name'"
+        fi
 
         RESOLVED_NAME="$requested_name"
         RESOLVED_PATH="$root"
-        RESOLVED_PROFILE="$CONFIG_PROFILE"
-        RESOLVED_CLOJURE_MCP="$CONFIG_CLOJURE_MCP"
+        RESOLVED_PROFILE="$lane_profile"
+        RESOLVED_CLOJURE_MCP="$lane_clojure_mcp"
+        RESOLVED_MODEL="$lane_model"
+        RESOLVED_REASONING="$lane_reasoning"
+        RESOLVED_LANE="$requested_lane"
+        RESOLVED_STATE_MODE="$lane_state_mode"
+        RESOLVED_AGENT="$lane_agent"
+        RESOLVED_GIT_LAYOUT="$candidate_git_layout"
+        RESOLVED_GIT_COMMON_DIR="$candidate_git_common_dir"
         return 0
     fi
 
@@ -1261,8 +2252,10 @@ resolve_project() {
         exit 1
     }
 
-    check_supported_repo "$current_root"
-    name="$(find_name_for_path "$current_root")"
+    inspect_git_layout "$current_root"
+    find_binding_for_path "$current_root"
+    name="$FOUND_PROJECT"
+    lane="$FOUND_LANE"
 
     if [[ -z "$name" ]]; then
         local suggested_name
@@ -1280,12 +2273,486 @@ resolve_project() {
         exit 1
     fi
 
-    read_project_config "$PROJECTS_DIR/$name"
+    read_project_config "$(registry_file_for "$name" "$lane")"
+
+    lane_profile="$CONFIG_PROFILE"
+    lane_clojure_mcp="$CONFIG_CLOJURE_MCP"
+    lane_model="$CONFIG_MODEL"
+    lane_reasoning="$CONFIG_REASONING"
+    lane_state_mode="$CONFIG_STATE_MODE"
+    lane_agent="$CONFIG_AGENT"
+    candidate_git_layout="$GIT_LAYOUT"
+    candidate_git_common_dir="$GIT_COMMON_DIR"
+    if [[ "$lane" != default ]]; then
+        default_file="$(registry_file_for "$name" default)"
+        [[ -f "$default_file" ]] ||
+            die "Project '$name' default lane is not registered"
+        read_project_config "$default_file"
+        default_root="$(git_root_for "$CONFIG_PATH")" ||
+            die "Default lane for project '$name' is no longer a Git repository: $CONFIG_PATH"
+        inspect_git_layout "$default_root"
+        [[ "$GIT_COMMON_DIR" == "$candidate_git_common_dir" ]] ||
+            die "Lane '$lane' no longer belongs to project '$name'"
+    fi
 
     RESOLVED_NAME="$name"
     RESOLVED_PATH="$current_root"
-    RESOLVED_PROFILE="$CONFIG_PROFILE"
-    RESOLVED_CLOJURE_MCP="$CONFIG_CLOJURE_MCP"
+    RESOLVED_PROFILE="$lane_profile"
+    RESOLVED_CLOJURE_MCP="$lane_clojure_mcp"
+    RESOLVED_MODEL="$lane_model"
+    RESOLVED_REASONING="$lane_reasoning"
+    RESOLVED_LANE="$lane"
+    RESOLVED_STATE_MODE="$lane_state_mode"
+    RESOLVED_AGENT="$lane_agent"
+    RESOLVED_GIT_LAYOUT="$candidate_git_layout"
+    RESOLVED_GIT_COMMON_DIR="$candidate_git_common_dir"
+}
+
+CODEX_HOST_HOME=""
+CODEX_HOST_M2=""
+
+resolve_lane_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local state_mode="$3"
+    local state_root resolved
+
+    case "$state_mode" in
+        legacy-global)
+            [[ "$lane" == default ]] ||
+                die "Only a default lane may use legacy global Codex state"
+            mkdir -p -- "$HOME/.codex"
+            CODEX_HOST_HOME="$(realpath -e -- "$HOME/.codex")" ||
+                die "Cannot resolve legacy Codex state directory"
+            mkdir -p -- "$HOME/.m2"
+            CODEX_HOST_M2="$(realpath -e -- "$HOME/.m2")" ||
+                die "Cannot resolve legacy Maven cache directory"
+            ;;
+        isolated)
+            mkdir -p -- "$LANE_STATE_ROOT"
+            state_root="$(realpath -e -- "$LANE_STATE_ROOT")" ||
+                die "Cannot resolve lane state root: $LANE_STATE_ROOT"
+            mkdir -p -- "$LANE_STATE_ROOT/$project/$lane/codex-home"
+            resolved="$(realpath -e -- "$LANE_STATE_ROOT/$project/$lane/codex-home")" ||
+                die "Cannot resolve Codex state for project '$project' lane '$lane'"
+            [[ "$resolved" == "$state_root/"* ]] ||
+                die "Lane Codex state escapes its managed root: $resolved"
+            CODEX_HOST_HOME="$resolved"
+            mkdir -p -- "$LANE_STATE_ROOT/$project/$lane/m2"
+            resolved="$(realpath -e -- "$LANE_STATE_ROOT/$project/$lane/m2")" ||
+                die "Cannot resolve Maven cache for project '$project' lane '$lane'"
+            [[ "$resolved" == "$state_root/"* ]] ||
+                die "Lane Maven cache escapes its managed root: $resolved"
+            CODEX_HOST_M2="$resolved"
+            ;;
+    esac
+}
+
+copy_codex_bootstrap_files() {
+    local requested_source="$1"
+    local destination_root="$2"
+    local require_empty="$3"
+    local source file destination
+    local restore_nullglob=false
+    local inputs=()
+
+    need find
+    need install
+
+    source="$(canonical_dir "$requested_source")" ||
+        die "Codex bootstrap directory does not exist: $requested_source"
+    [[ "$source" != "$destination_root" ]] ||
+        die "Codex bootstrap source and destination must differ"
+    if $require_empty; then
+        [[ -z "$(find "$destination_root" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+            die "Refusing to bootstrap a non-empty lane Codex home: $destination_root"
+    fi
+
+    if ! shopt -q nullglob; then
+        shopt -s nullglob
+        restore_nullglob=true
+    fi
+    inputs=(
+        "$source/auth.json" \
+        "$source/config.toml" \
+        "$source/requirements.toml" \
+        "$source"/*.config.toml
+    )
+    for file in "${inputs[@]}"; do
+        [[ -e "$file" || -L "$file" ]] || continue
+        [[ -f "$file" && ! -L "$file" ]] ||
+            die "Codex bootstrap input must be a regular file, not a symlink: $file"
+    done
+    for file in "${inputs[@]}"; do
+        [[ -f "$file" ]] || continue
+        destination="$destination_root/$(basename -- "$file")"
+        if [[ -e "$destination" || -L "$destination" ]]; then
+            [[ -f "$destination" && ! -L "$destination" ]] ||
+                die "Codex bootstrap destination must be a regular file, not a symlink: $destination"
+            $require_empty || continue
+        fi
+        install -m 0600 -- "$file" "$destination"
+    done
+    if $restore_nullglob; then
+        shopt -u nullglob
+    fi
+}
+
+bootstrap_lane_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local requested_source="$3"
+
+    resolve_lane_codex_home "$project" "$lane" isolated
+    copy_codex_bootstrap_files "$requested_source" "$CODEX_HOST_HOME" true
+}
+
+stage_managed_lane_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local default_state_mode="$3"
+    local stage_root="$4"
+    local default_codex_home
+
+    validate_project_name "$project"
+    validate_lane_name "$lane"
+    [[ -d "$stage_root" && ! -L "$stage_root" ]] ||
+        die "Managed lane bootstrap staging path is unsafe: $stage_root"
+    resolve_lane_codex_home "$project" default "$default_state_mode"
+    default_codex_home="$CODEX_HOST_HOME"
+    mkdir -p -- "$stage_root/codex-home" "$stage_root/m2"
+    copy_codex_bootstrap_files "$default_codex_home" \
+        "$stage_root/codex-home" false
+}
+
+seed_managed_lane_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local default_file lane_file default_state_mode
+    local managed_parent managed_path
+
+    default_file="$(registry_file_for "$project" default)"
+    lane_file="$(registry_file_for "$project" "$lane")"
+    [[ -f "$default_file" && -f "$lane_file" ]] || return 0
+
+    read_project_config "$default_file"
+    default_state_mode="$CONFIG_STATE_MODE"
+    read_project_config "$lane_file"
+    managed_parent="$(realpath -m -- "$CONFIG_ROOT/worktrees/$project")" ||
+        die "Cannot resolve managed review worktree directory"
+    managed_path="$managed_parent/$lane"
+    [[ "$CONFIG_PATH" == "$managed_path" ]] || return 0
+
+    seed_new_managed_lane_codex_home "$project" "$lane" "$default_state_mode"
+}
+
+seed_new_managed_lane_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local default_state_mode="${3:-}"
+    local default_file default_codex_home
+
+    default_file="$(registry_file_for "$project" default)"
+    [[ -f "$default_file" ]] || return 0
+    if [[ -z "$default_state_mode" ]]; then
+        read_project_config "$default_file"
+        default_state_mode="$CONFIG_STATE_MODE"
+    fi
+    resolve_lane_codex_home "$project" default "$default_state_mode"
+    default_codex_home="$CODEX_HOST_HOME"
+    resolve_lane_codex_home "$project" "$lane" isolated
+    copy_codex_bootstrap_files "$default_codex_home" "$CODEX_HOST_HOME" false
+}
+
+run_lane_state_sync() {
+    local mode="$1"
+    local launcher_source launcher_dir command
+    local lane_sync_dir lane_state_dir
+    local handoff_commit="" onboarding_hash=""
+    local runtime_version="" runtime_revision=""
+    local args=()
+
+    launcher_source="$(realpath -e -- "${BASH_SOURCE[0]}")" ||
+        die "Cannot resolve run-codex installation path"
+    launcher_dir="$(dirname -- "$launcher_source")"
+    lane_sync_dir="$SYNC_ROOT/projects/$PROJECT/lanes/$LANE"
+    lane_state_dir="$LOCAL_SYNC_STATE_ROOT/projects/$PROJECT/lanes/$LANE"
+
+    case "$mode" in
+        push-state)
+            command="$launcher_dir/codex-push"
+            ;;
+        pull-state)
+            command="$launcher_dir/codex-pull"
+            ;;
+        list-state)
+            command="$launcher_dir/codex-pull"
+            args=(--list)
+            ;;
+        force-state)
+            command="$launcher_dir/codex-pull"
+            args=(--force "$STATE_SYNC_GENERATION")
+            ;;
+        *) die "Unknown lane state synchronization action: $mode" ;;
+    esac
+    [[ -x "$command" ]] ||
+        die "Missing synchronization companion command: $command"
+
+    if [[ "$mode" != list-state ]]; then
+        [[ -z "$(git -C "$PROJECT_PATH" status --porcelain=v1 --untracked-files=all)" ]] ||
+            die "Preserve or remove checkout changes before handing off lane '$LANE'"
+        handoff_commit="$(git -C "$PROJECT_PATH" rev-parse --verify HEAD^{commit})" ||
+            die "Cannot resolve the lane's required Git commit"
+
+        need jq
+        need sha256sum
+        load_onboarding_manifests "$PROJECT" "$LANE"
+        if ! check_onboarding true; then
+            check_onboarding false || true
+            die "Complete destination-ready onboarding before handing off lane '$LANE'"
+        fi
+        onboarding_hash="$(onboarding_contract_hash)" ||
+            die "Cannot calculate the onboarding handoff contract"
+
+        need docker
+        docker info >/dev/null 2>&1 || die "Docker daemon is not available"
+        runtime_version="$(
+            docker image inspect --format \
+                '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+                "$IMAGE" 2>/dev/null
+        )" || die "Required handoff image is not available locally: $IMAGE"
+        runtime_revision="$(
+            docker image inspect --format \
+                '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+                "$IMAGE" 2>/dev/null
+        )" || die "Cannot inspect handoff image revision: $IMAGE"
+    fi
+
+    CODEX_DIR="$CODEX_HOST_HOME" \
+    CODEX_SYNC_DIR="$lane_sync_dir" \
+    CODEX_LOCK_FILE="$LOCK_FILE" \
+    CODEX_CONTAINER_PROJECT="$PROJECT" \
+    CODEX_CONTAINER_LANE="$LANE" \
+    CODEX_HANDOFF_PROJECT="$PROJECT" \
+    CODEX_HANDOFF_LANE="$LANE" \
+    CODEX_HANDOFF_COMMIT="$handoff_commit" \
+    CODEX_HANDOFF_RUNTIME_PROFILE="$PROFILE" \
+    CODEX_HANDOFF_RUNTIME_VERSION="$runtime_version" \
+    CODEX_HANDOFF_RUNTIME_REVISION="$runtime_revision" \
+    CODEX_HANDOFF_ONBOARDING_SHA256="$onboarding_hash" \
+    CODEX_HANDOFF_READY="$([[ "$mode" == list-state ]] || printf 1)" \
+    XDG_STATE_HOME="$lane_state_dir" \
+        exec "$command" "${args[@]}"
+}
+
+ONBOARDING_MANIFESTS=()
+ONBOARDING_ISSUES=0
+
+validate_onboarding_relative_path() {
+    local path="$1"
+
+    [[ -n "$path" && "$path" != /* && "$path" != */ &&
+       "$path" != *$'\n'* && "$path" != *$'\r'* && "$path" != *$'\t'* &&
+       "$path" != *//* ]] || return 1
+    case "/$path/" in
+        */./*|*/../*) return 1 ;;
+    esac
+    case "$path" in
+        .git|.git/*|.codex|.codex/*|.codex-universal|.codex-universal/*)
+            return 1
+            ;;
+    esac
+}
+
+load_onboarding_manifests() {
+    local project="$1"
+    local lane="$2"
+    local candidate
+
+    ONBOARDING_MANIFESTS=()
+    for candidate in \
+        "$PROJECT_PATH/.codex-universal/onboarding.json" \
+        "$ONBOARDING_DIR/$project.json" \
+        "$ONBOARDING_DIR/$project/$lane.json"; do
+        [[ -e "$candidate" || -L "$candidate" ]] || continue
+        [[ -f "$candidate" && ! -L "$candidate" && -r "$candidate" ]] ||
+            die "Onboarding manifest must be a readable regular file, not a symlink: $candidate"
+        jq -e '
+            type == "object" and
+            .version == 1 and
+            (.files | type == "array") and
+            all(.files[];
+                type == "object" and
+                (.path | type == "string") and
+                ((.template == null) or (.template | type == "string")) and
+                ((.secret == null) or (.secret | type == "boolean")) and
+                ((.mode == null) or (.mode == "0600") or
+                 (.mode == "0644") or (.mode == "0700") or
+                 (.mode == "0755")) and
+                ((.placeholders == null) or
+                 ((.placeholders | type == "array") and
+                  all(.placeholders[]; type == "string" and length > 0))) and
+                ((keys - ["mode", "path", "placeholders", "secret", "template"]) | length == 0)
+            ) and
+            ((keys - ["files", "version"]) | length == 0)
+        ' "$candidate" >/dev/null ||
+            die "Invalid onboarding manifest schema: $candidate"
+        ONBOARDING_MANIFESTS+=("$candidate")
+    done
+    if ((${#ONBOARDING_MANIFESTS[@]} > 0)); then
+        need grep
+        need stat
+        need install
+    fi
+}
+
+onboarding_contract_hash() {
+    if ((${#ONBOARDING_MANIFESTS[@]} == 0)); then
+        printf '' | sha256sum | awk '{print $1}'
+        return
+    fi
+
+    for manifest in "${ONBOARDING_MANIFESTS[@]}"; do
+        jq -cS . "$manifest"
+    done | LC_ALL=C sort | sha256sum | awk '{print $1}'
+}
+
+safe_onboarding_file() {
+    local root="$1"
+    local relative="$2"
+    local candidate resolved
+
+    validate_onboarding_relative_path "$relative" || return 1
+    candidate="$root/$relative"
+    [[ -f "$candidate" && ! -L "$candidate" ]] || return 1
+    [[ "$(stat -c '%h' -- "$candidate")" == 1 ]] || return 1
+    resolved="$(realpath -e -- "$candidate")" || return 1
+    [[ "$resolved" == "$root/"* ]] || return 1
+    printf '%s\n' "$resolved"
+}
+
+prepare_onboarding_parent() {
+    local root="$1"
+    local relative="$2"
+    local parent component current
+
+    validate_onboarding_relative_path "$relative" ||
+        die "Unsafe onboarding destination path: $relative"
+    parent="${relative%/*}"
+    [[ "$parent" != "$relative" ]] || return 0
+    current="$root"
+    IFS='/' read -r -a parent_parts <<<"$parent"
+    for component in "${parent_parts[@]}"; do
+        current="$current/$component"
+        if [[ -e "$current" || -L "$current" ]]; then
+            [[ -d "$current" && ! -L "$current" ]] ||
+                die "Unsafe onboarding destination parent: $current"
+        else
+            mkdir -m 0700 -- "$current"
+        fi
+    done
+}
+
+apply_onboarding() {
+    local source_root=""
+    local manifest entry path template secret mode source_file destination
+
+    if [[ -n "$ONBOARD_SOURCE" ]]; then
+        source_root="$(canonical_dir "$ONBOARD_SOURCE")" ||
+            die "Onboarding source checkout does not exist: $ONBOARD_SOURCE"
+        [[ "$source_root" != "$PROJECT_PATH" ]] ||
+            die "Onboarding source and destination checkouts must differ"
+    fi
+
+    for manifest in "${ONBOARDING_MANIFESTS[@]}"; do
+        while IFS= read -r entry; do
+            path="$(jq -r '.path' <<<"$entry")"
+            template="$(jq -r '.template // empty' <<<"$entry")"
+            secret="$(jq -r '.secret // false' <<<"$entry")"
+            mode="$(jq -r '.mode // empty' <<<"$entry")"
+            validate_onboarding_relative_path "$path" ||
+                die "Unsafe onboarding path '$path' in $manifest"
+            [[ -z "$template" ]] || validate_onboarding_relative_path "$template" ||
+                die "Unsafe onboarding template '$template' in $manifest"
+            destination="$PROJECT_PATH/$path"
+
+            if [[ -e "$destination" || -L "$destination" ]]; then
+                [[ -f "$destination" && ! -L "$destination" ]] ||
+                    die "Onboarding destination exists but is not a regular file: $path"
+                continue
+            fi
+
+            source_file=""
+            if [[ -n "$source_root" ]]; then
+                source_file="$(safe_onboarding_file "$source_root" "$path" || true)"
+            fi
+            if [[ -z "$source_file" && -n "$template" ]]; then
+                source_file="$(safe_onboarding_file "$PROJECT_PATH" "$template" || true)"
+            fi
+            [[ -n "$source_file" ]] || continue
+
+            if [[ -z "$mode" ]]; then
+                if [[ "$secret" == true ]]; then
+                    mode=0600
+                else
+                    mode=0644
+                fi
+            fi
+            prepare_onboarding_parent "$PROJECT_PATH" "$path"
+            install -m "$mode" -- "$source_file" "$destination"
+            printf 'Provisioned %s from %s\n' "$path" \
+                "$([[ -n "$source_root" && "$source_file" == "$source_root/"* ]] && printf source-checkout || printf template)"
+        done < <(jq -c '.files[]' "$manifest")
+    done
+}
+
+check_onboarding() {
+    local quiet="${1:-false}"
+    local manifest entry path secret destination placeholder permissions
+
+    ONBOARDING_ISSUES=0
+    for manifest in "${ONBOARDING_MANIFESTS[@]}"; do
+        while IFS= read -r entry; do
+            path="$(jq -r '.path' <<<"$entry")"
+            secret="$(jq -r '.secret // false' <<<"$entry")"
+            validate_onboarding_relative_path "$path" ||
+                die "Unsafe onboarding path '$path' in $manifest"
+            destination="$PROJECT_PATH/$path"
+            if [[ ! -e "$destination" && ! -L "$destination" ]]; then
+                ((ONBOARDING_ISSUES += 1))
+                $quiet || printf 'MISSING     %s\n' "$path"
+                continue
+            fi
+            if ! safe_onboarding_file "$PROJECT_PATH" "$path" >/dev/null; then
+                ((ONBOARDING_ISSUES += 1))
+                $quiet || printf 'UNSAFE      %s (must be a regular file inside the checkout)\n' "$path"
+                continue
+            fi
+            while IFS= read -r placeholder; do
+                if grep -Fq -- "$placeholder" "$destination"; then
+                    ((ONBOARDING_ISSUES += 1))
+                    $quiet || printf 'NEEDS-INPUT %s (contains an unresolved placeholder)\n' "$path"
+                    break
+                fi
+            done < <(jq -r '.placeholders[]?' <<<"$entry")
+            if [[ "$secret" == true ]]; then
+                permissions="$(stat -c '%a' -- "$destination")" ||
+                    die "Cannot inspect onboarding file permissions: $path"
+                if (( (8#$permissions & 077) != 0 )); then
+                    ((ONBOARDING_ISSUES += 1))
+                    $quiet || printf 'PERMISSIONS %s (secret file must not grant group/other access)\n' "$path"
+                fi
+            fi
+        done < <(jq -c '.files[]' "$manifest")
+    done
+
+    if ((ONBOARDING_ISSUES == 0)); then
+        $quiet || printf "READY       project '%s' lane '%s'\n" "$PROJECT" "$LANE"
+        return 0
+    fi
+    $quiet || printf "NEEDS-SETUP project '%s' lane '%s': %d issue(s)\n" \
+        "$PROJECT" "$LANE" "$ONBOARDING_ISSUES"
+    return 2
 }
 
 run_sandbox_probe() {
@@ -1371,8 +2838,32 @@ case "${1:-}" in
         ;;
     --rebind)
         shift
-        (($# >= 1 && $# <= 2)) || die "Usage: run-codex --rebind PROJECT [PATH]"
-        rebind_project "$1" "${2:-$PWD}"
+        rebind_args=()
+        rebind_lane="default"
+        while (($#)); do
+            case "$1" in
+                --lane)
+                    (($# >= 2)) || die "--lane requires a lane name"
+                    rebind_lane="$2"
+                    shift 2
+                    ;;
+                --lane=*)
+                    rebind_lane="${1#--lane=}"
+                    shift
+                    ;;
+                --)
+                    shift
+                    rebind_args+=("$@")
+                    break
+                    ;;
+                -*) die "Unknown --rebind option: $1" ;;
+                *) rebind_args+=("$1"); shift ;;
+            esac
+        done
+        ((${#rebind_args[@]} >= 1 && ${#rebind_args[@]} <= 2)) ||
+            die "Usage: run-codex --rebind PROJECT [PATH] [--lane LANE]"
+        validate_lane_name "$rebind_lane"
+        rebind_project "${rebind_args[0]}" "${rebind_args[1]:-$PWD}" "$rebind_lane"
         exit 0
         ;;
     --doctor)
@@ -1402,22 +2893,82 @@ case "${1:-}" in
     *)
         if (($# >= 2)) && [[ "$2" == --set ]]; then
             (($# == 4)) ||
-                die "Usage: run-codex PROJECT --set profile|clojure-mcp VALUE"
-            set_project_value "$1" "$3" "$4"
+                die "Usage: run-codex PROJECT --set profile|clojure-mcp|model|reasoning VALUE"
+            set_project_value "$1" default "$3" "$4"
+            exit 0
+        fi
+        if (($# >= 4)) && [[ "$2" == --lane && "$4" == --set ]]; then
+            (($# == 6)) ||
+                die "Usage: run-codex PROJECT --lane LANE --set profile|clojure-mcp|model|reasoning VALUE"
+            set_project_value "$1" "$3" "$5" "$6"
             exit 0
         fi
         parse_launch_args "$@"
         ;;
 esac
 
+if [[ -n "$LANE_MANAGEMENT_MODE" ]]; then
+    [[ -n "$PROJECT" && "$LANE_SET" == true ]] ||
+        die "Lane management requires PROJECT and an explicit --lane LANE"
+    [[ -z "$ONBOARD_SOURCE" ]] || die "--from is valid only with --onboard"
+    if $NEW_SESSION || $SESSION_LIST_MODE || $RESUME_QUERY_SET ||
+       $REVIEW_REVISION_SET || $ONBOARD_CHECK_MODE || $ONBOARD_APPLY_MODE ||
+       $SETUP_SESSION || [[ -n "$STATE_SYNC_MODE" ]] || $CODEX_PROMPT_SET ||
+       ((${#CODEX_FORWARD_ARGS[@]} > 0)) ||
+       ((${#CODEX_IMAGE_REQUESTS[@]} > 0)) || $IMAGE_TAG_OPTION_SET; then
+        die "Lane management actions cannot be combined with launch, onboarding, or state options"
+    fi
+    need git
+    need realpath
+    need flock
+    case "$LANE_MANAGEMENT_MODE" in
+        create)
+            create_managed_lane "$PROJECT" "$LANE" "$LANE_MANAGEMENT_REVISION"
+            ;;
+        import)
+            import_lane_result "$PROJECT" "$LANE" "$LANE_MANAGEMENT_REVISION"
+            ;;
+        remove)
+            remove_managed_lane "$PROJECT" "$LANE"
+            ;;
+        *) die "Unknown lane management action: $LANE_MANAGEMENT_MODE" ;;
+    esac
+    exit 0
+fi
+
 $NEW_SESSION && $RESUME_QUERY_SET &&
     die "--new and --resume are mutually exclusive"
+$REVIEW_REVISION_SET && $RESUME_QUERY_SET &&
+    die "--review and --resume are mutually exclusive"
+$REVIEW_REVISION_SET && $SESSION_LIST_MODE &&
+    die "--review and --sessions are mutually exclusive"
+$REVIEW_REVISION_SET && $SETUP_SESSION &&
+    die "--review and --setup are mutually exclusive"
+$ONBOARD_CHECK_MODE && $ONBOARD_APPLY_MODE &&
+    die "--check and --onboard are mutually exclusive"
+if { $ONBOARD_CHECK_MODE || $ONBOARD_APPLY_MODE; } &&
+   { $NEW_SESSION || $SESSION_LIST_MODE || $RESUME_QUERY_SET ||
+     $REVIEW_REVISION_SET || $CODEX_PROMPT_SET ||
+     ((${#CODEX_FORWARD_ARGS[@]} > 0)) ||
+     ((${#CODEX_IMAGE_REQUESTS[@]} > 0)) || $IMAGE_TAG_OPTION_SET; }; then
+    die "--check and --onboard cannot be combined with launch options"
+fi
+[[ -z "$ONBOARD_SOURCE" || "$ONBOARD_APPLY_MODE" == true ]] ||
+    die "--from is valid only with --onboard"
+if [[ -n "$STATE_SYNC_MODE" ]] &&
+   { $NEW_SESSION || $SESSION_LIST_MODE || $RESUME_QUERY_SET ||
+     $REVIEW_REVISION_SET || $ONBOARD_CHECK_MODE || $ONBOARD_APPLY_MODE ||
+     $SETUP_SESSION || $CODEX_PROMPT_SET ||
+     ((${#CODEX_FORWARD_ARGS[@]} > 0)) ||
+     ((${#CODEX_IMAGE_REQUESTS[@]} > 0)) || $IMAGE_TAG_OPTION_SET; }; then
+    die "State synchronization actions cannot be combined with launch or onboarding options"
+fi
 $SESSION_LIST_MODE && $RESUME_QUERY_SET &&
     die "--sessions and --resume are mutually exclusive"
 if $SESSION_LIST_MODE &&
    { $NEW_SESSION || ((${#CODEX_FORWARD_ARGS[@]} > 0)) ||
      ((${#CODEX_IMAGE_REQUESTS[@]} > 0)) || $CODEX_PROMPT_SET ||
-     $IMAGE_TAG_OPTION_SET; }; then
+     $IMAGE_TAG_OPTION_SET || $REVIEW_REVISION_SET; }; then
     die "--sessions cannot be combined with launch options"
 fi
 
@@ -1448,14 +2999,73 @@ fi
 # on a new machine whose Docker setup is not complete yet.
 need git
 need realpath
-resolve_project "$PROJECT"
+if $REVIEW_REVISION_SET && $LANE_SET && [[ "$LANE" != default ]] &&
+   [[ -n "$PROJECT" ]]; then
+    need flock
+    provision_missing_review_lane "$PROJECT" "$LANE" "$REVIEW_REVISION"
+    seed_managed_lane_codex_home "$PROJECT" "$LANE"
+fi
+resolve_project "$PROJECT" "$LANE"
 
 PROJECT="$RESOLVED_NAME"
 PROJECT_PATH="$RESOLVED_PATH"
+LANE="$RESOLVED_LANE"
 PROFILE="$RESOLVED_PROFILE"
 IMAGE="$(profile_image "$PROFILE")"
+if [[ -z "${CODEX_LOCK_FILE:-}" && "$RESOLVED_STATE_MODE" == isolated ]]; then
+    LOCK_FILE="$CONFIG_ROOT/locks/$PROJECT/$LANE.handoff.lock"
+fi
+if [[ -n "$STATE_SYNC_MODE" ]]; then
+    [[ "$RESOLVED_STATE_MODE" == isolated ]] ||
+        die "Lane-aware state synchronization requires isolated state; use standalone codex-push/codex-pull for this legacy global registration"
+    resolve_lane_codex_home "$PROJECT" "$LANE" "$RESOLVED_STATE_MODE"
+    run_lane_state_sync "$STATE_SYNC_MODE"
+fi
+need jq
+load_onboarding_manifests "$PROJECT" "$LANE"
+if $ONBOARD_APPLY_MODE; then
+    apply_onboarding
+    check_onboarding false
+    exit $?
+fi
+if $ONBOARD_CHECK_MODE; then
+    check_onboarding false
+    exit $?
+fi
+if ! $SETUP_SESSION && ! check_onboarding true; then
+    check_onboarding false || true
+    echo "Run 'run-codex $PROJECT --lane $LANE --onboard [--from CHECKOUT]' to provision declared files," >&2
+    echo "or use --setup for an isolated setup session." >&2
+    exit 2
+fi
+resolve_lane_codex_home "$PROJECT" "$LANE" "$RESOLVED_STATE_MODE"
 resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
-resolve_codex_image_options "$WORKSPACE_ROOT/$PROJECT"
+if [[ "$RESOLVED_GIT_LAYOUT" == linked-worktree ]]; then
+    CONTAINER_PROJECT_DEFAULT="$PROJECT_PATH"
+elif [[ "$LANE" == default ]]; then
+    CONTAINER_PROJECT_DEFAULT="$WORKSPACE_ROOT/$PROJECT"
+else
+    CONTAINER_PROJECT_DEFAULT="$WORKSPACE_ROOT/$PROJECT--$LANE"
+fi
+resolve_codex_image_options "$CONTAINER_PROJECT_DEFAULT"
+
+if $REVIEW_REVISION_SET; then
+    [[ "$LANE" != default ]] ||
+        die "--review requires a non-default isolated lane selected with --lane"
+    [[ -n "$REVIEW_REVISION" && "$REVIEW_REVISION" != -* &&
+       "$REVIEW_REVISION" != *$'\n'* && "$REVIEW_REVISION" != *$'\r'* ]] ||
+        die "--review requires a valid Git revision"
+    REVIEW_COMMIT="$(
+        git -C "$PROJECT_PATH" rev-parse --verify "${REVIEW_REVISION}^{commit}" 2>/dev/null
+    )" || die "Review revision is not a commit in lane '$LANE': $REVIEW_REVISION"
+    [[ -z "$(git -C "$PROJECT_PATH" status --porcelain=v1 --untracked-files=no)" ]] ||
+        die "Reviewer lane '$LANE' has tracked changes; preserve or discard them before reviewing an immutable revision"
+    ! $CODEX_PROMPT_SET ||
+        die "--review cannot be combined with --codex-option prompt=TEXT"
+    CODEX_PROMPT_SET=true
+    NEW_SESSION=true
+    CODEX_INITIAL_PROMPT="Review immutable Git commit $REVIEW_COMMIT in this checkout. Inspect that commit and its parent diff, do not modify files or Git metadata, and report concrete findings ordered by severity with file and line references. If there are no findings, say so and state remaining test or coverage risks."
+fi
 
 # Shared lock: multiple Codex projects may run simultaneously, while
 # codex-push/codex-pull take this same lock exclusively. Acquire it before any
@@ -1469,7 +3079,7 @@ if ! flock -sn 9; then
 fi
 
 if $SESSION_LIST_MODE || $RESUME_QUERY_SET; then
-    load_project_sessions "$WORKSPACE_ROOT/$PROJECT"
+    load_project_sessions "$CONTAINER_PROJECT_DEFAULT" "$CODEX_HOST_HOME"
     if $SESSION_LIST_MODE; then
         echo "Active Codex sessions for '$PROJECT':"
         print_session_rows "$SESSION_ROWS"
@@ -1527,13 +3137,18 @@ if ! sandbox_probe_output="$(run_sandbox_probe "$IMAGE" 2>&1)"; then
     exit 1
 fi
 
-mkdir -p "$HOME/.codex" "$HOME/.m2" "$CONFIG_ROOT/runtime"
+mkdir -p "$CODEX_HOST_HOME" "$CODEX_HOST_M2" "$CONFIG_ROOT/runtime"
 
-CONTAINER_BASE_NAME="codex-$PROJECT"
+if [[ "$LANE" == default ]]; then
+    CONTAINER_IDENTITY="$PROJECT"
+else
+    CONTAINER_IDENTITY="$PROJECT--$LANE"
+fi
+CONTAINER_BASE_NAME="codex-$CONTAINER_IDENTITY"
 CONTAINER_NAME="$CONTAINER_BASE_NAME"
-CONTAINER_PROJECT="$WORKSPACE_ROOT/$PROJECT"
+CONTAINER_PROJECT="$CONTAINER_PROJECT_DEFAULT"
 
-if $IDEA_MODE; then
+if $IDEA_MODE || [[ "$RESOLVED_GIT_LAYOUT" == linked-worktree ]]; then
     # IDEA sends the host project path in ACP session requests. Mounting the
     # checkout at that same absolute path lets Codex and IDEA agree on file
     # references without granting access to the host path's parent directory.
@@ -1542,18 +3157,18 @@ if $IDEA_MODE; then
         /|/bin|/bin/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|\
         /opt|/opt/*|/proc|/proc/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|\
         /usr|/usr/*|/var|/var/*)
-            die "IDEA mode cannot mount a project over a container system path: $PROJECT_PATH"
+            die "Exact-path mode cannot mount a project over a container system path: $PROJECT_PATH"
             ;;
     esac
     if [[ "$CONTAINER_HOME" == "$PROJECT_PATH" ||
           "$CONTAINER_HOME" == "$PROJECT_PATH/"* ]]; then
-        die "IDEA mode cannot mount a project over the container home: $PROJECT_PATH"
+        die "Exact-path mode cannot mount a project over the container home: $PROJECT_PATH"
     fi
     for state_path in "$CONTAINER_HOME/.codex" "$CONTAINER_HOME/.m2"; do
         if [[ "$state_path" == "$PROJECT_PATH" ||
               "$state_path" == "$PROJECT_PATH/"* ||
               "$PROJECT_PATH" == "$state_path/"* ]]; then
-            die "IDEA mode project path overlaps container state '$state_path': $PROJECT_PATH"
+            die "Exact-path project overlaps container state '$state_path': $PROJECT_PATH"
         fi
     done
     CONTAINER_PROJECT="$PROJECT_PATH"
@@ -1562,6 +3177,7 @@ fi
 running_project_containers="$(
     docker ps \
         --filter "label=codex-universal.project=$PROJECT" \
+        --filter "label=codex-universal.lane=$LANE" \
         --format '{{.Names}}'
 )"
 
@@ -1569,11 +3185,12 @@ if $IDEA_MODE; then
     running_terminal="$(
         docker ps \
             --filter "label=codex-universal.project=$PROJECT" \
+            --filter "label=codex-universal.lane=$LANE" \
             --filter 'label=codex-universal.mode=terminal' \
             --format '{{.Names}}'
     )"
     [[ -z "$running_terminal" ]] ||
-        die "Terminal container '$running_terminal' is already using project '$PROJECT'"
+        die "Terminal container '$running_terminal' is already using project '$PROJECT' lane '$LANE'"
 
     # A container with the old deterministic name may be an IDEA session from
     # the immediately preceding launcher version. Allow it only when its label
@@ -1591,17 +3208,17 @@ if $IDEA_MODE; then
 else
     if [[ -n "$running_project_containers" ]] ||
        docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_BASE_NAME"; then
-        die "Project '$PROJECT' already has a running Codex container"
+        die "Project '$PROJECT' lane '$LANE' already has a running agent container"
     fi
 fi
 
 # Multiple IDEA chats for one project may run concurrently. A terminal session
 # remains mutually exclusive with all IDEA chats for that project.
-exec 8>"$CONFIG_ROOT/runtime/$PROJECT.lock"
+exec 8>"$CONFIG_ROOT/runtime/$CONTAINER_IDENTITY.lock"
 if $IDEA_MODE; then
-    flock -sn 8 || die "A terminal Codex session is already using project '$PROJECT'"
+    flock -sn 8 || die "A terminal agent session is already using project '$PROJECT' lane '$LANE'"
 else
-    flock -xn 8 || die "An IDEA Codex session is already using project '$PROJECT'"
+    flock -xn 8 || die "An IDEA agent session is already using project '$PROJECT' lane '$LANE'"
 fi
 
 docker_args=(
@@ -1718,6 +3335,8 @@ if $IDEA_MODE; then
         --cidfile "$IDEA_CID_FILE"
         --label codex-universal.mode=idea
         --label "codex-universal.project=$PROJECT"
+        --label "codex-universal.lane=$LANE"
+        --label "codex-universal.agent=$RESOLVED_AGENT"
     )
     if [[ "$IDEA_MCP" == 1 ]]; then
         docker_args+=(
@@ -1731,6 +3350,8 @@ else
         -it
         --label codex-universal.mode=terminal
         --label "codex-universal.project=$PROJECT"
+        --label "codex-universal.lane=$LANE"
+        --label "codex-universal.agent=$RESOLVED_AGENT"
     )
 fi
 
@@ -1741,6 +3362,7 @@ fi
 docker_args+=(
     --user "$HOST_UID:$HOST_GID"
     -e "HOME=$CONTAINER_HOME"
+    -e "CODEX_HOME=$CONTAINER_HOME/.codex"
     -e "CODEX_UNIVERSAL_WORKFLOW=$WORKFLOW_ENABLED"
 )
 
@@ -1832,9 +3454,40 @@ if [[ -n "$GIT_USER_NAME" && -n "$GIT_USER_EMAIL" ]]; then
     )
 fi
 
+if [[ "$RESOLVED_GIT_LAYOUT" == linked-worktree ]]; then
+    [[ "$RESOLVED_GIT_COMMON_DIR" == /* &&
+       "$RESOLVED_GIT_COMMON_DIR" != / &&
+       "$RESOLVED_GIT_COMMON_DIR" != *:* &&
+       "$RESOLVED_GIT_COMMON_DIR" != *$'\n'* ]] ||
+        die "Unsafe linked-worktree common Git path: $RESOLVED_GIT_COMMON_DIR"
+    [[ "$RESOLVED_GIT_COMMON_DIR" != "$PROJECT_PATH" &&
+       "$RESOLVED_GIT_COMMON_DIR" != "$PROJECT_PATH/"* &&
+       "$PROJECT_PATH" != "$RESOLVED_GIT_COMMON_DIR/"* ]] ||
+        die "Linked-worktree common Git metadata overlaps its checkout"
+    case "$RESOLVED_GIT_COMMON_DIR" in
+        /bin|/bin/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|\
+        /opt|/opt/*|/proc|/proc/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|\
+        /usr|/usr/*|/var|/var/*)
+            die "Linked-worktree Git metadata would mask a container system path: $RESOLVED_GIT_COMMON_DIR"
+            ;;
+    esac
+    if [[ "$RESOLVED_GIT_COMMON_DIR" == "$CONTAINER_HOME" ||
+          "$RESOLVED_GIT_COMMON_DIR" == "$CONTAINER_HOME/"* ||
+          "$CONTAINER_HOME" == "$RESOLVED_GIT_COMMON_DIR/"* ]]; then
+        die "Linked-worktree Git metadata overlaps the container home: $RESOLVED_GIT_COMMON_DIR"
+    fi
+    # Linked-worktree pointer files contain absolute host paths. The checkout
+    # therefore stays at its exact path and receives only its common Git
+    # metadata as one additional mount. Other worktree contents are not
+    # exposed. Git metadata writes remain behind the human approval boundary.
+    docker_args+=(
+        -v "$RESOLVED_GIT_COMMON_DIR:$RESOLVED_GIT_COMMON_DIR"
+    )
+fi
+
 docker_args+=(
-    -v "$HOME/.codex:$CONTAINER_HOME/.codex"
-    -v "$HOME/.m2:$CONTAINER_HOME/.m2"
+    -v "$CODEX_HOST_HOME:$CONTAINER_HOME/.codex"
+    -v "$CODEX_HOST_M2:$CONTAINER_HOME/.m2"
     -v "$PROJECT_PATH:$CONTAINER_PROJECT"
     -w "$CONTAINER_PROJECT"
     --name "$CONTAINER_NAME"
@@ -1871,17 +3524,20 @@ fi
 
 if $IDEA_MODE; then
     echo "Starting IntelliJ ACP agent for '$PROJECT'" >&2
+elif $REVIEW_REVISION_SET; then
+    echo "Starting $RESOLVED_AGENT reviewer for '$PROJECT' lane '$LANE' at '$REVIEW_COMMIT'"
 elif $NEW_SESSION; then
-    echo "Starting new Codex session for '$PROJECT'"
+    echo "Starting new $RESOLVED_AGENT session for '$PROJECT' lane '$LANE'"
 elif $RESUME_QUERY_SET; then
-    echo "Resuming Codex session '$RESOLVED_SESSION_NAME' for '$PROJECT'"
+    echo "Resuming $RESOLVED_AGENT session '$RESOLVED_SESSION_NAME' for '$PROJECT' lane '$LANE'"
 else
-    echo "Resuming last Codex session for '$PROJECT'"
+    echo "Resuming last $RESOLVED_AGENT session for '$PROJECT' lane '$LANE'"
 fi
 
 if $IDEA_MODE; then
     echo "  profile: $PROFILE" >&2
     echo "  image:   $IMAGE" >&2
+    echo "  lane:    $LANE ($RESOLVED_AGENT; $RESOLVED_STATE_MODE state)" >&2
     echo "  project: $PROJECT_PATH -> $CONTAINER_PROJECT" >&2
     if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
         echo "  Clojure MCP: enabled ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)" >&2
@@ -1892,6 +3548,7 @@ if $IDEA_MODE; then
 else
     echo "  profile: $PROFILE"
     echo "  image:   $IMAGE"
+    echo "  lane:    $LANE ($RESOLVED_AGENT; $RESOLVED_STATE_MODE state)"
     echo "  project: $PROJECT_PATH -> $CONTAINER_PROJECT"
     if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
         echo "  Clojure MCP: enabled ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
@@ -1907,11 +3564,24 @@ fi
 if $IDEA_MODE; then
     docker "${docker_args[@]}" /usr/local/bin/codex-acp-entrypoint
 else
-    session_args=(codex "${codex_args[@]}")
+    case "$RESOLVED_AGENT" in
+        codex)
+            session_args=(codex "${codex_args[@]}")
+            ;;
+        *)
+            die "No container adapter is installed for agent '$RESOLVED_AGENT'"
+            ;;
+    esac
     if $RESUME_QUERY_SET; then
         session_args+=(resume "$RESOLVED_SESSION_ID")
     elif ! $NEW_SESSION; then
         session_args+=(resume --last)
+    fi
+    if ! $CODEX_MODEL_SET && [[ -n "$RESOLVED_MODEL" ]]; then
+        session_args+=(--model "$RESOLVED_MODEL")
+    fi
+    if ! $CODEX_REASONING_SET && [[ -n "$RESOLVED_REASONING" ]]; then
+        session_args+=(-c "model_reasoning_effort=\"$RESOLVED_REASONING\"")
     fi
     session_args+=("${CODEX_FORWARD_ARGS[@]}")
     if $CODEX_PROMPT_SET; then

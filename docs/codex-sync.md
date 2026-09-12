@@ -2,6 +2,22 @@
 
 `codex-push` and `codex-pull` safely hand off Codex state between development machines through a file-synchronized directory. They are host commands: run them outside the Codex container.
 
+For new project/lane registrations, prefer the lane-aware launcher wrappers:
+
+```bash
+run-codex PROJECT --lane LANE --push-state
+run-codex PROJECT --lane LANE --pull-state
+```
+
+They select that lane's isolated Codex home, lock, local baseline, running
+container labels, and `CODEX_SYNC_ROOT/projects/PROJECT/lanes/LANE` snapshot
+namespace. They also bind each new snapshot to the lane's clean Git commit,
+runtime profile and immutable image labels, and onboarding declarations. A
+destination pull checks those requirements and local onboarding readiness
+before any live-state replacement. The standalone commands below retain their
+global-state defaults and legacy snapshots remain readable for backward
+compatibility.
+
 ## Why snapshots are necessary
 
 Do not synchronize the live `~/.codex` directory with Seafile, Dropbox, Syncthing, or similar software. Codex state can contain SQLite databases and WAL files. A synchronization client copying those files while Codex is running can produce an inconsistent state on another machine.
@@ -154,17 +170,27 @@ On machine A:
 
 ```bash
 # Exit all Codex sessions and containers first.
-codex-push
+run-codex PROJECT --lane LANE --push-state
 ```
 
 Wait for the synchronization service to finish. Then, on machine B:
 
 ```bash
-codex-pull
-run-codex PROJECT
+git -C /path/to/checkout switch --detach REQUIRED_COMMIT
+run-codex PROJECT --lane LANE --onboard [--from SOURCE_CHECKOUT]
+run-codex PROJECT --lane LANE --pull-state
+run-codex PROJECT --lane LANE
 ```
 
-Before switching back, exit Codex on machine B, push there, wait for synchronization, and pull on machine A.
+The checkout may have a different absolute path on machine B. Register or
+rebind that path first. The pull refuses until the project/lane names, required
+commit, runtime profile and immutable image version/revision, onboarding
+declarations, and destination readiness match the published handoff marker.
+The refusal happens before extraction or live-state replacement and can be
+retried after the missing code, image, or local inputs are supplied.
+
+Before switching back, exit Codex on machine B, push there, wait for
+synchronization, and pull on machine A.
 
 Repeated pushes and pulls are no-ops when nothing changed. Normal operation is forward-only. If the remote generation advanced while local state also changed, the scripts report divergence instead of choosing a side or overwriting data.
 
