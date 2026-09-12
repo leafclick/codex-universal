@@ -4,14 +4,39 @@ umask 077
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEST_ROOT="$(mktemp -d)"
+ACTIVE_TEST_CONTAINER=""
+ACTIVE_TEST_CONTAINER_TOKEN=""
+SUITE_STARTED_AT=$SECONDS
+ACTIVITY_STARTED_AT=$SECONDS
+
+printf '%s\n' '=== CODEX UNIVERSAL HOST SMOKE TESTS ==='
 
 cleanup() {
+    local active_token=""
+
+    if [[ -n "$ACTIVE_TEST_CONTAINER" ]] &&
+       command -v docker >/dev/null 2>&1; then
+        active_token="$(
+            docker inspect --format \
+                '{{ index .Config.Labels "codex-universal.smoke-token" }}' \
+                "$ACTIVE_TEST_CONTAINER" 2>/dev/null || true
+        )"
+        if [[ -n "$ACTIVE_TEST_CONTAINER_TOKEN" &&
+              "$active_token" == "$ACTIVE_TEST_CONTAINER_TOKEN" ]]; then
+            docker rm -f -- "$ACTIVE_TEST_CONTAINER" >/dev/null 2>&1 || true
+        fi
+    fi
     rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
 
 pass() {
-    printf 'ok - %s\n' "$1"
+    printf '  ok - %s (%ss)\n' "$1" "$((SECONDS - ACTIVITY_STARTED_AT))"
+}
+
+activity() {
+    ACTIVITY_STARTED_AT=$SECONDS
+    printf '\nSTART  %s\n' "$1"
 }
 
 fail() {
@@ -40,6 +65,7 @@ assert_not_contains() {
         fail "expected launcher output not to contain: $unexpected"
 }
 
+activity "host prerequisites and syntax checks"
 for command in bash git grep jq realpath setpriv flock; do
     need "$command"
 done
@@ -67,12 +93,30 @@ for script in \
     "$ROOT/container/install-system-runtimes" \
     "$ROOT/scripts/update-tool-versions" \
     "$ROOT/tests/host-smoke-sync.sh" \
+    "$ROOT/tests/fixtures/host-smoke-image.sh" \
+    "$ROOT/tests/fixtures/host-smoke-image-phase.sh" \
     "$ROOT/tests/fixtures/host-smoke-clojure-runtime.sh"; do
     bash -n "$script"
 done
 bash -n \
     "$ROOT/container/clojure-tool-versions.conf" \
     "$ROOT/container/system-tool-versions.conf"
+set +e
+image_diagnostic_output="$(
+    bash "$ROOT/tests/fixtures/host-smoke-image.sh" \
+        identity generic -1 -1 example/image:test 2>&1
+)"
+image_diagnostic_status=$?
+set -e
+(( image_diagnostic_status != 0 )) ||
+    fail "container image diagnostic fixture unexpectedly passed"
+[[ "$image_diagnostic_output" == \
+   'host-smoke: generic container image example/image:test failed during identity at line '* ]] ||
+    fail "container image diagnostic fixture omitted failure context"
+[[ "$image_diagnostic_output" != *$'\n'* ]] ||
+    fail "container image diagnostic fixture emitted multiline script text"
+pass "concise container image failure diagnostics"
+activity "workflow installer lifecycle and ownership"
 for script in "$ROOT/bin/run-codex" "$ROOT/bin/codex-push" "$ROOT/bin/codex-pull"; do
     nullglob_enable_count="$(grep -c 'shopt -s nullglob' "$script" || true)"
     nullglob_restore_count="$(grep -c 'shopt -u nullglob' "$script" || true)"
@@ -237,6 +281,7 @@ if grep -R -Fq '$CODEX_HOME/scripts/codex-worker-observe' \
     fail "workflow guidance requires CODEX_HOME to be set"
 fi
 pass "workflow installer lifecycle and update ownership"
+activity "worker command observability"
 
 observe_root="$TEST_ROOT/worker-observe"
 observe_helper="$ROOT/container/codex-workflow/scripts/codex-worker-observe"
@@ -295,6 +340,7 @@ set -e
 [[ "$observe_reuse_exit" == 2 ]] ||
     fail "worker observability helper replaced an immutable run ID"
 pass "worker command observability"
+activity "static security and runtime invariants"
 
 jq -e '
     .defaultAction == "SCMP_ACT_ERRNO" and
@@ -352,6 +398,8 @@ grep -Fq 'LD_LIBRARY_PATH "$jvm_library_path"' "$ROOT/container/codex-clojure-ls
     fail "Clojure LSP MCP bridge does not supply selected JDK libraries"
 grep -Fq -- '--check-java' "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge lacks its in-sandbox Java diagnostic"
+grep -Fq -- '--check-clojure-lsp' "$ROOT/container/codex-clojure-lsp-mcp" ||
+    fail "Clojure LSP MCP bridge lacks its in-sandbox server diagnostic"
 grep -Fq -- '\( -name .git -o -name .codex \) -prune -print0' \
     "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge does not protect nested Git/Codex metadata"
@@ -420,7 +468,7 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         grep -n '^RUN /usr/local/src/install-clojure-runtimes' "$dockerfile" |
             cut -d: -f1
     )"
-    native_tools_line="$(
+    clojure_tools_line="$(
         grep -n '^RUN /usr/local/src/install-clojure-tools' "$dockerfile" |
             cut -d: -f1
     )"
@@ -430,15 +478,15 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
             cut -d: -f1
     )"
     (( system_runtime_line < clojure_runtime_line &&
-       clojure_runtime_line < native_tools_line &&
-       native_tools_line < npm_install_line &&
+       clojure_runtime_line < clojure_tools_line &&
+       clojure_tools_line < npm_install_line &&
        npm_install_line < mcp_wrapper_line )) ||
         fail "$(basename "$dockerfile") does not preserve stable toolchain cache ordering"
     for package_arg in CODEX_VERSION CODEX_ACP_VERSION AGENT_LSP_VERSION; do
         package_arg_line="$(
             grep -n "^ARG ${package_arg}=" "$dockerfile" | cut -d: -f1
         )"
-        (( native_tools_line < package_arg_line &&
+        (( clojure_tools_line < package_arg_line &&
            package_arg_line < npm_install_line )) ||
             fail "$(basename "$dockerfile") declares $package_arg before the stable toolchain"
     done
@@ -488,9 +536,26 @@ for version_var in \
         "$ROOT/container/clojure-tool-versions.conf" ||
         fail "$version_var is not pinned"
 done
-[[ "$(grep -hEc '^[A-Z0-9_]+_SHA256=[0-9a-f]{64}$' \
-    "$ROOT/container/clojure-tool-versions.conf" | awk '{sum += $1} END {print sum}')" == 12 ]] ||
-    fail "Clojure installer checksum pins are incomplete"
+for checksum_var in \
+    CLOJURE_INSTALLER_SHA256 \
+    LEIN_LAUNCHER_SHA256 LEIN_JAR_SHA256 DEPS_CLJ_AMD64_SHA256 \
+    BABASHKA_AMD64_SHA256 BABASHKA_ARM64_SHA256 \
+    CLJFMT_AMD64_SHA256 CLJFMT_ARM64_SHA256 \
+    CLJ_KONDO_AMD64_SHA256 CLJ_KONDO_ARM64_SHA256 \
+    CLOJURE_LSP_JVM_SHA256; do
+    grep -qE "^${checksum_var}=[0-9a-f]{64}$" \
+        "$ROOT/container/clojure-tool-versions.conf" ||
+        fail "$checksum_var is not pinned to a SHA-256 digest"
+done
+grep -Fq '${CLOJURE_LSP_VERSION}/clojure-lsp"' \
+    "$ROOT/container/install-clojure-tools" ||
+    fail "Clojure LSP installer does not use the architecture-independent release"
+grep -Fq 'install -m 0755 "$install_root/clojure-lsp" /usr/local/bin/clojure-lsp' \
+    "$ROOT/container/install-clojure-tools" ||
+    fail "Clojure LSP installer does not install the verified JVM executable"
+if grep -Fq 'clojure-lsp-native-' "$ROOT/container/install-clojure-tools"; then
+    fail "Clojure LSP installer still selects a GraalVM native image"
+fi
 [[ "$(grep -Ec '^[A-Z0-9_]+_KEY_SHA256=[0-9a-f]{64}$' \
     "$ROOT/container/system-tool-versions.conf")" == 2 ]] ||
     fail "system-runtime repository key checksums are incomplete"
@@ -522,7 +587,7 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
     grep -q 'container/requirements.toml /etc/codex/requirements.toml' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install managed requirements"
     grep -q 'container/install-clojure-tools /usr/local/src/install-clojure-tools' "$dockerfile" ||
-        fail "$(basename "$dockerfile") does not install native Clojure tools"
+        fail "$(basename "$dockerfile") does not install standalone Clojure tools"
     grep -q 'container/install-clojure-runtimes /usr/local/src/install-clojure-runtimes' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install pinned Clojure runtimes"
     grep -q 'container/install-system-runtimes /usr/local/src/install-system-runtimes' "$dockerfile" ||
@@ -810,8 +875,18 @@ grep -Fq 'setpriv --pdeathsig TERM --' "$ROOT/bin/run-codex" ||
 grep -Fq '8>&- 9>&- &' "$ROOT/bin/run-codex" ||
     fail "IDEA relay inherits launcher lock descriptors"
 pass "shell syntax and static security invariants"
+activity "delayed IntelliJ relay failure handling"
 
-if command -v python3 >/dev/null 2>&1; then
+if command -v python3 >/dev/null 2>&1 &&
+    command -v timeout >/dev/null 2>&1 &&
+    command -v bwrap >/dev/null 2>&1 &&
+    timeout --kill-after=1s 3s bwrap \
+        --unshare-user \
+        --unshare-pid \
+        --die-with-parent \
+        --ro-bind / / \
+        --dev /dev \
+        -- /bin/true >/dev/null 2>&1; then
     relay_failure_fixture="$TEST_ROOT/acp-relay-delayed-failure"
     relay_failure_bin="$relay_failure_fixture/bin"
     relay_failure_socket="$relay_failure_fixture/idea.sock"
@@ -863,8 +938,10 @@ PY
         fail "ACP started after its IntelliJ relay failed"
     pass "delayed IntelliJ relay startup failure"
 else
-    printf 'skip - delayed IntelliJ relay startup failure (python3 or Bubblewrap unavailable on host)\n'
+    printf 'skip - delayed IntelliJ relay startup failure (python3, timeout, or usable Bubblewrap unavailable on host)\n'
 fi
+
+activity "launcher and shared-state locking"
 
 # The launcher smoke test uses echo as a Docker frontend. This verifies the
 # complete argument vector without requiring Docker or Codex on the host.
@@ -886,9 +963,20 @@ printf '%s\n' \
     '        exit 0' \
     '        ;;' \
     '    run|build)' \
-    '        printf "%s\\n" "$*"' \
+    '        if [[ "${CODEX_TEST_DOCKER_ACP:-0}" != 1 || "$*" != *codex-acp-entrypoint* ]]; then' \
+    '            printf "%s\\n" "$*"' \
+    '        fi' \
     '        if [[ -n "${CODEX_TEST_DOCKER_ARGV_LOG:-}" ]]; then' \
     '            printf "%q\\n" "$@" > "$CODEX_TEST_DOCKER_ARGV_LOG"' \
+    '        fi' \
+    '        if [[ "${CODEX_TEST_DOCKER_ACP:-0}" == 1 && "$*" == *codex-acp-entrypoint* ]]; then' \
+    '            IFS= read -r initialize_line' \
+    '            initialize_id="$(jq -c .id <<<"$initialize_line")"' \
+    '            jq -cn --argjson id "$initialize_id" '\''{jsonrpc:"2.0",id:$id,result:{protocolVersion:1}}'\''' \
+    '            : > "$CODEX_TEST_DOCKER_ACP_REQUEST_LOG"' \
+    '            while IFS= read -r agent_line; do' \
+    '                printf "%s\\n" "$agent_line" >> "$CODEX_TEST_DOCKER_ACP_REQUEST_LOG"' \
+    '            done' \
     '        fi' \
     '        ;;' \
     '    *) exit 0 ;;' \
@@ -1055,6 +1143,7 @@ exec 7>&-
 wait "$session_lock_pid" || fail "session listing failed after handoff lock release"
 assert_contains "$(<"$session_lock_stdout")" 'Created while handoff locked'
 pass "session reads wait for the shared state handoff lock"
+activity "launcher doctor installation"
 
 ambiguous_docker_log="$TEST_ROOT/ambiguous-sessions-docker-argv.log"
 if "${launcher_env[@]}" "CODEX_TEST_DOCKER_ARGV_LOG=$ambiguous_docker_log" \
@@ -1191,6 +1280,7 @@ if "${launcher_env[@]}" "$missing_module_dir/run-codex" \
 fi
 assert_contains "$(<"$missing_module_dir/output")" "Missing doctor module:"
 pass "launcher doctor companion installation"
+activity "AppArmor failure handling"
 
 for unsafe_apparmor_profile in unconfined docker-default arbitrary-profile; do
     set +e
@@ -1213,6 +1303,7 @@ for unsafe_apparmor_profile in unconfined docker-default arbitrary-profile; do
     assert_contains "$unsafe_launch_output" "Unsupported CODEX_APPARMOR_PROFILE"
 done
 pass "unsupported AppArmor profile rejection"
+activity "project registry and launcher policy"
 
 if "${launcher_env[@]}" CODEX_TEST_IMAGE_USER=0:0 \
     "$ROOT/bin/run-codex" --doctor smoke-project \
@@ -1373,7 +1464,9 @@ assert_contains "$idea_output" 'CODEX_IDEA_MCP_RELAY_SOCKET=/run/codex-idea-mcp/
 assert_contains "$idea_output" 'CODEX_IDEA_MCP_RELAY_PORT=64342'
 assert_contains "$idea_output" ':/run/codex-idea-mcp:ro'
 assert_not_contains "$idea_output" '--network host'
-assert_not_contains "$idea_output" 'mcp_servers":{"clojure_lsp'
+assert_contains "$idea_output" '"clojure_lsp":{"command":"/usr/local/bin/codex-clojure-lsp-mcp"'
+assert_contains "$idea_output" '"args":["clojure:clojure-lsp"]'
+assert_contains "$idea_output" '"enabled_tools":["start_lsp","restart_lsp_server"'
 assert_contains "$idea_output" "--name codex-smoke-project-idea-"
 assert_contains "$idea_output" "$TEST_ROOT/repo:$TEST_ROOT/repo"
 assert_contains "$idea_output" "--cidfile"
@@ -1382,6 +1475,13 @@ assert_contains "$idea_output" "--label codex-universal.project=smoke-project"
 if [[ "$idea_output" == *"-it"* ]]; then
     fail "IDEA launcher allocated a TTY and would corrupt ACP stdio"
 fi
+
+idea_lsp_disabled_output="$(
+    "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=0 \
+        "$ROOT/bin/run-codex" --idea smoke-project
+)"
+assert_contains "$idea_lsp_disabled_output" '"mcp_servers":{"idea"'
+assert_not_contains "$idea_lsp_disabled_output" '"clojure_lsp"'
 
 lsp_disabled_output="$(
     "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=0 \
@@ -1422,15 +1522,74 @@ grep -Fxq 'clojure_mcp=auto' \
     "$TEST_ROOT/launcher-config/run-codex/projects/plain-project" ||
     fail "project Clojure MCP setter did not update the project configuration"
 
+# The one global IDEA ACP entry must wait for session cwd before selecting a
+# registered project. Verify that the dispatcher reuses the normal launcher so
+# the selected project's profile, mount, labels, and policy remain authoritative.
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set profile cuda >/dev/null
+idea_dispatch_argv="$TEST_ROOT/idea-dispatch.argv"
+idea_dispatch_request="$TEST_ROOT/idea-dispatch-request.json"
+idea_initialize_request="$(
+    jq -cn '{jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:1,clientCapabilities:{},clientInfo:{name:"host-smoke",version:"1"}}}'
+)"
+idea_session_request="$(
+    jq -cn --arg cwd "$TEST_ROOT/non-clojure-repo" \
+        '{jsonrpc:"2.0",id:2,method:"session/new",params:{cwd:$cwd,mcpServers:[]}}'
+)"
+idea_prompt_request="$(
+    jq -cn '{jsonrpc:"2.0",id:3,method:"session/prompt",params:{sessionId:"host-smoke",prompt:[{type:"text",text:"verify relay"}]}}'
+)"
+idea_dispatch_output="$(
+    printf '%s\n' \
+        "$idea_initialize_request" "$idea_session_request" "$idea_prompt_request" |
+    "${launcher_env[@]}" \
+    "CODEX_TEST_DOCKER_ACP=1" \
+    "CODEX_TEST_DOCKER_ARGV_LOG=$idea_dispatch_argv" \
+    "CODEX_TEST_DOCKER_ACP_REQUEST_LOG=$idea_dispatch_request" \
+    "$ROOT/bin/run-codex" --idea
+)"
+jq -e '
+    .id == 1 and
+    .result.agentInfo.name == "codex-universal" and
+    .result.agentCapabilities.loadSession == true and
+    (.result.agentCapabilities.sessionCapabilities.list == {})
+' <<<"$idea_dispatch_output" >/dev/null ||
+    fail "IDEA dispatcher did not return its constrained initialization response"
+cmp -s -- "$idea_dispatch_request" \
+    <(printf '%s\n' "$idea_session_request" "$idea_prompt_request") ||
+    fail "IDEA dispatcher did not forward session creation and the following prompt"
+grep -Fxq -- 'example/codex-universal-cuda:test-version' "$idea_dispatch_argv" &&
+    grep -Fxq -- 'codex-universal.project=plain-project' "$idea_dispatch_argv" &&
+    grep -Fxq -- "$TEST_ROOT/non-clojure-repo:$TEST_ROOT/non-clojure-repo" \
+        "$idea_dispatch_argv" ||
+    fail "IDEA dispatcher did not launch the registered project profile and mount"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set profile generic >/dev/null
+
 for removed_setter in --set-profile --set-clojure-mcp; do
     if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
         "$removed_setter" plain-project value >"$TEST_ROOT/removed-setter.out" 2>&1; then
         fail "removed project setter '$removed_setter' was still accepted"
     fi
-    grep -Fq "Unknown launch option '$removed_setter'" \
-        "$TEST_ROOT/removed-setter.out" ||
-        fail "removed project setter '$removed_setter' did not fail clearly"
+    case "$removed_setter" in
+        --set-profile)
+            expected_setter_hint='Use: run-codex PROJECT --set profile generic|cuda'
+            ;;
+        --set-clojure-mcp)
+            expected_setter_hint='Use: run-codex PROJECT --set clojure-mcp auto|on|off'
+            ;;
+    esac
+    grep -Fq "$expected_setter_hint" "$TEST_ROOT/removed-setter.out" ||
+        fail "removed project setter '$removed_setter' did not show its replacement syntax"
 done
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" plain-project \
+    --codex-option clojure-mcp=auto >"$TEST_ROOT/setting-as-option.out" 2>&1; then
+    fail "launcher accepted the Clojure MCP project setting as a Codex option"
+fi
+grep -Fq 'Use: run-codex PROJECT --set clojure-mcp auto|on|off' \
+    "$TEST_ROOT/setting-as-option.out" ||
+    fail "Clojure MCP Codex-option error did not show the project setter syntax"
 
 set_error="$TEST_ROOT/project-setter-error.out"
 if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
@@ -1647,12 +1806,14 @@ fi
 grep -Fxq 'ERROR: Missing command: jq' "$TEST_ROOT/no-jq.err" ||
     fail "IDEA launcher did not report missing jq"
 pass "project registry and launcher policy"
+activity "JetBrains ACP configuration"
 
-# IDEA setup must merge its entry without replacing unrelated JetBrains
-# settings or agents. Override paths keep the test entirely temporary.
+# IDEA setup must merge one cwd-routing entry without replacing unrelated
+# JetBrains settings or agents. Override paths keep the test temporary.
 ACP_FILE="$TEST_ROOT/jetbrains/acp.json"
 mkdir -p "$(dirname "$ACP_FILE")"
-printf '%s\n' '{"theme":"dark","agent_servers":{"Existing":{"command":"existing-agent"}}}' \
+printf '%s\n' \
+    "{\"theme\":\"dark\",\"agent_servers\":{\"Existing\":{\"command\":\"existing-agent\"},\"Dockerized Codex (manual)\":{\"command\":\"other-agent\",\"args\":[\"--idea\",\"manual\"]},\"Dockerized Codex (smoke-project)\":{\"command\":\"$ROOT/bin/run-codex\",\"args\":[\"--idea\",\"smoke-project\"],\"use_idea_mcp\":false,\"use_custom_mcp\":false}}}" \
     > "$ACP_FILE"
 
 env \
@@ -1660,7 +1821,7 @@ env \
     "XDG_CONFIG_HOME=$TEST_ROOT/launcher-config" \
     "CODEX_IDEA_ACP_FILE=$ACP_FILE" \
     "CODEX_RUN_CODEX=$ROOT/bin/run-codex" \
-    "$ROOT/bin/setup-codex-idea" smoke-project >/dev/null
+    "$ROOT/bin/setup-codex-idea" >/dev/null
 
 jq -e '.theme == "dark"' "$ACP_FILE" >/dev/null ||
     fail "IDEA setup replaced unrelated top-level configuration"
@@ -1668,14 +1829,35 @@ jq -e '.agent_servers.Existing.command == "existing-agent"' "$ACP_FILE" >/dev/nu
     fail "IDEA setup replaced an existing agent"
 jq -e \
     --arg command "$(realpath -e "$ROOT/bin/run-codex")" \
-    '.agent_servers["Dockerized Codex (smoke-project)"] == {
+    '.agent_servers["Dockerized Codex (codex-universal)"] == {
         "command": $command,
-        "args": ["--idea", "smoke-project"],
+        "args": ["--idea"],
         "use_idea_mcp": false,
         "use_custom_mcp": false
-    }' "$ACP_FILE" >/dev/null ||
-    fail "IDEA setup did not create the expected Dockerized Codex agent"
+    } and
+    (.agent_servers["Dockerized Codex (smoke-project)"] == null)' \
+    "$ACP_FILE" >/dev/null ||
+    fail "IDEA setup did not replace legacy project entries with one dispatcher"
+
+# JetBrains's ACP configuration is global and offers no per-project visibility
+# predicate. Re-running setup updates one dispatcher while preserving unrelated
+# custom agents, including similarly named ones.
+env \
+    "HOME=$TEST_ROOT/launcher-home" \
+    "XDG_CONFIG_HOME=$TEST_ROOT/launcher-config" \
+    "CODEX_IDEA_ACP_FILE=$ACP_FILE" \
+    "CODEX_RUN_CODEX=$ROOT/bin/run-codex" \
+    "$ROOT/bin/setup-codex-idea" >/dev/null
+jq -e \
+    '.agent_servers.Existing.command == "existing-agent" and
+     .agent_servers["Dockerized Codex (manual)"].command == "other-agent" and
+     (.agent_servers["Dockerized Codex (codex-universal)"].args == ["--idea"]) and
+     ([.agent_servers | to_entries[] |
+        select(.value.command | strings | test("(^|/)run-codex$"))] | length) == 1' \
+    "$ACP_FILE" >/dev/null ||
+    fail "IDEA setup was not idempotent or replaced an unrelated custom agent"
 pass "JetBrains ACP configuration"
+activity "portable image build policy"
 
 # Verify that one build is portable instead of capturing the builder's UID/GID.
 # Use a clean fixture checkout so the explicit-version assertion is independent
@@ -1707,6 +1889,7 @@ assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:latest"
 pass "portable non-root image build policy"
+activity "Git-derived image metadata"
 
 # Explicit image names do not waive the repository's immutable Git-provenance
 # requirement. Keep the failure clear instead of implying that IMAGE_VERSION
@@ -1874,6 +2057,7 @@ assert_contains "$credential_source_output" \
     "--build-arg IMAGE_SOURCE=https://example.com/acme/codex-universal"
 pass "sanitized Git image source metadata"
 
+activity "snapshot synchronization state machine"
 "$ROOT/tests/host-smoke-sync.sh"
 
 # If built images and a Docker daemon are present, inspect the real containers.
@@ -1881,6 +2065,67 @@ pass "sanitized Git image source metadata"
 # CODEX_TEST_IMAGE remains a compatibility alias for the generic image.
 GENERIC_TEST_IMAGE="${CODEX_TEST_GENERIC_IMAGE:-${CODEX_TEST_IMAGE:-leafclick/codex-universal-generic:latest}}"
 CUDA_TEST_IMAGE="${CODEX_TEST_CUDA_IMAGE:-leafclick/codex-universal-cuda:latest}"
+image_smoke_script="$TEST_ROOT/host-smoke-image.sh"
+image_smoke_phase_wrapper="$TEST_ROOT/host-smoke-image-phase.sh"
+image_smoke_runner="$TEST_ROOT/host-smoke-image.clj"
+cp -- "$ROOT/tests/fixtures/host-smoke-image.sh" "$image_smoke_script"
+cp -- "$ROOT/tests/fixtures/host-smoke-image-phase.sh" "$image_smoke_phase_wrapper"
+cp -- "$ROOT/tests/fixtures/host-smoke-image.clj" "$image_smoke_runner"
+chmod 0555 -- \
+    "$image_smoke_script" \
+    "$image_smoke_phase_wrapper" \
+    "$image_smoke_runner"
+[[ "$(stat -c %a "$image_smoke_script")" == 555 &&
+   "$(stat -c %a "$image_smoke_phase_wrapper")" == 555 &&
+   "$(stat -c %a "$image_smoke_runner")" == 555 ]] ||
+    fail "temporary container image smoke files are not executable by the container user"
+
+image_timeout_seconds="${CODEX_TEST_IMAGE_TIMEOUT_SECONDS:-660}"
+image_heartbeat_seconds="${CODEX_TEST_IMAGE_HEARTBEAT_SECONDS:-10}"
+image_kill_after_seconds="${CODEX_TEST_IMAGE_KILL_AFTER_SECONDS:-5}"
+for image_timing_name in \
+    CODEX_TEST_IMAGE_TIMEOUT_SECONDS \
+    CODEX_TEST_IMAGE_HEARTBEAT_SECONDS \
+    CODEX_TEST_IMAGE_KILL_AFTER_SECONDS; do
+    case "$image_timing_name" in
+        CODEX_TEST_IMAGE_TIMEOUT_SECONDS) image_timing_value="$image_timeout_seconds" ;;
+        CODEX_TEST_IMAGE_HEARTBEAT_SECONDS) image_timing_value="$image_heartbeat_seconds" ;;
+        CODEX_TEST_IMAGE_KILL_AFTER_SECONDS) image_timing_value="$image_kill_after_seconds" ;;
+    esac
+    [[ "$image_timing_value" =~ ^[1-9][0-9]*$ ]] ||
+        fail "$image_timing_name must be a positive integer"
+done
+
+activity "local container image runtime checks"
+
+remove_active_test_container() {
+    local container_name="$1"
+    local expected_token="$2"
+    local actual_token
+
+    actual_token="$(
+        docker inspect --format \
+            '{{ index .Config.Labels "codex-universal.smoke-token" }}' \
+            "$container_name" 2>/dev/null || true
+    )"
+    if [[ -n "$expected_token" && "$actual_token" == "$expected_token" ]]; then
+        docker rm -f -- "$container_name" >/dev/null 2>&1 || true
+    fi
+    if [[ "$ACTIVE_TEST_CONTAINER" == "$container_name" &&
+          "$ACTIVE_TEST_CONTAINER_TOKEN" == "$expected_token" ]]; then
+        ACTIVE_TEST_CONTAINER=""
+        ACTIVE_TEST_CONTAINER_TOKEN=""
+    fi
+}
+
+show_image_failure_tail() {
+    local log_file="$1"
+
+    [[ ! -s "$log_file" ]] || {
+        printf '%s\n' '--- container output (last 40 lines) ---' >&2
+        tail -n 40 -- "$log_file" >&2
+    }
+}
 
 smoke_image() {
     local profile="$1"
@@ -1902,7 +2147,12 @@ smoke_image() {
         --security-opt "seccomp=$ROOT/security/seccomp/codex-bwrap.json"
         --user "$runtime_uid:$runtime_gid"
         --mount "type=bind,src=$ROOT,dst=/opt/codex-universal,readonly"
+        --mount "type=bind,src=$image_smoke_script,dst=/tmp/host-smoke-image.sh,readonly"
+        --mount "type=bind,src=$image_smoke_phase_wrapper,dst=/tmp/host-smoke-image-phase.sh,readonly"
+        --mount "type=bind,src=$image_smoke_runner,dst=/tmp/host-smoke-image.clj,readonly"
         -e HOME=/home/codex
+        -e "CODEX_TEST_IMAGE_HEARTBEAT_SECONDS=$image_heartbeat_seconds"
+        -e "CODEX_TEST_IMAGE_KILL_AFTER_SECONDS=$image_kill_after_seconds"
         -w /workspace
         --entrypoint /usr/local/bin/codex-entrypoint
     )
@@ -1911,228 +2161,60 @@ smoke_image() {
         docker_args+=(--gpus all)
     fi
 
-    docker_args+=("$image" /bin/bash)
+    local preflight_name="codex-universal-smoke-${profile}-bb-${BASHPID}-${RANDOM}"
+    local preflight_token="${BASHPID}-${RANDOM}-${RANDOM}"
+    local preflight_log="$TEST_ROOT/${profile}-bb-preflight.log"
+    local started_at=$SECONDS
+    printf 'START  %s image Babashka preflight (timeout 30s)\n' "$profile"
+    ACTIVE_TEST_CONTAINER="$preflight_name"
+    ACTIVE_TEST_CONTAINER_TOKEN="$preflight_token"
+    set +e
+    timeout --signal=TERM --kill-after="${image_kill_after_seconds}s" 30s \
+        docker "${docker_args[@]}" \
+            --label "codex-universal.smoke-token=$preflight_token" \
+            --name "$preflight_name" \
+            "$image" /usr/local/bin/bb --version \
+            >"$preflight_log" 2>&1
+    local preflight_status=$?
+    set -e
+    remove_active_test_container "$preflight_name" "$preflight_token"
+    if ((preflight_status != 0)); then
+        show_image_failure_tail "$preflight_log"
+        if ((preflight_status == 124)); then
+            fail "$profile image Babashka preflight timed out after 30s for $image"
+        fi
+        fail "$profile image does not provide a working pinned Babashka for $image (exit $preflight_status)"
+    fi
+    local bb_version
+    bb_version="$(grep -E 'babashka v[^[:space:]]+' "$preflight_log" | tail -n 1 || true)"
+    printf 'PASS   %s image Babashka preflight (%ss)%s\n' \
+        "$profile" "$((SECONDS - started_at))" \
+        "${bb_version:+ - $bb_version}"
 
-    docker "${docker_args[@]}" -c '
-        set -Eeuo pipefail
-        [[ "$(id -u)" == "$2" ]]
-        [[ "$(id -g)" == "$3" ]]
-        [[ "$(id -un)" == codex ]]
-        [[ "$(id -gn)" == codex ]]
-        [[ -z "${LD_PRELOAD:-}" ]]
-        [[ -z "${NSS_WRAPPER_PASSWD:-}" ]]
-        [[ -z "${NSS_WRAPPER_GROUP:-}" ]]
-        passwd_entry="$(getent passwd "$2")"
-        group_entry="$(getent group "$3")"
-        [[ "$passwd_entry" == "codex:x:$2:$3:"*":$HOME:/bin/bash" ]]
-        [[ "$group_entry" == "codex:x:$3:" ]]
-        [[ "$(getent passwd codex)" == "$passwd_entry" ]]
-        [[ "$(getent group codex)" == "$group_entry" ]]
-        grep -Eq "^passwd:[[:space:]]+codex([[:space:]]|$)" /etc/nsswitch.conf
-        grep -Eq "^group:[[:space:]]+codex([[:space:]]|$)" /etc/nsswitch.conf
-        touch "$HOME/runtime-home-is-writable"
-        touch /tmp/runtime-tmp-is-writable
-        touch /workspace/runtime-workspace-is-writable
-        printf "#!/bin/sh\nexit 0\n" > "$HOME/runtime-home-is-executable"
-        chmod 0700 "$HOME/runtime-home-is-executable"
-        "$HOME/runtime-home-is-executable"
-        printf "#!/bin/sh\nexit 0\n" > /tmp/runtime-tmp-is-executable
-        chmod 0700 /tmp/runtime-tmp-is-executable
-        /tmp/runtime-tmp-is-executable
-        if touch /usr/local/bin/image-root-is-read-only 2>/dev/null; then
-            exit 1
+    local suite_name="codex-universal-smoke-${profile}-suite-${BASHPID}-${RANDOM}"
+    local suite_token="${BASHPID}-${RANDOM}-${RANDOM}"
+    started_at=$SECONDS
+    printf 'START  %s container image suite (outer timeout %ss)\n' \
+        "$profile" "$image_timeout_seconds"
+    ACTIVE_TEST_CONTAINER="$suite_name"
+    ACTIVE_TEST_CONTAINER_TOKEN="$suite_token"
+    set +e
+    timeout --signal=TERM --kill-after="${image_kill_after_seconds}s" \
+        "${image_timeout_seconds}s" \
+        docker "${docker_args[@]}" \
+            --label "codex-universal.smoke-token=$suite_token" \
+            --name "$suite_name" \
+            "$image" /usr/local/bin/bb /tmp/host-smoke-image.clj \
+            "$profile" "$runtime_uid" "$runtime_gid" "$image"
+    local suite_status=$?
+    set -e
+    remove_active_test_container "$suite_name" "$suite_token"
+    if ((suite_status != 0)); then
+        if ((suite_status == 124)); then
+            fail "$profile container image suite timed out after ${image_timeout_seconds}s for $image"
         fi
-        root_mount_options=""
-        while read -r _ mountpoint _ options _; do
-            if [[ "$mountpoint" == / ]]; then
-                root_mount_options="$options"
-                break
-            fi
-        done < /proc/mounts
-        [[ ",$root_mount_options," == *,ro,* ]]
-        command -v bwrap >/dev/null
-        command -v python3 >/dev/null
-        command -v codex >/dev/null
-        command -v node >/dev/null
-        command -v java >/dev/null
-        command -v codex-acp >/dev/null
-        command -v codex-acp-entrypoint >/dev/null
-        command -v agent-lsp >/dev/null
-        command -v codex-clojure-lsp-mcp >/dev/null
-        command -v codex-lsp-message-proxy >/dev/null
-        command -v codex-no-nested-userns >/dev/null
-        command -v lsof >/dev/null
-        command -v setsid >/dev/null
-        command -v bb >/dev/null
-        command -v clj >/dev/null
-        command -v deps >/dev/null
-        command -v lein >/dev/null
-        command -v cljfmt >/dev/null
-        command -v clj-kondo >/dev/null
-        command -v clojure-lsp >/dev/null
-        command -v rlwrap >/dev/null
-        command -v socat >/dev/null
-        command -v zstd >/dev/null
-        /bin/bash /opt/codex-universal/tests/fixtures/host-smoke-clojure-runtime.sh \
-            /opt/codex-universal \
-            /usr/local/share/codex-universal/workflow/skills/clojure-development
-        [[ "$LEIN_JAR" == /opt/clojure/leiningen-standalone.jar ]]
-        [[ -r "$LEIN_JAR" ]]
-        [[ "$DEPS_CLJ_TOOLS_DIR" == /usr/local/lib/clojure ]]
-        clojure -Sdescribe
-        deps -Sdescribe
-        lein version
-        node --version
-        java --version
-        rlwrap --version
-        test -r /etc/codex/requirements.toml
-        [[ "$(stat -c %a /etc/codex)" == 755 ]]
-        [[ "$(stat -c %u /usr/local/bin/codex-entrypoint)" == 0 ]]
-        [[ "$(stat -c %u /usr/local/share/npm-global/bin/codex)" == 0 ]]
-        [[ "$(stat -c %u /etc/codex/requirements.toml)" == 0 ]]
-        [[ "$(awk '\''$1 == "CapEff:" {print $2}'\'' /proc/self/status)" == 0000000000000000 ]]
-        [[ "$(awk '\''$1 == "NoNewPrivs:" {print $2}'\'' /proc/self/status)" == 1 ]]
-        [[ "$(cat /proc/self/attr/current)" == "codex-universal (enforce)" ]]
-        test -x /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-development
-        test -x /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-process-supervisor
-        test -x /usr/local/share/codex-universal/workflow/scripts/codex-worker-observe
-        test -p "$CODEX_CLOJURE_STATE_DIR/service-control.fifo"
-        /usr/local/share/codex-universal/workflow/skills/clojure-development/scripts/clojure-process-supervisor \
-            control "$CODEX_CLOJURE_STATE_DIR/service-control.fifo" neutral status \
-            | grep -Fxq stopped
-        nss_module="$(find /usr/lib -name libnss_codex.so.2 -print -quit)"
-        [[ -n "$nss_module" && "$(stat -c %u:%g:%a "$nss_module")" == 0:0:644 ]]
-        bwrap \
-            --unshare-user \
-            --unshare-net \
-            --ro-bind / / \
-            --dev /dev \
-            --proc /proc \
-            --tmpfs /tmp \
-            -- \
-            /bin/bash -c '\''
-                set -Eeuo pipefail
-                [[ "$(id -un)" == codex && "$(id -gn)" == codex ]]
-                [[ -z "${LD_PRELOAD:-}" ]]
-                [[ -z "${NSS_WRAPPER_PASSWD:-}" ]]
-                [[ -z "${NSS_WRAPPER_GROUP:-}" ]]
-                printf "#!/bin/sh\nexit 0\n" > /tmp/sandbox-tmp-is-executable
-                chmod 0700 /tmp/sandbox-tmp-is-executable
-                /tmp/sandbox-tmp-is-executable
-            '\''
-        fixture_dir="$HOME/clojure-lsp-smoke"
-        mkdir -p "$fixture_dir/src/example" "$fixture_dir/test/example" "$fixture_dir/dev"
-        printf "%s\n" \
-            "{:paths [\"src\" \"test\" \"dev\"] :aliases {:dev {} :test {}}}" \
-            > "$fixture_dir/deps.edn"
-        printf "%s\n" \
-            "(ns example.core)" \
-            "(defn public-fn [] :ok)" \
-            > "$fixture_dir/src/example/core.clj"
-        printf "%s\n" \
-            "(ns example.core-test" \
-            "  (:require [clojure.test :refer [deftest is]]" \
-            "            [example.core :as sut]))" \
-            "(deftest public-fn-test" \
-            "  (is (= :ok (sut/public-fn))))" \
-            > "$fixture_dir/test/example/core_test.clj"
-        cd "$fixture_dir"
-        coproc MCP_BRIDGE {
-            exec codex-clojure-lsp-mcp clojure:clojure-lsp
-        }
-        mcp_pid="$MCP_BRIDGE_PID"
-        mcp_input_fd="${MCP_BRIDGE[1]}"
-        mcp_output_fd="${MCP_BRIDGE[0]}"
-        mcp_ready=0
-        printf '\''%s\n'\'' \
-            '\''{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"host-smoke","version":"1"}}}'\'' \
-            >&"$mcp_input_fd"
-        for _ in {1..10}; do
-            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
-               jq -e \
-                   '\''.id == 1 and .result.serverInfo.name == "agent-lsp"'\'' \
-                   <<<"$mcp_line" >/dev/null 2>&1; then
-                mcp_ready=1
-                break
-            fi
-        done
-        (( mcp_ready == 1 ))
-        lsp_ready=0
-        printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_lsp","arguments":{"root_dir":"%s","language_id":"clojure","ready_timeout_seconds":60}}}\n' \
-            "$fixture_dir" >&"$mcp_input_fd"
-        for _ in {1..75}; do
-            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
-               jq -e \
-                   '\''.id == 2 and .result.content[0].text == "LSP server started successfully"'\'' \
-                   <<<"$mcp_line" >/dev/null 2>&1; then
-                lsp_ready=1
-                break
-            fi
-        done
-        (( lsp_ready == 1 ))
-        references_ready=0
-        printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_references","arguments":{"file_path":"%s/src/example/core.clj","line":2,"column":7,"language_id":"clojure","include_declaration":true}}}\n' \
-            "$fixture_dir" >&"$mcp_input_fd"
-        for _ in {1..75}; do
-            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
-               jq -e --arg test_file "$fixture_dir/test/example/core_test.clj" \
-                   '\''.id == 3 and ([.result.content[]?.text] | join("\\n") | contains($test_file))'\'' \
-                   <<<"$mcp_line" >/dev/null 2>&1; then
-                references_ready=1
-                break
-            fi
-        done
-        kill "$mcp_pid" 2>/dev/null || true
-        wait "$mcp_pid" 2>/dev/null || true
-        (( references_ready == 1 ))
-        codex-clojure-lsp-mcp --check-java >/dev/null
-        codex --version
-        bb --version
-        cljfmt --version
-        clj-kondo --version
-        clojure-lsp --version
-        codex \
-            --sandbox workspace-write \
-            --ask-for-approval on-request \
-            -c '\''approvals_reviewer="user"'\'' \
-            --help >/dev/null
-        if [[ "$1" == cuda ]]; then
-            # The CUDA wrapper (installed as /usr/bin/bwrap) must re-expose the
-            # NVIDIA device nodes AFTER Codex'\''s own `--dev /dev`. bwrap applies
-            # options in order, so an earlier `--dev /dev` mounts a fresh devtmpfs
-            # that would discard binds emitted before it. nvidia-smi uses NVML and
-            # would pass even with the nodes missing, so assert the nodes directly.
-            if [[ -e /dev/nvidiactl ]]; then
-                bwrap \
-                    --unshare-user \
-                    --ro-bind / / \
-                    --dev /dev \
-                    --proc /proc \
-                    --tmpfs /tmp \
-                    -- \
-                    /bin/bash -c '\''
-                        set -Eeuo pipefail
-                        test -e /dev/nvidiactl
-                        test -e /dev/nvidia0 || ls /dev/nvidia[0-9]* >/dev/null
-                    '\''
-            fi
-            bwrap \
-                --unshare-user \
-                --ro-bind / / \
-                --dev /dev \
-                --proc /proc \
-                --tmpfs /tmp \
-                -- \
-                /bin/bash -c "nvidia-smi >/dev/null"
-            [[ "${CODEX_NVIDIA_ENTRYPOINT_RAN:-}" == 1 ]]
-            command -v nvcc >/dev/null
-            command -v nvidia-smi >/dev/null
-            test -f /usr/local/cuda/include/cuda.h
-            test -f /usr/local/cuda/include/cuda_runtime.h
-            nvcc --version
-            nvidia-smi >/dev/null
-        fi
-    ' host-smoke "$profile" "$runtime_uid" "$runtime_gid"
+        fail "$profile container image suite failed for $image (exit $suite_status)"
+    fi
     pass "$profile container image $image"
 }
 
@@ -2142,6 +2224,8 @@ elif ! command -v docker >/dev/null 2>&1 ||
      ! docker info >/dev/null 2>&1; then
     printf 'skip - container images (Docker daemon is not available)\n'
 else
+    command -v timeout >/dev/null 2>&1 ||
+        fail "local container image checks require host command 'timeout'"
     if docker image inspect "$GENERIC_TEST_IMAGE" >/dev/null 2>&1; then
         smoke_image generic "$GENERIC_TEST_IMAGE"
     else
@@ -2159,4 +2243,5 @@ else
     fi
 fi
 
+printf '\nTOTAL  host smoke suite (%ss)\n' "$((SECONDS - SUITE_STARTED_AT))"
 printf '\n=== ALL HOST SMOKE TESTS PASSED ===\n'

@@ -10,10 +10,10 @@ no full-access mode.
 
 Both the generic Ubuntu and NVIDIA CUDA images include Codex, Java, Node.js,
 Clojure CLI, Leiningen, Git, and common build tools. Clojure projects also get
-native `bb`, `cljfmt`, `clj-kondo`, and `clojure-lsp`, plus a persistent local
-LSP-to-MCP bridge in terminal mode. Optional IntelliJ IDEA integration runs the
-same containerized Codex in JetBrains AI Chat and exposes a read-only view of
-the IDE's semantic tools.
+native `bb`, `cljfmt`, and `clj-kondo`, a Java-backed `clojure-lsp`, and a
+persistent local LSP-to-MCP bridge in terminal mode. Optional IntelliJ IDEA
+integration runs the same containerized Codex in JetBrains AI Chat and exposes
+a read-only view of the IDE's semantic tools.
 
 See the concise [change log](CHANGELOG.md) for release history.
 
@@ -121,12 +121,13 @@ A successful run ends with `=== ALL HOST SMOKE TESTS PASSED ===`. See
 selection, CUDA-only checks, and troubleshooting.
 
 Next start a new Codex chat and paste the prompt for that client mode. Terminal
-and IDEA sessions use intentionally different MCP servers and paths:
+and IDEA sessions use intentionally different paths; IDEA can expose both
+semantic providers when Clojure MCP is enabled:
 
 | Client mode | MCP server | Expected project path |
 | --- | --- | --- |
 | `run-codex` | Container-local `clojure_lsp` | Container path, normally `/workspace/<project>` |
-| `run-codex --idea` | Host IDEA `idea` through a private relay | Exact absolute host checkout path |
+| `run-codex --idea` | Host IDEA `idea`, plus container-local `clojure_lsp` when enabled | Exact absolute host checkout path |
 
 Test the modes in separate chats. In either mode, `pwd` is authoritative; do
 not translate paths or move a conversation between the two path forms. The
@@ -353,7 +354,7 @@ repositories and some non-Clojure package channels are resolved at build time.
 Do not overwrite a published version tag, and use the registry digest when an
 exact image artifact must be selected.
 
-Stable system, Java, and core Clojure layers precede the native Clojure tools,
+Stable system, Java, and core Clojure layers precede the standalone Clojure tools,
 versioned Codex/ACP/LSP packages, and copied integration files. Updating an
 agent package version or an integration script therefore preserves the costly
 Java and core Clojure cache. Git-derived OCI labels are applied after every
@@ -406,7 +407,17 @@ Both image profiles install checksum-verified, pinned native releases of:
 - `bb` (Babashka)
 - `cljfmt`
 - `clj-kondo`
-- `clojure-lsp`
+
+They install the architecture-independent, Java-backed upstream `clojure-lsp`
+executable. Unlike its GraalVM native-image alternative, it starts inside the
+terminal bridge's deliberately empty `/proc` while retaining the same pinned
+server version and checksum validation. The image smoke fixture uses a
+config-free Clojure source tree so this startup check remains networkless and
+does not launch a native build tool inside that sandbox.
+
+See [GraalVM Native Image in procfs-hidden sandboxes](docs/graalvm-native-image-procfs.md)
+for the general compatibility finding and packaging recommendation behind this
+choice.
 
 They also install pinned Clojure CLI, Leiningen, native deps.clj, and `rlwrap`.
 The current versions and SHA-256 values are in
@@ -426,8 +437,8 @@ Each tool uses its upstream defaults and still discovers project-local
 configuration such as `bb.edn`, `.cljfmt.edn`, `.clj-kondo/config.edn`, and
 `.lsp/config.edn`.
 
-In terminal mode, `run-codex` enables a container-local `clojure_lsp` MCP
-server automatically for Clojure projects. Auto-detection looks for a root
+`run-codex` enables a container-local `clojure_lsp` MCP server automatically
+for Clojure projects in terminal and IDEA modes. Auto-detection looks for a root
 `deps.edn`, `project.clj`, `bb.edn`, `shadow-cljs.edn`, or `build.boot`, then
 for tracked or unignored `.clj`, `.cljc`, or `.cljs` source anywhere in the
 repository. Other projects start without the MCP server or its tool catalog.
@@ -626,13 +637,13 @@ enforces these practices or blocks a primary or worker, so normal targeted
 `rg`, `sed`, Clojure LSP, and IDEA MCP operations remain available.
 
 Provider lifecycle follows the client. Terminal Codex readers use the
-container-local Clojure LSP lifecycle above, while IntelliJ ACP readers reuse
-IDEA's already-running project index and do not call `start_lsp`. If a client
-actually exposes both read-only providers, ordinary questions use one. For an
-ambiguous, incomplete, or high-risk claim, Luna readers may instead receive
-provider-specific evidence assignments and return a compact agreement or
-discrepancy report. This deliberate corroboration does not authorize the
-primary to repeat either search.
+container-local Clojure LSP lifecycle above. IntelliJ ACP readers prefer IDEA's
+already-running project index; when `clojure_lsp` is also enabled, they start it
+only for Clojure-specific gaps or explicit corroboration. Ordinary questions
+use one provider. For an ambiguous, incomplete, or high-risk claim, readers may
+query both in parallel and return a compact agreement or discrepancy report.
+This deliberate corroboration does not authorize the primary to repeat either
+search.
 
 Delegated substantial and long-running commands are observable without an
 experimental Codex feature. The primary announces the role, scope, assigned run
@@ -920,6 +931,25 @@ host installation. The CUDA check additionally starts the
 container with `--gpus all` and verifies `nvcc`, CUDA headers, and
 `nvidia-smi`. It therefore requires the NVIDIA driver and Container Toolkit
 described in [CUDA host setup](#cuda-host-setup).
+
+For each local image, the host first runs a bounded `bb --version` preflight,
+then uses that image's pinned Babashka to orchestrate the image-internal test
+phases. The runner prints each phase before it starts, its timeout, periodic
+elapsed-time heartbeats, its duration, and a final phase summary. Successful
+command output is captured; a failed phase prints only bounded stdout and
+stderr tails. The host also applies an outer deadline to the Docker run and
+removes the specifically named test container on failure or interruption.
+
+The default image-suite heartbeat is 10 seconds, the process kill grace period
+is 5 seconds, and the outer per-image deadline is 660 seconds. Override these
+positive integer values when diagnosing unusually slow hosts:
+
+```bash
+CODEX_TEST_IMAGE_HEARTBEAT_SECONDS=15 \
+CODEX_TEST_IMAGE_KILL_AFTER_SECONDS=10 \
+CODEX_TEST_IMAGE_TIMEOUT_SECONDS=900 \
+  ./tests/host-smoke.sh
+```
 
 The suite uses `--pull=never --network none`; it never pulls or builds an
 image. Select different local images with:
@@ -1239,15 +1269,16 @@ Use automatic project detection, which is the default:
 run-codex my-project --set clojure-mcp auto
 ```
 
-Or force the terminal bridge on or off:
+Or force the container-local bridge on or off:
 
 ```bash
 run-codex my-project --set clojure-mcp on
 run-codex my-project --set clojure-mcp off
 ```
 
-The setting affects terminal mode. IDEA mode continues to use IntelliJ's
-separate semantic MCP integration.
+The setting affects both terminal and IDEA modes. IDEA always keeps its
+integrated semantic MCP connection when enabled; a resolved `auto` or `on`
+setting adds `clojure_lsp` as a second provider.
 
 ## Move a checkout
 
@@ -1297,10 +1328,13 @@ List the active, non-archived sessions recorded for a project:
 run-codex my-project --sessions
 ```
 
-The list contains only the session name, update time, and UUID; it does not
-print prompts or transcript previews. Names assigned automatically by Codex
-and names changed with `/rename` are both supported. Resume by full UUID or by
-a case-insensitive substring of the session name:
+This is the terminal-mode session list. IDEA's AI Chat owns its separate ACP
+chat list; see the
+[IDEA conversation notes](docs/intellij.md#conversation-ownership-and-resume).
+The terminal list contains only the session name, update time, and UUID; it
+does not print prompts or transcript previews. Names assigned automatically by
+Codex and names changed with `/rename` are both supported. Resume by full UUID
+or by a case-insensitive substring of the session name:
 
 ```bash
 run-codex my-project --resume gpu-tuning
@@ -1414,7 +1448,12 @@ and the official [Codex authentication guide](https://learn.chatgpt.com/docs/aut
 
 JetBrains IDEs with AI Assistant can connect to the same hardened, Dockerized Codex through a custom ACP agent. The complete setup, relay design, security boundaries, troubleshooting, and operational guidance are in the dedicated [IntelliJ IDEA integration guide](docs/intellij.md).
 
-The short path is: register a project, run `setup-codex-idea <project>`, add the generated custom agent in AI Chat, and keep **Ask for approval** selected.
+The short path is: register each project normally, run `setup-codex-idea` once,
+select **Dockerized Codex (codex-universal)** in AI Chat, and keep **Ask for
+approval** selected. The single global entry routes each new ACP chat from its
+IDEA working directory to the matching registered project, including its image
+profile and launcher policy. IDEA's conversation list remains owned by
+JetBrains AI Assistant.
 
 ## Container profiles
 

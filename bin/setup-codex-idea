@@ -3,16 +3,15 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/run-codex"
-PROJECTS_DIR="$CONFIG_ROOT/projects"
 ACP_FILE="${CODEX_IDEA_ACP_FILE:-$HOME/.jetbrains/acp.json}"
 
 usage() {
     cat <<'USAGE'
-Usage: setup-codex-idea PROJECT
+Usage: setup-codex-idea
 
-Adds or updates a project-specific Dockerized Codex agent in the JetBrains
-ACP configuration. The project must already be registered with run-codex.
+Adds one Dockerized Codex agent to the global JetBrains ACP configuration.
+Each IDEA chat is routed from its requested working directory to the matching
+run-codex project registration and therefore uses that project's image profile.
 
 Environment:
   CODEX_IDEA_ACP_FILE  Override ~/.jetbrains/acp.json
@@ -29,12 +28,6 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
-validate_project_name() {
-    local name="$1"
-    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
-        die "Invalid project name '$name'. Use letters, digits, '.', '_' or '-'."
-}
-
 case "${1:-}" in
     -h|--help)
         usage
@@ -42,15 +35,10 @@ case "${1:-}" in
         ;;
 esac
 
-(($# == 1)) || {
+(($# == 0)) || {
     usage >&2
     exit 2
 }
-
-PROJECT="$1"
-validate_project_name "$PROJECT"
-[[ -f "$PROJECTS_DIR/$PROJECT" ]] ||
-    die "Project '$PROJECT' is not registered. Run 'run-codex --init $PROJECT' first."
 
 need jq
 need realpath
@@ -82,7 +70,7 @@ if [[ -e "$ACP_FILE" ]]; then
         die "ACP configuration must be a JSON object with an optional agent_servers object: $ACP_FILE"
 fi
 
-AGENT_NAME="Dockerized Codex ($PROJECT)"
+AGENT_NAME="Dockerized Codex (codex-universal)"
 TMP_FILE="$(mktemp -- "$ACP_DIR/.acp.json.tmp.XXXXXX")"
 cleanup() {
     rm -f -- "$TMP_FILE"
@@ -93,11 +81,27 @@ if [[ -f "$ACP_FILE" ]]; then
     jq \
         --arg name "$AGENT_NAME" \
         --arg command "$RUN_CODEX" \
-        --arg project "$PROJECT" \
-        '.agent_servers = ((.agent_servers // {}) + {
+        'def managed_dockerized_codex:
+            if (.value | type) != "object" then false
+            else
+                ((.key == "Dockerized Codex (codex-universal)") or
+                 (.key | test("^Dockerized Codex \\([A-Za-z0-9][A-Za-z0-9_.-]*\\)$"))) and
+                (.value.command |
+                    if type == "string" then test("(^|/)run-codex$") else false end) and
+                (.value.args |
+                    if type == "array" then
+                        ((length == 1 or length == 2) and .[0] == "--idea")
+                    else false
+                    end) and
+                (.value.use_idea_mcp == false) and
+                (.value.use_custom_mcp == false)
+            end;
+         .agent_servers = (
+            ((.agent_servers // {}) |
+                with_entries(select(managed_dockerized_codex | not))) + {
             ($name): {
                 "command": $command,
-                "args": ["--idea", $project],
+                "args": ["--idea"],
                 "use_idea_mcp": false,
                 "use_custom_mcp": false
             }
@@ -107,12 +111,11 @@ else
     jq -n \
         --arg name "$AGENT_NAME" \
         --arg command "$RUN_CODEX" \
-        --arg project "$PROJECT" \
         '{
             "agent_servers": {
                 ($name): {
                     "command": $command,
-                    "args": ["--idea", $project],
+                    "args": ["--idea"],
                     "use_idea_mcp": false,
                     "use_custom_mcp": false
                 }
@@ -126,7 +129,8 @@ trap - EXIT
 
 echo "Configured JetBrains ACP agent '$AGENT_NAME':"
 echo "  file:    $ACP_FILE"
-echo "  command: $RUN_CODEX --idea $PROJECT"
+echo "  command: $RUN_CODEX --idea"
 echo "  MCP:     private IntelliJ HTTP relay enabled; ACP host forwarding disabled"
+echo "  routing: ACP session cwd -> registered run-codex project"
 echo "Select '$AGENT_NAME' (not the registry-managed 'Codex') in AI Chat."
 echo "Restart the IDE only if the new custom entry does not appear."

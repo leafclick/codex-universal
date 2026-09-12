@@ -61,10 +61,11 @@ session likely to need substantial terminal semantic work, initialize one reader
 early for the exact root with one bounded `start_lsp` call while the primary does
 disjoint work. Reuse that reader and resident LSP across idle turns; do not pay
 startup for an isolated lookup, retry a stalled start, or restart without
-evidence that it is unhealthy. IntelliJ ACP readers use IDEA's existing project
-index and never call `start_lsp`. When both providers exist, use one routinely;
-explicitly assign both only to corroborate an ambiguous, incomplete, or
-high-risk claim. Semantic workers validate tool arguments, bound result volume,
+evidence that it is unhealthy. IntelliJ ACP readers prefer IDEA's existing
+project index. When the container-local Clojure LSP provider is also exposed,
+use one provider routinely and start it only for a Clojure-specific gap or
+explicit corroboration. Query both in parallel only for an ambiguous,
+incomplete, or high-risk claim. Semantic workers validate tool arguments, bound result volume,
 select an exact symbol match before downstream queries, and prefer its exact
 file position. Numerical aggregates must state their invariant and reconcile.
 

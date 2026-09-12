@@ -66,6 +66,21 @@ separately from semantic results. A fresh or resumed Codex process may establish
 a new connection; neither that nor longer timeouts guarantees mid-session
 recovery. This transport limitation alone does not invalidate working REPL or
 runtime evidence. Use `rg` for literals, configuration and generated identifiers.
+Treat Clojure symbol-search syntax as provider-specific. For Clojure LSP
+workspace search, start with a simple var name or an exact namespace; do not
+assume canonical `namespace/var` or dotted `namespace.var` queries resolve.
+For IDEA `search_symbol`, start with the simple var name and use dotted
+`namespace.var` to disambiguate; slash-qualified and namespace-only searches
+may be empty or noisy even when IDEA's position-based PSI resolves the symbol.
+Preserve the namespace spelling returned by the provider, including underscores,
+and use `get_symbol_info` at a returned IDEA position to recover the canonical
+Clojure `namespace/var` identity. For exact Clojure resolution, prefer
+`inspect_symbol` or `go_to_definition` over qualified workspace search. Treat
+coordinate bases as tool-specific: IDEA positions are 1-based, raw LSP ranges
+can be 0-based, and Clojure MCP wrappers may display or accept 1-based positions.
+Record values and any conversion explicitly; never infer absence from an empty
+search result.
+
 Use native `cljfmt`, `clj-kondo`, and `clojure-lsp` when appropriate. Before
 interpreting probes, load the intended source into the correct namespace;
 targeted evaluation suits straightforward function edits. Suspect stale state

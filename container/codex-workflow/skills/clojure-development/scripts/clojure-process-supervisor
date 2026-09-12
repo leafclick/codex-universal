@@ -179,10 +179,12 @@ def terminate_process_tree(process, namespace_scoped):
         os.kill(signal_target, signal.SIGTERM)
     except ProcessLookupError:
         process.poll()
+        reap_children()
         return True
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         process.poll()
+        reap_children()
         if not alive():
             return True
         time.sleep(0.02)
@@ -190,10 +192,12 @@ def terminate_process_tree(process, namespace_scoped):
         os.kill(signal_target, signal.SIGKILL)
     except ProcessLookupError:
         process.poll()
+        reap_children()
         return True
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
         process.poll()
+        reap_children()
         if not alive():
             return True
         time.sleep(0.02)
@@ -379,6 +383,9 @@ def inside(path, root):
 
 def serve(control_path, project_root, state_root, namespace_scoped):
     set_parent_death_signal()
+    # Adopt runtime grandchildren so killed descendants can be reaped before
+    # process-group liveness is used to confirm termination.
+    set_child_subreaper()
     try:
         network_namespace = os.readlink("/proc/self/ns/net")
     except OSError:

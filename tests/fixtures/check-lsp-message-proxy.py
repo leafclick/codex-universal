@@ -36,3 +36,17 @@ assert messages[1]["method"] == "window/showMessage"
 assert messages[2]["id"] == 7
 assert messages[2]["error"]["code"] == -32002
 assert "initialization failure" in messages[2]["error"]["message"]
+
+early_exit = subprocess.Popen(
+    [proxy, sys.executable, "-c", "pass"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+early_status = early_exit.wait(timeout=5)
+early_stderr = early_exit.stderr.read()
+early_exit.stdin.close()
+early_exit.stdout.close()
+early_exit.stderr.close()
+assert early_status == 0
+assert b"Fatal Python error" not in early_stderr
