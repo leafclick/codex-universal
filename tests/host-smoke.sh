@@ -973,8 +973,10 @@ printf '%s\n' \
     '            IFS= read -r initialize_line' \
     '            initialize_id="$(jq -c .id <<<"$initialize_line")"' \
     '            jq -cn --argjson id "$initialize_id" '\''{jsonrpc:"2.0",id:$id,result:{protocolVersion:1}}'\''' \
-    '            IFS= read -r session_line' \
-    '            printf "%s\\n" "$session_line" > "$CODEX_TEST_DOCKER_ACP_REQUEST_LOG"' \
+    '            : > "$CODEX_TEST_DOCKER_ACP_REQUEST_LOG"' \
+    '            while IFS= read -r agent_line; do' \
+    '                printf "%s\\n" "$agent_line" >> "$CODEX_TEST_DOCKER_ACP_REQUEST_LOG"' \
+    '            done' \
     '        fi' \
     '        ;;' \
     '    *) exit 0 ;;' \
@@ -1462,7 +1464,9 @@ assert_contains "$idea_output" 'CODEX_IDEA_MCP_RELAY_SOCKET=/run/codex-idea-mcp/
 assert_contains "$idea_output" 'CODEX_IDEA_MCP_RELAY_PORT=64342'
 assert_contains "$idea_output" ':/run/codex-idea-mcp:ro'
 assert_not_contains "$idea_output" '--network host'
-assert_not_contains "$idea_output" 'mcp_servers":{"clojure_lsp'
+assert_contains "$idea_output" '"clojure_lsp":{"command":"/usr/local/bin/codex-clojure-lsp-mcp"'
+assert_contains "$idea_output" '"args":["clojure:clojure-lsp"]'
+assert_contains "$idea_output" '"enabled_tools":["start_lsp","restart_lsp_server"'
 assert_contains "$idea_output" "--name codex-smoke-project-idea-"
 assert_contains "$idea_output" "$TEST_ROOT/repo:$TEST_ROOT/repo"
 assert_contains "$idea_output" "--cidfile"
@@ -1471,6 +1475,13 @@ assert_contains "$idea_output" "--label codex-universal.project=smoke-project"
 if [[ "$idea_output" == *"-it"* ]]; then
     fail "IDEA launcher allocated a TTY and would corrupt ACP stdio"
 fi
+
+idea_lsp_disabled_output="$(
+    "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=0 \
+        "$ROOT/bin/run-codex" --idea smoke-project
+)"
+assert_contains "$idea_lsp_disabled_output" '"mcp_servers":{"idea"'
+assert_not_contains "$idea_lsp_disabled_output" '"clojure_lsp"'
 
 lsp_disabled_output="$(
     "${launcher_env[@]}" CODEX_CLOJURE_LSP_MCP=0 \
@@ -1525,8 +1536,12 @@ idea_session_request="$(
     jq -cn --arg cwd "$TEST_ROOT/non-clojure-repo" \
         '{jsonrpc:"2.0",id:2,method:"session/new",params:{cwd:$cwd,mcpServers:[]}}'
 )"
+idea_prompt_request="$(
+    jq -cn '{jsonrpc:"2.0",id:3,method:"session/prompt",params:{sessionId:"host-smoke",prompt:[{type:"text",text:"verify relay"}]}}'
+)"
 idea_dispatch_output="$(
-    printf '%s\n' "$idea_initialize_request" "$idea_session_request" |
+    printf '%s\n' \
+        "$idea_initialize_request" "$idea_session_request" "$idea_prompt_request" |
     "${launcher_env[@]}" \
     "CODEX_TEST_DOCKER_ACP=1" \
     "CODEX_TEST_DOCKER_ARGV_LOG=$idea_dispatch_argv" \
@@ -1540,8 +1555,9 @@ jq -e '
     (.result.agentCapabilities.sessionCapabilities.list == {})
 ' <<<"$idea_dispatch_output" >/dev/null ||
     fail "IDEA dispatcher did not return its constrained initialization response"
-cmp -s -- "$idea_dispatch_request" <(printf '%s\n' "$idea_session_request") ||
-    fail "IDEA dispatcher did not forward the project-selecting session request"
+cmp -s -- "$idea_dispatch_request" \
+    <(printf '%s\n' "$idea_session_request" "$idea_prompt_request") ||
+    fail "IDEA dispatcher did not forward session creation and the following prompt"
 grep -Fxq -- 'example/codex-universal-cuda:test-version' "$idea_dispatch_argv" &&
     grep -Fxq -- 'codex-universal.project=plain-project' "$idea_dispatch_argv" &&
     grep -Fxq -- "$TEST_ROOT/non-clojure-repo:$TEST_ROOT/non-clojure-repo" \

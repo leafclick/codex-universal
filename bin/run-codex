@@ -171,6 +171,9 @@ run_idea_dispatcher() {
     local frontend_input_pid=""
     local backend_input_fd=""
     local backend_output_fd=""
+    local coproc_input_fd=""
+    local coproc_output_fd=""
+    local client_input_fd=""
     local run_codex_self=""
     local status=0
     local backend_initialized=false
@@ -254,8 +257,14 @@ run_idea_dispatcher() {
         exec "$run_codex_self" --internal-idea-backend "$request_cwd"
     }
     backend_pid="$IDEA_BACKEND_PID"
-    exec {backend_output_fd}<&"${IDEA_BACKEND[0]}"
-    exec {backend_input_fd}>&"${IDEA_BACKEND[1]}"
+    coproc_output_fd="${IDEA_BACKEND[0]}"
+    coproc_input_fd="${IDEA_BACKEND[1]}"
+    exec {backend_output_fd}<&"$coproc_output_fd"
+    exec {backend_input_fd}>&"$coproc_input_fd"
+    # Keep only descriptors whose lifetime is managed below. Otherwise the
+    # original coprocess input descriptor prevents the backend from seeing EOF.
+    exec {coproc_output_fd}<&-
+    exec {coproc_input_fd}>&-
 
     cleanup_idea_dispatcher() {
         local cleanup_status=$?
@@ -289,13 +298,19 @@ run_idea_dispatcher() {
         die "Dockerized Codex exited before completing ACP initialization"
 
     printf '%s\n' "$request_line" >&"$backend_input_fd"
+    # Bash connects an asynchronous command's fd 0 to /dev/null when job
+    # control is disabled. Preserve IDEA's protocol input on an explicit fd
+    # before starting the background client-to-agent relay.
+    exec {client_input_fd}<&0
     (
-        while IFS= read -r request_line; do
+        while IFS= read -r request_line <&"$client_input_fd"; do
             printf '%s\n' "$request_line" >&"$backend_input_fd" || break
         done
+        exec {client_input_fd}<&-
         exec {backend_input_fd}>&-
     ) &
     frontend_input_pid=$!
+    exec {client_input_fd}<&-
     exec {backend_input_fd}>&-
     cat <&"$backend_output_fd"
 
@@ -1777,6 +1792,24 @@ if $IDEA_MODE; then
         )"
     fi
 
+    if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
+        IDEA_CODEX_CONFIG="$(
+            jq -c \
+                --argjson enabled_tools "$CLOJURE_LSP_MCP_ALLOWED_TOOLS" \
+                '.mcp_optional_startup_grace_ms = 5000 |
+                 .mcp_servers.clojure_lsp = {
+                    command: "/usr/local/bin/codex-clojure-lsp-mcp",
+                    args: ["clojure:clojure-lsp"],
+                    enabled: true,
+                    required: false,
+                    enabled_tools: $enabled_tools,
+                    default_tools_approval_mode: "writes",
+                    startup_timeout_sec: 30,
+                    tool_timeout_sec: 120
+                 }' <<<"$IDEA_CODEX_CONFIG"
+        )"
+    fi
+
     docker_args+=(
         -e "CODEX_PATH=/usr/local/share/npm-global/bin/codex"
         # codex-acp calls this mode "read-only" internally but presents it as
@@ -1850,6 +1883,11 @@ if $IDEA_MODE; then
     echo "  profile: $PROFILE" >&2
     echo "  image:   $IMAGE" >&2
     echo "  project: $PROJECT_PATH -> $CONTAINER_PROJECT" >&2
+    if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
+        echo "  Clojure MCP: enabled ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)" >&2
+    else
+        echo "  Clojure MCP: disabled ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)" >&2
+    fi
     echo "  policy:  workspace-write; human approval; no full-access mode" >&2
 else
     echo "  profile: $PROFILE"

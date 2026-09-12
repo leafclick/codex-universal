@@ -121,12 +121,13 @@ A successful run ends with `=== ALL HOST SMOKE TESTS PASSED ===`. See
 selection, CUDA-only checks, and troubleshooting.
 
 Next start a new Codex chat and paste the prompt for that client mode. Terminal
-and IDEA sessions use intentionally different MCP servers and paths:
+and IDEA sessions use intentionally different paths; IDEA can expose both
+semantic providers when Clojure MCP is enabled:
 
 | Client mode | MCP server | Expected project path |
 | --- | --- | --- |
 | `run-codex` | Container-local `clojure_lsp` | Container path, normally `/workspace/<project>` |
-| `run-codex --idea` | Host IDEA `idea` through a private relay | Exact absolute host checkout path |
+| `run-codex --idea` | Host IDEA `idea`, plus container-local `clojure_lsp` when enabled | Exact absolute host checkout path |
 
 Test the modes in separate chats. In either mode, `pwd` is authoritative; do
 not translate paths or move a conversation between the two path forms. The
@@ -436,8 +437,8 @@ Each tool uses its upstream defaults and still discovers project-local
 configuration such as `bb.edn`, `.cljfmt.edn`, `.clj-kondo/config.edn`, and
 `.lsp/config.edn`.
 
-In terminal mode, `run-codex` enables a container-local `clojure_lsp` MCP
-server automatically for Clojure projects. Auto-detection looks for a root
+`run-codex` enables a container-local `clojure_lsp` MCP server automatically
+for Clojure projects in terminal and IDEA modes. Auto-detection looks for a root
 `deps.edn`, `project.clj`, `bb.edn`, `shadow-cljs.edn`, or `build.boot`, then
 for tracked or unignored `.clj`, `.cljc`, or `.cljs` source anywhere in the
 repository. Other projects start without the MCP server or its tool catalog.
@@ -636,13 +637,13 @@ enforces these practices or blocks a primary or worker, so normal targeted
 `rg`, `sed`, Clojure LSP, and IDEA MCP operations remain available.
 
 Provider lifecycle follows the client. Terminal Codex readers use the
-container-local Clojure LSP lifecycle above, while IntelliJ ACP readers reuse
-IDEA's already-running project index and do not call `start_lsp`. If a client
-actually exposes both read-only providers, ordinary questions use one. For an
-ambiguous, incomplete, or high-risk claim, Luna readers may instead receive
-provider-specific evidence assignments and return a compact agreement or
-discrepancy report. This deliberate corroboration does not authorize the
-primary to repeat either search.
+container-local Clojure LSP lifecycle above. IntelliJ ACP readers prefer IDEA's
+already-running project index; when `clojure_lsp` is also enabled, they start it
+only for Clojure-specific gaps or explicit corroboration. Ordinary questions
+use one provider. For an ambiguous, incomplete, or high-risk claim, readers may
+query both in parallel and return a compact agreement or discrepancy report.
+This deliberate corroboration does not authorize the primary to repeat either
+search.
 
 Delegated substantial and long-running commands are observable without an
 experimental Codex feature. The primary announces the role, scope, assigned run
@@ -1268,15 +1269,16 @@ Use automatic project detection, which is the default:
 run-codex my-project --set clojure-mcp auto
 ```
 
-Or force the terminal bridge on or off:
+Or force the container-local bridge on or off:
 
 ```bash
 run-codex my-project --set clojure-mcp on
 run-codex my-project --set clojure-mcp off
 ```
 
-The setting affects terminal mode. IDEA mode continues to use IntelliJ's
-separate semantic MCP integration.
+The setting affects both terminal and IDEA modes. IDEA always keeps its
+integrated semantic MCP connection when enabled; a resolved `auto` or `on`
+setting adds `clojure_lsp` as a second provider.
 
 ## Move a checkout
 

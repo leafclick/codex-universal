@@ -232,8 +232,11 @@ Run `setup-codex-idea` once. Every IDEA session request includes an absolute
 working directory; the dispatcher rejects unregistered directories and starts
 the normal launcher backend for the matching project. That backend remains the
 source of truth for the registered checkout, image profile, locks, mounts, and
-managed security policy. The `clojure-mcp` project setting remains a terminal
-mode setting because IDEA sessions use IDEA's indexed MCP tools instead.
+managed security policy. IDEA's indexed MCP remains the default semantic
+provider. When the project's `clojure-mcp` setting resolves to enabled, the
+container-local Clojure LSP MCP is exposed as a second provider. Use it for
+Clojure-specific gaps, or query both providers in parallel when an ambiguous
+or high-risk result benefits from independent corroboration.
 
 The image installs an enforced `/etc/codex/requirements.toml` for
 `workspace-write`, `on-request`, and human review. OpenAI documents this
