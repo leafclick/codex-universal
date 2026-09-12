@@ -1278,7 +1278,7 @@ create_managed_lane() {
         local lane_codex_home=""
         local codex_home_created=false
         local m2_created=false
-        local seed_source seed_destination seed_name seed_index
+        local seed_source seed_destination seed_name seed_index seed_intent_index
         local seeded_sources=()
         local seeded_destinations=()
 
@@ -1305,9 +1305,7 @@ create_managed_lane() {
                         "refs/heads/$branch" "$commit" >/dev/null 2>&1 || true
                 fi
                 if ! $state_created; then
-                    for ((seed_index = 0;
-                          seed_index < ${#seeded_destinations[@]};
-                          seed_index++)); do
+                    for seed_index in "${!seeded_destinations[@]}"; do
                         seed_destination="${seeded_destinations[$seed_index]}"
                         seed_source="${seeded_sources[$seed_index]}"
                         if [[ -f "$seed_destination" && ! -L "$seed_destination" &&
@@ -1419,11 +1417,16 @@ create_managed_lane() {
                     die "Codex bootstrap destination must be a regular file, not a symlink: $seed_destination"
                 continue
             fi
-            if ln -- "$seed_source" "$seed_destination"; then
-                seeded_sources+=("$seed_source")
-                seeded_destinations+=("$seed_destination")
-            elif [[ ! -f "$seed_destination" || -L "$seed_destination" ]]; then
-                die "Cannot publish Codex bootstrap file: $seed_destination"
+            seed_intent_index="${#seeded_destinations[@]}"
+            seeded_sources+=("$seed_source")
+            seeded_destinations+=("$seed_destination")
+            if ! ln -- "$seed_source" "$seed_destination"; then
+                if [[ -f "$seed_destination" && ! -L "$seed_destination" ]]; then
+                    unset 'seeded_sources[seed_intent_index]'
+                    unset 'seeded_destinations[seed_intent_index]'
+                else
+                    die "Cannot publish Codex bootstrap file: $seed_destination"
+                fi
             fi
         done < <(find "$state_stage_path/codex-home" -mindepth 1 -maxdepth 1 \
             -type f -print0)

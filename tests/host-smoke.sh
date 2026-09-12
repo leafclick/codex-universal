@@ -2349,6 +2349,95 @@ cli_run cli-project --lane rollback-preserve --create "$cli_base_commit" \
    -e "$cli_config/run-codex/worktrees/cli-project/rollback-preserve" &&
    -f "$cli_config/run-codex/lanes/cli-project/rollback-preserve" ]] ||
     fail "successful retry did not seed preserved lane state"
+
+cli_signal_lane='signal'
+cli_signal_path="$cli_config/run-codex/worktrees/cli-project/$cli_signal_lane"
+cli_signal_config="$cli_config/run-codex/lanes/cli-project/$cli_signal_lane"
+cli_signal_state="$cli_config/run-codex/state/cli-project/$cli_signal_lane"
+cli_signal_branch="codex/cli-project/$cli_signal_lane"
+mkdir -p "$cli_signal_state"
+printf '%s\n' pre-existing-signal-state > "$cli_signal_state/marker"
+cli_signal_marker_before="$(<"$cli_signal_state/marker")"
+cli_signal_bin="$cli_root/signal-bin"
+mkdir -p "$cli_signal_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    '/bin/ln "$@"' \
+    'status=$?' \
+    'if ((status == 0)); then kill -TERM "$PPID"; fi' \
+    'exit "$status"' > "$cli_signal_bin/ln"
+chmod 755 "$cli_signal_bin/ln"
+cli_signal_env=(
+    "${cli_env[@]}"
+    "PATH=$cli_signal_bin:$TEST_ROOT/fake-bin:$PATH"
+)
+cli_run_signal() {
+    "${cli_signal_env[@]}" "$ROOT/bin/run-codex" "$@"
+}
+set +e
+cli_run_signal cli-project --lane "$cli_signal_lane" --create "$cli_base_commit" \
+    >"$cli_root/create-signal.log" 2>&1
+cli_signal_status=$?
+set -e
+(( cli_signal_status == 143 )) ||
+    fail "signal-interrupted lane creation returned $cli_signal_status, not 143"
+[[ ! -e "$cli_signal_path" && ! -e "$cli_signal_config" ]] ||
+    fail "signal-interrupted creation left checkout or registration"
+git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_signal_branch" &&
+    fail "signal-interrupted creation left its managed branch"
+[[ ! -e "$cli_signal_state/codex-home/auth.json" &&
+   "$(<"$cli_signal_state/marker")" == "$cli_signal_marker_before" ]] ||
+    fail "signal-interrupted creation published auth or changed lane state"
+
+cli_sparse_lane='sparse'
+cli_sparse_path="$cli_config/run-codex/worktrees/cli-project/$cli_sparse_lane"
+cli_sparse_config="$cli_config/run-codex/lanes/cli-project/$cli_sparse_lane"
+cli_sparse_state="$cli_config/run-codex/state/cli-project/$cli_sparse_lane"
+cli_sparse_branch="codex/cli-project/$cli_sparse_lane"
+printf '%s\n' bootstrap-config > "$cli_default_codex_home/config.toml"
+mkdir -p "$cli_sparse_state"
+printf '%s\n' pre-existing-sparse-state > "$cli_sparse_state/marker"
+cli_sparse_marker_before="$(<"$cli_sparse_state/marker")"
+cli_sparse_bin="$cli_root/sparse-bin"
+mkdir -p "$cli_sparse_bin"
+printf '%s\n' 0 > "$cli_sparse_bin/ln-count"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -Eeuo pipefail' \
+    'count=$(<"'$cli_sparse_bin'/ln-count")' \
+    'count=$((count + 1))' \
+    'printf "%s\\n" "$count" > "'$cli_sparse_bin'/ln-count"' \
+    'if [[ "${3##*/}" == config.toml ]]; then : > "${3:?}"; exit 1; fi' \
+    'exec /bin/ln "$@"' > "$cli_sparse_bin/ln"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${3:-}" == "'$cli_sparse_config'" ]]; then exit 1; fi' \
+    'exec /bin/mv "$@"' > "$cli_sparse_bin/mv"
+chmod 755 "$cli_sparse_bin/ln" "$cli_sparse_bin/mv"
+cli_sparse_env=(
+    "${cli_env[@]}"
+    "PATH=$cli_sparse_bin:$TEST_ROOT/fake-bin:$PATH"
+)
+cli_run_sparse() {
+    "${cli_sparse_env[@]}" "$ROOT/bin/run-codex" "$@"
+}
+if cli_run_sparse cli-project --lane "$cli_sparse_lane" --create "$cli_base_commit" \
+    >"$cli_root/create-sparse.log" 2>&1; then
+    fail "sparse bootstrap failure was accepted"
+fi
+[[ "$(<"$cli_sparse_bin/ln-count")" == 2 ]] ||
+    fail "sparse bootstrap fixture did not reach its second input"
+[[ ! -e "$cli_sparse_path" && ! -e "$cli_sparse_config" ]] ||
+    fail "sparse bootstrap rollback left checkout or registration"
+git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_sparse_branch" &&
+    fail "sparse bootstrap rollback left its managed branch"
+[[ ! -e "$cli_sparse_state/codex-home/auth.json" &&
+   -f "$cli_sparse_state/codex-home/config.toml" &&
+   ! -L "$cli_sparse_state/codex-home/config.toml" &&
+   "$(<"$cli_sparse_state/marker")" == "$cli_sparse_marker_before" ]] ||
+    fail "sparse bootstrap rollback mishandled linked or regular files"
+
 printf '%s\n' feature > "$cli_managed_path/feature"
 git -C "$cli_managed_path" add feature
 git -C "$cli_managed_path" -c user.name=host-smoke \
