@@ -33,6 +33,7 @@ SNAPSHOT_RUNTIME_PROFILE=""
 SNAPSHOT_RUNTIME_VERSION=""
 SNAPSHOT_RUNTIME_REVISION=""
 SNAPSHOT_ONBOARDING_SHA256=""
+SNAPSHOT_HANDOFF_IDENTITY=""
 
 valid_handoff_id() {
     [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]
@@ -79,6 +80,19 @@ snapshot_handoff_metadata_is_valid() {
     valid_runtime_value "$SNAPSHOT_RUNTIME_VERSION" || return 1
     [[ "$SNAPSHOT_RUNTIME_REVISION" =~ ^[0-9a-f]{7,64}$ ]] || return 1
     valid_hash "$SNAPSHOT_ONBOARDING_SHA256" || return 1
+}
+
+snapshot_handoff_identity() {
+    local state_file="$1"
+
+    SNAPSHOT_HANDOFF_IDENTITY=""
+    snapshot_handoff_metadata_is_valid "$state_file" || return 1
+    if [[ -z "$SNAPSHOT_HANDOFF_FORMAT" ]]; then
+        SNAPSHOT_HANDOFF_IDENTITY="legacy"
+        return 0
+    fi
+
+    SNAPSHOT_HANDOFF_IDENTITY="handoff:1|project=$SNAPSHOT_PROJECT|lane=$SNAPSHOT_LANE|required_commit=$SNAPSHOT_REQUIRED_COMMIT|runtime_profile=$SNAPSHOT_RUNTIME_PROFILE|runtime_version=$SNAPSHOT_RUNTIME_VERSION|runtime_revision=$SNAPSHOT_RUNTIME_REVISION|onboarding_sha256=$SNAPSHOT_ONBOARDING_SHA256"
 }
 
 snapshot_metadata_is_valid() {

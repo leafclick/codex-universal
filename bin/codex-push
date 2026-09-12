@@ -240,6 +240,7 @@ REMOTE_STATE_FILE=""
 load_latest_remote() {
     local best_gen=-1
     local best_hash=""
+    local best_handoff=""
     local best_file=""
     local found=false
     local restore_nullglob=false
@@ -254,8 +255,7 @@ load_latest_remote() {
     fi
 
     for state_file in "${files[@]}"; do
-        local generation
-        local hash
+        local generation hash handoff
 
         generation="$(state_value "$state_file" generation)"
         hash="$(state_value "$state_file" sha256)"
@@ -264,16 +264,24 @@ load_latest_remote() {
         valid_hash "$hash" || continue
 
         generation=$((10#$generation))
+        if snapshot_handoff_identity "$state_file"; then
+            handoff="$SNAPSHOT_HANDOFF_IDENTITY"
+        else
+            handoff="invalid"
+        fi
 
         if (( generation > best_gen )); then
             best_gen="$generation"
             best_hash="$hash"
+            best_handoff="$handoff"
             best_file="$state_file"
             found=true
 
         elif (( generation == best_gen )); then
             [[ "$hash" == "$best_hash" ]] ||
                 die "DIVERGENCE: generation $generation has multiple different hashes"
+            [[ "$handoff" == "$best_handoff" ]] ||
+                die "DIVERGENCE: generation $generation has conflicting handoff metadata"
         fi
     done
 

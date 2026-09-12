@@ -174,6 +174,35 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
             zstd -q -T0 -o "$archive_path"
     }
 
+    write_handoff_snapshot() {
+        local sync_dir="$1"
+        local source_dir="$2"
+        local generation="$3"
+        local suffix="$4"
+        local required_commit="$5"
+        local archive_name="codex-g$(printf '%010d' "$generation")-$suffix.tar.zst"
+        local archive_path="$sync_dir/$archive_name"
+        local state_hash archive_hash
+
+        make_fixture_archive "$source_dir" "$archive_path"
+        state_hash="$(fixture_state_hash "$source_dir")"
+        archive_hash="$(sha256sum "$archive_path" | awk '{print $1}')"
+        printf '%s\n' "$archive_hash" > "$archive_path.sha256"
+        {
+            printf 'format=1\ngeneration=%s\nsha256=%s\n' \
+                "$generation" "$state_hash"
+            printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
+                "$archive_name"
+            printf 'handoff_format=1\nproject=%s\nlane=%s\n' \
+                "$handoff_project" "$handoff_lane"
+            printf 'required_commit=%s\nruntime_profile=%s\n' \
+                "$required_commit" "$handoff_profile"
+            printf 'runtime_version=%s\nruntime_revision=%s\n' \
+                "$handoff_version" "$handoff_revision"
+            printf 'onboarding_sha256=%s\n' "$handoff_onboarding_hash"
+        } > "$archive_path.state"
+    }
+
     mkdir -p "$TEST_ROOT/a/live" "$TEST_ROOT/a/home"
     printf 'generation one\n' > "$TEST_ROOT/a/live/payload"
     generation_one_hash="$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')"
@@ -632,6 +661,120 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
        'contextual handoff state' ]] ||
         fail "matching handoff context did not restore across machine roots"
     pass "lane handoff metadata is published, validated, and nonmutating"
+
+    run_metadata_handoff() {
+        local root="$1"
+        shift
+
+        env \
+            "HOME=$root/home" \
+            "CODEX_DIR=$root/live" \
+            "CODEX_SYNC_DIR=$root/sync" \
+            "CODEX_LOCK_FILE=$root/handoff.lock" \
+            "XDG_STATE_HOME=$root/state" \
+            "CODEX_HANDOFF_PROJECT=$handoff_project" \
+            "CODEX_HANDOFF_LANE=$handoff_lane" \
+            "CODEX_HANDOFF_COMMIT=$handoff_commit" \
+            "CODEX_HANDOFF_RUNTIME_PROFILE=$handoff_profile" \
+            "CODEX_HANDOFF_RUNTIME_VERSION=$handoff_version" \
+            "CODEX_HANDOFF_RUNTIME_REVISION=$handoff_revision" \
+            "CODEX_HANDOFF_ONBOARDING_SHA256=$handoff_onboarding_hash" \
+            'CODEX_HANDOFF_READY=1' \
+            "$@"
+    }
+
+    metadata_pull_root="$TEST_ROOT/metadata-divergence-pull"
+    metadata_pull_source="$TEST_ROOT/metadata-divergence-pull-source"
+    mkdir -p "$metadata_pull_root/live" "$metadata_pull_root/home" \
+        "$metadata_pull_root/sync" "$metadata_pull_source"
+    printf 'metadata divergence payload\n' > "$metadata_pull_source/payload"
+    printf 'must survive metadata divergence\n' > \
+        "$metadata_pull_root/live/payload"
+    write_handoff_snapshot "$metadata_pull_root/sync" \
+        "$metadata_pull_source" 7 alpha "$handoff_commit"
+    write_handoff_snapshot "$metadata_pull_root/sync" \
+        "$metadata_pull_source" 7 zeta \
+        'cccccccccccccccccccccccccccccccccccccccc'
+    # Keep a unique newer head so --force 7 exercises selected-generation
+    # comparison rather than remote-head discovery.
+    write_handoff_snapshot "$metadata_pull_root/sync" \
+        "$metadata_pull_source" 8 head "$handoff_commit"
+    metadata_pull_before="$(fixture_state_hash "$metadata_pull_root/live")"
+    metadata_pull_files_before="$(find "$metadata_pull_root/sync" -maxdepth 1 \
+        -type f -print | LC_ALL=C sort)"
+    if run_metadata_handoff "$metadata_pull_root" "$PULL_COMMAND" --force 7 \
+        >"$metadata_pull_root/divergence.log" 2>&1; then
+        fail "pull accepted conflicting handoff metadata for one generation"
+    fi
+    assert_contains "$(<"$metadata_pull_root/divergence.log")" "DIVERGENCE"
+    [[ "$(fixture_state_hash "$metadata_pull_root/live")" == \
+       "$metadata_pull_before" ]] ||
+        fail "metadata-divergent pull mutated live state"
+    [[ "$(find "$metadata_pull_root/sync" -maxdepth 1 -type f -print | \
+        LC_ALL=C sort)" == "$metadata_pull_files_before" ]] ||
+        fail "metadata-divergent pull mutated synchronization state"
+    pass "pull rejects conflicting handoff metadata before mutation"
+
+    metadata_push_root="$TEST_ROOT/metadata-divergence-push"
+    metadata_push_source="$TEST_ROOT/metadata-divergence-push-source"
+    mkdir -p "$metadata_push_root/live" "$metadata_push_root/home" \
+        "$metadata_push_root/sync" "$metadata_push_source"
+    printf 'metadata push payload\n' > "$metadata_push_source/payload"
+    cp -- "$metadata_push_source/payload" "$metadata_push_root/live/payload"
+    write_handoff_snapshot "$metadata_push_root/sync" \
+        "$metadata_push_source" 9 alpha "$handoff_commit"
+    write_handoff_snapshot "$metadata_push_root/sync" \
+        "$metadata_push_source" 9 zeta \
+        'cccccccccccccccccccccccccccccccccccccccc'
+    metadata_push_files_before="$(find "$metadata_push_root/sync" -maxdepth 1 \
+        -type f -print | LC_ALL=C sort)"
+    metadata_push_live_before="$(fixture_state_hash "$metadata_push_root/live")"
+    if run_metadata_handoff "$metadata_push_root" "$PUSH_COMMAND" \
+        >"$metadata_push_root/divergence.log" 2>&1; then
+        fail "push accepted conflicting remote handoff metadata"
+    fi
+    assert_contains "$(<"$metadata_push_root/divergence.log")" "DIVERGENCE"
+    [[ "$(find "$metadata_push_root/sync" -maxdepth 1 -type f -print | \
+        LC_ALL=C sort)" == "$metadata_push_files_before" ]] ||
+        fail "metadata-divergent push published or removed synchronization files"
+    [[ "$(fixture_state_hash "$metadata_push_root/live")" == \
+       "$metadata_push_live_before" ]] ||
+        fail "metadata-divergent push mutated live state"
+    [[ ! -e "$metadata_push_root/state/codex-handoff/base.state" ]] ||
+        fail "metadata-divergent push wrote a local baseline"
+    pass "push rejects conflicting remote handoff metadata before publishing"
+
+    legacy_duplicate_root="$TEST_ROOT/legacy-duplicate"
+    legacy_duplicate_source="$TEST_ROOT/legacy-duplicate-source"
+    mkdir -p "$legacy_duplicate_root/live" "$legacy_duplicate_root/home" \
+        "$legacy_duplicate_root/sync" "$legacy_duplicate_source"
+    printf 'legacy duplicate payload\n' > "$legacy_duplicate_source/payload"
+    printf 'replace legacy duplicate\n' > "$legacy_duplicate_root/live/payload"
+    legacy_duplicate_state_hash="$(fixture_state_hash "$legacy_duplicate_source")"
+    for legacy_suffix in alpha zeta; do
+        legacy_archive="codex-g0000000001-$legacy_suffix.tar.zst"
+        make_fixture_archive "$legacy_duplicate_source" \
+            "$legacy_duplicate_root/sync/$legacy_archive"
+        legacy_archive_hash="$(sha256sum \
+            "$legacy_duplicate_root/sync/$legacy_archive" | awk '{print $1}')"
+        printf '%s\n' "$legacy_archive_hash" > \
+            "$legacy_duplicate_root/sync/$legacy_archive.sha256"
+        {
+            printf 'format=1\ngeneration=1\nsha256=%s\n' \
+                "$legacy_duplicate_state_hash"
+            printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
+                "$legacy_archive"
+        } > "$legacy_duplicate_root/sync/$legacy_archive.state"
+    done
+    run_isolated "$legacy_duplicate_root" "$PULL_COMMAND" --force 1 >/dev/null
+    [[ "$(<"$legacy_duplicate_root/live/payload")" == \
+       'legacy duplicate payload' ]] ||
+        fail "compatible legacy duplicate snapshots did not restore"
+    legacy_duplicate_push="$(
+        run_isolated "$legacy_duplicate_root" "$PUSH_COMMAND"
+    )"
+    assert_contains "$legacy_duplicate_push" "No changes"
+    pass "matching same-generation legacy snapshots remain compatible"
 
     rollback_root="$TEST_ROOT/rollback"
     mkdir -p "$rollback_root/live" "$rollback_root/home" "$rollback_root/sync"

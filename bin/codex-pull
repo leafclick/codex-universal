@@ -257,8 +257,9 @@ REMOTE_HASH=""
 load_latest_metadata() {
     local max_gen=-1
     local max_hash=""
+    local max_handoff=""
     local found=false
-    local state_file generation hash
+    local state_file generation hash handoff
     local restore_nullglob=false
 
     if ! shopt -q nullglob; then
@@ -280,14 +281,22 @@ load_latest_metadata() {
         valid_hash "$hash" || continue
 
         generation=$((10#$generation))
+        if snapshot_handoff_identity "$state_file"; then
+            handoff="$SNAPSHOT_HANDOFF_IDENTITY"
+        else
+            handoff="invalid"
+        fi
 
         if ((generation > max_gen)); then
             max_gen="$generation"
             max_hash="$hash"
+            max_handoff="$handoff"
             found=true
         elif ((generation == max_gen)); then
             [[ "$hash" == "$max_hash" ]] ||
                 die "DIVERGENCE: generation $generation has multiple different states"
+            [[ "$handoff" == "$max_handoff" ]] ||
+                die "DIVERGENCE: generation $generation has conflicting handoff metadata"
         fi
     done
 
@@ -312,9 +321,10 @@ archive_is_valid() {
 select_snapshot() {
     local wanted="$1"
     local expected_hash=""
+    local expected_handoff=""
     local matched=false
     local valid=false
-    local state_file generation hash
+    local state_file generation hash handoff
     local restore_nullglob=false
 
     SELECTED_ARCHIVE=""
@@ -340,11 +350,19 @@ select_snapshot() {
         generation=$((10#$generation))
         ((generation == wanted)) || continue
         matched=true
+        if snapshot_handoff_identity "$state_file"; then
+            handoff="$SNAPSHOT_HANDOFF_IDENTITY"
+        else
+            handoff="invalid"
+        fi
 
         if [[ -z "$expected_hash" ]]; then
             expected_hash="$hash"
+            expected_handoff="$handoff"
         elif [[ "$hash" != "$expected_hash" ]]; then
             die "DIVERGENCE: generation $wanted has multiple different states"
+        elif [[ "$handoff" != "$expected_handoff" ]]; then
+            die "DIVERGENCE: generation $wanted has conflicting handoff metadata"
         fi
 
         if archive_is_valid "$state_file"; then
