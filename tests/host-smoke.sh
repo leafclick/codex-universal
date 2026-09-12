@@ -2289,12 +2289,13 @@ grep -Fxq "path=$cli_managed_path" "$cli_managed_config" ||
 
 cli_rollback_path="$cli_config/run-codex/worktrees/cli-project/rollback"
 cli_rollback_config="$cli_config/run-codex/lanes/cli-project/rollback"
+cli_rollback_state="$cli_config/run-codex/state/cli-project/rollback"
 cli_rollback_branch='codex/cli-project/rollback'
 cli_rollback_bin="$cli_root/rollback-bin"
 mkdir -p "$cli_rollback_bin"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [[ "${3:-}" == "'$cli_rollback_config'" ]]; then exit 1; fi' \
+    'if [[ "${3:-}" == "'$cli_rollback_config'" || "${3:-}" == "'$cli_config/run-codex/lanes/cli-project/rollback-preserve'" ]]; then exit 1; fi' \
     'exec /bin/mv "$@"' > "$cli_rollback_bin/mv"
 chmod 755 "$cli_rollback_bin/mv"
 cli_rollback_env=(
@@ -2310,12 +2311,32 @@ if cli_run_rollback cli-project --lane rollback --create "$cli_base_commit" \
 fi
 [[ ! -e "$cli_rollback_path" && ! -e "$cli_rollback_config" ]] ||
     fail "failed managed lane creation left checkout or registration"
+[[ ! -e "$cli_rollback_state" ]] ||
+    fail "failed managed lane creation left newly created lane state"
 git -C "$cli_repo" show-ref --verify --quiet "refs/heads/$cli_rollback_branch" &&
     fail "failed managed lane creation left its managed branch"
 cli_run cli-project --lane rollback --create "$cli_base_commit" >/dev/null 2>&1
 [[ -e "$cli_rollback_path" && -f "$cli_rollback_config" &&
-   "$(git -C "$cli_rollback_path" rev-parse HEAD)" == "$cli_base_commit" ]] ||
+   "$(git -C "$cli_rollback_path" rev-parse HEAD)" == "$cli_base_commit" &&
+   -d "$cli_rollback_state/codex-home" &&
+   ! -e "$cli_rollback_state/.run-codex-create-owner" ]] ||
     fail "managed lane creation did not succeed after rollback retry"
+
+cli_preserve_state="$cli_config/run-codex/state/cli-project/rollback-preserve"
+mkdir -p "$cli_preserve_state"
+printf '%s\n' pre-existing-state > "$cli_preserve_state/marker"
+cli_preserve_marker_before="$(<"$cli_preserve_state/marker")"
+if cli_run_rollback cli-project --lane rollback-preserve --create "$cli_base_commit" \
+    >"$cli_root/create-rollback-preserve.log" 2>&1; then
+    fail "managed lane creation ignored post-worktree failure with existing state"
+fi
+[[ "$(<"$cli_preserve_state/marker")" == "$cli_preserve_marker_before" &&
+   ! -e "$cli_config/run-codex/worktrees/cli-project/rollback-preserve" &&
+   ! -e "$cli_config/run-codex/lanes/cli-project/rollback-preserve" ]] ||
+    fail "failed managed lane creation changed pre-existing lane state"
+git -C "$cli_repo" show-ref --verify --quiet \
+    refs/heads/codex/cli-project/rollback-preserve &&
+    fail "failed managed lane creation with existing state left its branch"
 printf '%s\n' feature > "$cli_managed_path/feature"
 git -C "$cli_managed_path" add feature
 git -C "$cli_managed_path" -c user.name=host-smoke \

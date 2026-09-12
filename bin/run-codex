@@ -1264,6 +1264,12 @@ create_managed_lane() {
         local registration_created=false
         local branch_created=false
         local temp_path=""
+        local state_created=false
+        local state_root=""
+        local lane_state_path=""
+        local state_owner=""
+        local state_owner_file=""
+        local state_quarantine=""
 
         rollback_managed_lane_create() {
             local status=$?
@@ -1287,12 +1293,35 @@ create_managed_lane() {
                     git -C "$default_root" update-ref -d \
                         "refs/heads/$branch" "$commit" >/dev/null 2>&1 || true
                 fi
+                if $state_created; then
+                    if [[ -d "$lane_state_path" && ! -L "$lane_state_path" &&
+                          -f "$state_owner_file" && ! -L "$state_owner_file" &&
+                          "$(<"$state_owner_file")" == "$state_owner" ]]; then
+                        state_quarantine="$lane_state_path.rollback.$state_owner"
+                        if [[ ! -e "$state_quarantine" && ! -L "$state_quarantine" ]] &&
+                           mv -T -- "$lane_state_path" "$state_quarantine"; then
+                            if [[ -f "$state_quarantine/.run-codex-create-owner" &&
+                                  ! -L "$state_quarantine/.run-codex-create-owner" &&
+                                  "$(<"$state_quarantine/.run-codex-create-owner")" == "$state_owner" ]]; then
+                                rm -rf -- "$state_quarantine"
+                            else
+                                echo "WARNING: quarantined lane state ownership changed; preserving '$state_quarantine' for inspection." >&2
+                            fi
+                        else
+                            echo "WARNING: could not quarantine owned lane state; preserving '$lane_state_path' for inspection." >&2
+                        fi
+                    else
+                        echo "WARNING: managed lane state ownership changed; preserving '$lane_state_path' for inspection." >&2
+                    fi
+                fi
                 if [[ -e "$temp_path" || -L "$temp_path" ||
                       -e "$managed_path" || -L "$managed_path" ||
-                      -e "$lane_file" || -L "$lane_file" ]] ||
+                      -e "$lane_file" || -L "$lane_file" ||
+                      ( "$state_created" == true &&
+                        ( -e "$lane_state_path" || -e "$state_quarantine" ) ) ]] ||
                    git -C "$default_root" show-ref --verify --quiet \
                        "refs/heads/$branch"; then
-                    echo "WARNING: incomplete lane artifacts remain; inspect temporary path '$temp_path', final path '$managed_path', registration '$lane_file', and branch '$branch'." >&2
+                    echo "WARNING: incomplete lane artifacts remain; inspect temporary path '$temp_path', final path '$managed_path', registration '$lane_file', branch '$branch', and state '$lane_state_path'." >&2
                 fi
             fi
             exit "$status"
@@ -1310,7 +1339,24 @@ create_managed_lane() {
         echo "Creating managed lane '$lane' at $managed_path" >&2
         git -C "$default_root" worktree add --detach "$temp_path" "$commit" >&2
         temp_worktree_created=true
-        seed_new_managed_lane_codex_home "$name" "$lane"
+        mkdir -p -- "$LANE_STATE_ROOT"
+        state_root="$(realpath -e -- "$LANE_STATE_ROOT")" ||
+            die "Cannot resolve lane state root: $LANE_STATE_ROOT"
+        lane_state_path="$(realpath -m -- "$state_root/$name/$lane")" ||
+            die "Cannot resolve managed lane state path"
+        [[ "$lane_state_path" == "$state_root/"* ]] ||
+            die "Managed lane state path escapes its root: $lane_state_path"
+        if [[ -e "$lane_state_path" || -L "$lane_state_path" ]]; then
+            [[ -d "$lane_state_path" && ! -L "$lane_state_path" ]] ||
+                die "Managed lane state must be a directory, not a symlink: $lane_state_path"
+        else
+            mkdir -p -- "$lane_state_path"
+            state_owner="$(basename -- "$temp_path")"
+            state_owner_file="$lane_state_path/.run-codex-create-owner"
+            printf '%s\n' "$state_owner" > "$state_owner_file"
+            state_created=true
+            seed_new_managed_lane_codex_home "$name" "$lane"
+        fi
         write_project_config "$name" "$lane" "$managed_path" "$profile" \
             "$clojure_mcp" isolated "$agent"
         registration_created=true
@@ -1320,6 +1366,9 @@ create_managed_lane() {
 
         rollback_pending=false
         trap - EXIT HUP INT TERM
+        if $state_created && ! rm -f -- "$state_owner_file"; then
+            echo "WARNING: retained managed lane creation marker: $state_owner_file" >&2
+        fi
         echo "Created project '$name' lane '$lane':"
         echo "  path:   $managed_path"
         echo "  branch: $branch"
