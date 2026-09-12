@@ -679,6 +679,12 @@ PRUNE_ORIGINAL_MARKER=""
 PRUNE_RECORD=""
 PRUNE_EXPECTED_HASH=""
 PRUNE_DELETE_COMMITTED=false
+PRUNE_ID=""
+PRUNE_PROJECT=""
+PRUNE_BINDING_KEY=""
+PRUNE_BINDING_VALUE=""
+PRUNE_TIMESTAMP_KEY=""
+PRUNE_QUARANTINE=""
 
 clear_prune_hold() {
     PRUNE_HOLD_DIR=""
@@ -688,41 +694,95 @@ clear_prune_hold() {
     PRUNE_RECORD=""
     PRUNE_EXPECTED_HASH=""
     PRUNE_DELETE_COMMITTED=false
+    PRUNE_ID=""
+    PRUNE_PROJECT=""
+    PRUNE_BINDING_KEY=""
+    PRUNE_BINDING_VALUE=""
+    PRUNE_TIMESTAMP_KEY=""
+    PRUNE_QUARANTINE=""
+}
+
+validate_prune_record() {
+    local file="$1"
+
+    validate_message_file "$file" "$PRUNE_ID"
+    [[ "$(jq -r '.project' "$file")" == "$PRUNE_PROJECT" ]]
+    [[ "$(jq -r ".$PRUNE_BINDING_KEY" "$file")" == "$PRUNE_BINDING_VALUE" ]]
+}
+
+quarantine_prune_hold() {
+    local token record_target marker_target preserved="$PRUNE_HOLD_DIR"
+
+    token="${PRUNE_HOLD_DIR##*.}"
+    record_target="$PRUNE_QUARANTINE/$PRUNE_ID.prune-record.$token.json"
+    marker_target="$PRUNE_QUARANTINE/$PRUNE_ID.prune-marker.$token.json"
+    if [[ ( -e "$PRUNE_HELD_RECORD" || -L "$PRUNE_HELD_RECORD" ) &&
+          ( -e "$record_target" || -L "$record_target" ) ]] ||
+       [[ ( -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ) &&
+          ( -e "$marker_target" || -L "$marker_target" ) ]]; then
+        echo "Preserved conflicting prune hold at $preserved" >&2
+        clear_prune_hold
+        return 1
+    fi
+    if [[ -e "$PRUNE_HELD_RECORD" || -L "$PRUNE_HELD_RECORD" ]]; then
+        mv -T -- "$PRUNE_HELD_RECORD" "$record_target"
+        preserved="$record_target"
+    fi
+    if [[ -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ]]; then
+        mv -T -- "$PRUNE_HELD_MARKER" "$marker_target"
+        [[ "$preserved" != "$PRUNE_HOLD_DIR" ]] || preserved="$marker_target"
+    fi
+    rmdir -- "$PRUNE_HOLD_DIR" 2>/dev/null || true
+    clear_prune_hold
+    echo "Preserved conflicting prune data at $preserved" >&2
+    return 1
 }
 
 restore_prune_hold() {
-    local preserved=""
+    local held_hash="" held_valid=false marker_valid=false
 
     [[ -n "$PRUNE_HOLD_DIR" ]] || return 0
     if $PRUNE_DELETE_COMMITTED; then
         rm -f -- "$PRUNE_HELD_RECORD" "$PRUNE_HELD_MARKER"
     elif [[ -e "$PRUNE_HELD_RECORD" || -L "$PRUNE_HELD_RECORD" ]]; then
-        if [[ ! -e "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" &&
-              ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" &&
-              -f "$PRUNE_HELD_RECORD" && ! -L "$PRUNE_HELD_RECORD" &&
-              -f "$PRUNE_HELD_MARKER" && ! -L "$PRUNE_HELD_MARKER" &&
-              "$(message_hash "$PRUNE_HELD_RECORD")" == "$PRUNE_EXPECTED_HASH" ]]; then
+        if (validate_prune_record "$PRUNE_HELD_RECORD") >/dev/null 2>&1; then
+            held_valid=true
+            held_hash="$(message_hash "$PRUNE_HELD_RECORD")"
+        fi
+        if [[ -n "$held_hash" ]] &&
+           (validate_marker_file "$PRUNE_HELD_MARKER" "$PRUNE_ID" \
+               "$PRUNE_EXPECTED_HASH" "$PRUNE_TIMESTAMP_KEY") >/dev/null 2>&1; then
+            marker_valid=true
+        fi
+        if $held_valid && [[ "$held_hash" == "$PRUNE_EXPECTED_HASH" ]] &&
+           $marker_valid &&
+           [[ ! -e "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" &&
+              ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]]; then
             mv -T -- "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
             mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
+        elif $held_valid &&
+             [[ ! -e "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" ]]; then
+            mv -T -- "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
+            quarantine_prune_hold
+            return 1
         else
-            preserved="$PRUNE_HOLD_DIR"
+            quarantine_prune_hold
+            return 1
         fi
     elif [[ -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ]]; then
         if [[ -f "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" &&
-              -f "$PRUNE_HELD_MARKER" && ! -L "$PRUNE_HELD_MARKER" &&
               "$(message_hash "$PRUNE_RECORD")" == "$PRUNE_EXPECTED_HASH" &&
-              ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]]; then
+              ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]] &&
+           (validate_marker_file "$PRUNE_HELD_MARKER" "$PRUNE_ID" \
+               "$PRUNE_EXPECTED_HASH" "$PRUNE_TIMESTAMP_KEY") >/dev/null 2>&1; then
             mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
         else
-            preserved="$PRUNE_HOLD_DIR"
+            quarantine_prune_hold
+            return 1
         fi
     fi
     rmdir -- "$PRUNE_HOLD_DIR" 2>/dev/null || true
     clear_prune_hold
-    if [[ -n "$preserved" ]]; then
-        echo "Preserved conflicting prune hold at $preserved" >&2
-        return 1
-    fi
 }
 
 prune_completed_mailbox() {
@@ -732,6 +792,7 @@ prune_completed_mailbox() {
     local binding_key="$4"
     local binding_value="$5"
     local project="$6"
+    local quarantine="$7"
     local file id marker digest invalid=false list_fd find_pid
 
     [[ -n "$records" && -n "$markers" ]] || return 0
@@ -762,6 +823,12 @@ prune_completed_mailbox() {
         PRUNE_RECORD="$file"
         PRUNE_EXPECTED_HASH="$digest"
         PRUNE_DELETE_COMMITTED=false
+        PRUNE_ID="$id"
+        PRUNE_PROJECT="$project"
+        PRUNE_BINDING_KEY="$binding_key"
+        PRUNE_BINDING_VALUE="$binding_value"
+        PRUNE_TIMESTAMP_KEY="$timestamp_key"
+        PRUNE_QUARANTINE="$quarantine"
         mv -T -- "$marker" "$PRUNE_HELD_MARKER"
         mv -T -- "$file" "$PRUNE_HELD_RECORD"
         if ! (validate_message_file "$PRUNE_HELD_RECORD" "$id" &&
@@ -790,7 +857,7 @@ prune_completed_mailbox() {
 command_prune() {
     local project="$1"
     local lane="$2"
-    local outbox delivered inbox acks invalid=false
+    local outbox delivered inbox acks quarantine invalid=false
 
     load_lane "$project" "$lane"
     lock_lanes "$project" "$lane"
@@ -812,13 +879,14 @@ command_prune() {
     inbox="$MAILBOX_DIR"
     resolve_existing_mailbox "$project" "$lane" acks
     acks="$MAILBOX_DIR"
+    quarantine="$(ensure_mailbox "$project" "$lane" quarantine)"
     PRUNE_COUNT=0
     if ! prune_completed_mailbox "$outbox" "$delivered" delivered_at \
-        from_lane "$lane" "$project"; then
+        from_lane "$lane" "$project" "$quarantine"; then
         invalid=true
     fi
     if ! prune_completed_mailbox "$inbox" "$acks" acknowledged_at \
-        to_lane "$lane" "$project"; then
+        to_lane "$lane" "$project" "$quarantine"; then
         invalid=true
     fi
     echo "Pruned $PRUNE_COUNT completed collaboration record(s) from $project/$lane."

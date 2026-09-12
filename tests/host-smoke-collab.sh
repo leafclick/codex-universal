@@ -170,6 +170,41 @@ fi
 grep -Fq 'Cannot enumerate collaboration mailbox' "$T/find-list.err" ||
     fail "list omitted its mailbox enumeration diagnostic"
 run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$T/pending-body" > "$T/prune-pre-race-id"
+prune_pre_race_id="$(<"$T/prune-pre-race-id")"
+run deliver collab-project --lane default "$prune_pre_race_id" >/dev/null
+prune_pre_race_record="$out/$prune_pre_race_id.json"
+prune_pre_race_marker="$delivered_dir/$prune_pre_race_id.json"
+prune_pre_replacement="$T/prune-pre-replacement.json"
+jq '.body="pre-move replacement"' "$prune_pre_race_record" > "$T/prune-pre-body.json"
+prune_pre_body_hash="$(jq -j '.body' "$T/prune-pre-body.json" | sha256sum | awk '{print $1}')"
+jq --arg hash "$prune_pre_body_hash" '.body_sha256=$hash' \
+    "$T/prune-pre-body.json" > "$prune_pre_replacement"
+prune_pre_bin="$T/prune-pre-bin"; mkdir -p "$prune_pre_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${1:-}" == -T && "${2:-}" == -- && "${3:-}" == "'$prune_pre_race_marker'" ]]; then' \
+    '    /bin/mv "$@"' \
+    '    cp -- "'$prune_pre_replacement'" "'$prune_pre_race_record'.replacement"' \
+    '    /bin/mv -T -- "'$prune_pre_race_record'.replacement" "'$prune_pre_race_record'"' \
+    '    exit 0' \
+    'fi' \
+    'exec /bin/mv "$@"' > "$prune_pre_bin/mv"
+chmod 755 "$prune_pre_bin/mv"
+if PATH="$prune_pre_bin:$PATH" run prune collab-project --lane default \
+    >/dev/null 2>&1; then
+    fail "prune accepted a record replaced before its hold"
+fi
+jq -e '.body == "pre-move replacement"' "$prune_pre_race_record" >/dev/null ||
+    fail "pre-move replacement was stranded outside the mailbox"
+[[ ! -e "$prune_pre_race_marker" ]] ||
+    fail "pre-move replacement inherited the stale completion marker"
+prune_pre_quarantine="$T/config/run-codex/state/collab-project/default/collaboration/quarantine"
+prune_pre_stale_marker="$(find "$prune_pre_quarantine" -mindepth 1 -maxdepth 1 \
+    -type f -name "$prune_pre_race_id.prune-marker.*.json" -print -quit)"
+[[ -f "$prune_pre_stale_marker" ]] || fail "stale prune marker was not quarantined"
+rm -- "$prune_pre_race_record" "$prune_pre_stale_marker"
+run send collab-project --lane default --to review --kind question --revision "$base" \
     --body-file "$T/pending-body" > "$T/prune-race-id"
 prune_race_id="$(<"$T/prune-race-id")"
 run deliver collab-project --lane default "$prune_race_id" >/dev/null
