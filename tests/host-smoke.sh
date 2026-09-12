@@ -963,9 +963,18 @@ printf '%s\n' \
     '        exit 0' \
     '        ;;' \
     '    run|build)' \
-    '        printf "%s\\n" "$*"' \
+    '        if [[ "${CODEX_TEST_DOCKER_ACP:-0}" != 1 || "$*" != *codex-acp-entrypoint* ]]; then' \
+    '            printf "%s\\n" "$*"' \
+    '        fi' \
     '        if [[ -n "${CODEX_TEST_DOCKER_ARGV_LOG:-}" ]]; then' \
     '            printf "%q\\n" "$@" > "$CODEX_TEST_DOCKER_ARGV_LOG"' \
+    '        fi' \
+    '        if [[ "${CODEX_TEST_DOCKER_ACP:-0}" == 1 && "$*" == *codex-acp-entrypoint* ]]; then' \
+    '            IFS= read -r initialize_line' \
+    '            initialize_id="$(jq -c .id <<<"$initialize_line")"' \
+    '            jq -cn --argjson id "$initialize_id" '\''{jsonrpc:"2.0",id:$id,result:{protocolVersion:1}}'\''' \
+    '            IFS= read -r session_line' \
+    '            printf "%s\\n" "$session_line" > "$CODEX_TEST_DOCKER_ACP_REQUEST_LOG"' \
     '        fi' \
     '        ;;' \
     '    *) exit 0 ;;' \
@@ -1502,15 +1511,69 @@ grep -Fxq 'clojure_mcp=auto' \
     "$TEST_ROOT/launcher-config/run-codex/projects/plain-project" ||
     fail "project Clojure MCP setter did not update the project configuration"
 
+# The one global IDEA ACP entry must wait for session cwd before selecting a
+# registered project. Verify that the dispatcher reuses the normal launcher so
+# the selected project's profile, mount, labels, and policy remain authoritative.
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set profile cuda >/dev/null
+idea_dispatch_argv="$TEST_ROOT/idea-dispatch.argv"
+idea_dispatch_request="$TEST_ROOT/idea-dispatch-request.json"
+idea_initialize_request="$(
+    jq -cn '{jsonrpc:"2.0",id:1,method:"initialize",params:{protocolVersion:1,clientCapabilities:{},clientInfo:{name:"host-smoke",version:"1"}}}'
+)"
+idea_session_request="$(
+    jq -cn --arg cwd "$TEST_ROOT/non-clojure-repo" \
+        '{jsonrpc:"2.0",id:2,method:"session/new",params:{cwd:$cwd,mcpServers:[]}}'
+)"
+idea_dispatch_output="$(
+    printf '%s\n' "$idea_initialize_request" "$idea_session_request" |
+    "${launcher_env[@]}" \
+    "CODEX_TEST_DOCKER_ACP=1" \
+    "CODEX_TEST_DOCKER_ARGV_LOG=$idea_dispatch_argv" \
+    "CODEX_TEST_DOCKER_ACP_REQUEST_LOG=$idea_dispatch_request" \
+    "$ROOT/bin/run-codex" --idea
+)"
+jq -e '
+    .id == 1 and
+    .result.agentInfo.name == "codex-universal" and
+    .result.agentCapabilities.loadSession == true and
+    (.result.agentCapabilities.sessionCapabilities.list == {})
+' <<<"$idea_dispatch_output" >/dev/null ||
+    fail "IDEA dispatcher did not return its constrained initialization response"
+cmp -s -- "$idea_dispatch_request" <(printf '%s\n' "$idea_session_request") ||
+    fail "IDEA dispatcher did not forward the project-selecting session request"
+grep -Fxq -- 'example/codex-universal-cuda:test-version' "$idea_dispatch_argv" &&
+    grep -Fxq -- 'codex-universal.project=plain-project' "$idea_dispatch_argv" &&
+    grep -Fxq -- "$TEST_ROOT/non-clojure-repo:$TEST_ROOT/non-clojure-repo" \
+        "$idea_dispatch_argv" ||
+    fail "IDEA dispatcher did not launch the registered project profile and mount"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    plain-project --set profile generic >/dev/null
+
 for removed_setter in --set-profile --set-clojure-mcp; do
     if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
         "$removed_setter" plain-project value >"$TEST_ROOT/removed-setter.out" 2>&1; then
         fail "removed project setter '$removed_setter' was still accepted"
     fi
-    grep -Fq "Unknown launch option '$removed_setter'" \
-        "$TEST_ROOT/removed-setter.out" ||
-        fail "removed project setter '$removed_setter' did not fail clearly"
+    case "$removed_setter" in
+        --set-profile)
+            expected_setter_hint='Use: run-codex PROJECT --set profile generic|cuda'
+            ;;
+        --set-clojure-mcp)
+            expected_setter_hint='Use: run-codex PROJECT --set clojure-mcp auto|on|off'
+            ;;
+    esac
+    grep -Fq "$expected_setter_hint" "$TEST_ROOT/removed-setter.out" ||
+        fail "removed project setter '$removed_setter' did not show its replacement syntax"
 done
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" plain-project \
+    --codex-option clojure-mcp=auto >"$TEST_ROOT/setting-as-option.out" 2>&1; then
+    fail "launcher accepted the Clojure MCP project setting as a Codex option"
+fi
+grep -Fq 'Use: run-codex PROJECT --set clojure-mcp auto|on|off' \
+    "$TEST_ROOT/setting-as-option.out" ||
+    fail "Clojure MCP Codex-option error did not show the project setter syntax"
 
 set_error="$TEST_ROOT/project-setter-error.out"
 if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
@@ -1729,11 +1792,12 @@ grep -Fxq 'ERROR: Missing command: jq' "$TEST_ROOT/no-jq.err" ||
 pass "project registry and launcher policy"
 activity "JetBrains ACP configuration"
 
-# IDEA setup must merge its entry without replacing unrelated JetBrains
-# settings or agents. Override paths keep the test entirely temporary.
+# IDEA setup must merge one cwd-routing entry without replacing unrelated
+# JetBrains settings or agents. Override paths keep the test temporary.
 ACP_FILE="$TEST_ROOT/jetbrains/acp.json"
 mkdir -p "$(dirname "$ACP_FILE")"
-printf '%s\n' '{"theme":"dark","agent_servers":{"Existing":{"command":"existing-agent"}}}' \
+printf '%s\n' \
+    "{\"theme\":\"dark\",\"agent_servers\":{\"Existing\":{\"command\":\"existing-agent\"},\"Dockerized Codex (manual)\":{\"command\":\"other-agent\",\"args\":[\"--idea\",\"manual\"]},\"Dockerized Codex (smoke-project)\":{\"command\":\"$ROOT/bin/run-codex\",\"args\":[\"--idea\",\"smoke-project\"],\"use_idea_mcp\":false,\"use_custom_mcp\":false}}}" \
     > "$ACP_FILE"
 
 env \
@@ -1741,7 +1805,7 @@ env \
     "XDG_CONFIG_HOME=$TEST_ROOT/launcher-config" \
     "CODEX_IDEA_ACP_FILE=$ACP_FILE" \
     "CODEX_RUN_CODEX=$ROOT/bin/run-codex" \
-    "$ROOT/bin/setup-codex-idea" smoke-project >/dev/null
+    "$ROOT/bin/setup-codex-idea" >/dev/null
 
 jq -e '.theme == "dark"' "$ACP_FILE" >/dev/null ||
     fail "IDEA setup replaced unrelated top-level configuration"
@@ -1749,13 +1813,33 @@ jq -e '.agent_servers.Existing.command == "existing-agent"' "$ACP_FILE" >/dev/nu
     fail "IDEA setup replaced an existing agent"
 jq -e \
     --arg command "$(realpath -e "$ROOT/bin/run-codex")" \
-    '.agent_servers["Dockerized Codex (smoke-project)"] == {
+    '.agent_servers["Dockerized Codex (codex-universal)"] == {
         "command": $command,
-        "args": ["--idea", "smoke-project"],
+        "args": ["--idea"],
         "use_idea_mcp": false,
         "use_custom_mcp": false
-    }' "$ACP_FILE" >/dev/null ||
-    fail "IDEA setup did not create the expected Dockerized Codex agent"
+    } and
+    (.agent_servers["Dockerized Codex (smoke-project)"] == null)' \
+    "$ACP_FILE" >/dev/null ||
+    fail "IDEA setup did not replace legacy project entries with one dispatcher"
+
+# JetBrains's ACP configuration is global and offers no per-project visibility
+# predicate. Re-running setup updates one dispatcher while preserving unrelated
+# custom agents, including similarly named ones.
+env \
+    "HOME=$TEST_ROOT/launcher-home" \
+    "XDG_CONFIG_HOME=$TEST_ROOT/launcher-config" \
+    "CODEX_IDEA_ACP_FILE=$ACP_FILE" \
+    "CODEX_RUN_CODEX=$ROOT/bin/run-codex" \
+    "$ROOT/bin/setup-codex-idea" >/dev/null
+jq -e \
+    '.agent_servers.Existing.command == "existing-agent" and
+     .agent_servers["Dockerized Codex (manual)"].command == "other-agent" and
+     (.agent_servers["Dockerized Codex (codex-universal)"].args == ["--idea"]) and
+     ([.agent_servers | to_entries[] |
+        select(.value.command | strings | test("(^|/)run-codex$"))] | length) == 1' \
+    "$ACP_FILE" >/dev/null ||
+    fail "IDEA setup was not idempotent or replaced an unrelated custom agent"
 pass "JetBrains ACP configuration"
 activity "portable image build policy"
 

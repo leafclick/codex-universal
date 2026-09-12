@@ -72,7 +72,8 @@ Usage:
   run-codex --new [PROJECT] [--image-version VERSION] [--codex-option OPTION]...
   run-codex [PROJECT] --sessions
   run-codex [PROJECT] --resume QUERY [--image-version VERSION] [--codex-option OPTION]...
-  run-codex --idea PROJECT
+  run-codex --idea
+  run-codex --idea PROJECT  # compatibility/direct project launch
 
   run-codex --init [--profile generic|cuda] [--clojure-mcp auto|on|off] [PROJECT [PATH]]
   run-codex --rebind PROJECT [PATH]
@@ -102,7 +103,7 @@ Examples:
   run-codex cortex --resume gpu-tuning
   run-codex cortex --new --codex-option model=gpt-5.6-sol --codex-option reasoning=high
   run-codex cortex --codex-option no-alt-screen
-  run-codex --idea cortex
+  run-codex --idea
   run-codex --doctor cortex
   run-codex cortex --set profile generic
   run-codex cortex --set clojure-mcp auto
@@ -152,6 +153,162 @@ container_paths_overlap() {
 
 need() {
     command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+run_idea_dispatcher() {
+    need jq
+    need realpath
+    ((HOST_UID > 0 && HOST_GID > 0)) ||
+        die "Run this command as a non-root user with a non-root primary group"
+
+    local initialize_line=""
+    local initialize_id=""
+    local request_line=""
+    local request_method=""
+    local request_cwd=""
+    local backend_line=""
+    local backend_pid=""
+    local frontend_input_pid=""
+    local backend_input_fd=""
+    local backend_output_fd=""
+    local run_codex_self=""
+    local status=0
+    local backend_initialized=false
+
+    IFS= read -r initialize_line ||
+        die "IDEA ACP client closed before initialize"
+    jq -e '
+        type == "object" and .jsonrpc == "2.0" and
+        .method == "initialize" and has("id") and
+        (.params.protocolVersion == 1)
+    ' <<<"$initialize_line" >/dev/null ||
+        die "IDEA ACP dispatcher expected a protocol-version 1 initialize request"
+    initialize_id="$(jq -c '.id' <<<"$initialize_line")"
+
+    # Project selection is intentionally deferred until IDEA supplies cwd in a
+    # session request. Advertise only the capabilities that this one-project
+    # dispatcher can route without choosing or exposing another checkout.
+    jq -cn \
+        --argjson id "$initialize_id" \
+        '{
+            jsonrpc: "2.0",
+            id: $id,
+            result: {
+                protocolVersion: 1,
+                agentInfo: {
+                    name: "codex-universal",
+                    title: "Dockerized Codex",
+                    version: "1"
+                },
+                agentCapabilities: {
+                    loadSession: true,
+                    promptCapabilities: {
+                        embeddedContext: true,
+                        image: true
+                    },
+                    sessionCapabilities: {
+                        resume: {},
+                        list: {},
+                        close: {},
+                        delete: {},
+                        fork: {}
+                    },
+                    mcpCapabilities: {
+                        acp: false,
+                        http: true,
+                        sse: false
+                    }
+                },
+                authMethods: []
+            }
+        }'
+
+    # session/new and every supported resume/load request carry an absolute
+    # cwd. Do not guess from the IDE process cwd or expose all registered
+    # checkouts to a placeholder container.
+    while IFS= read -r request_line; do
+        request_method="$(jq -er '.method | strings' <<<"$request_line" 2>/dev/null || true)"
+        case "$request_method" in
+            session/new|session/load|session/resume|session/list|session/fork)
+                request_cwd="$(
+                    jq -er '.params.cwd | strings | select(startswith("/"))' \
+                        <<<"$request_line" 2>/dev/null || true
+                )"
+                [[ -n "$request_cwd" ]] ||
+                    die "IDEA ACP $request_method request did not include an absolute cwd"
+                break
+                ;;
+            \$/cancel_request)
+                continue
+                ;;
+            *)
+                die "IDEA ACP dispatcher cannot route '$request_method' before receiving a project cwd"
+                ;;
+        esac
+    done
+    [[ -n "$request_cwd" ]] ||
+        die "IDEA ACP client closed before selecting a project"
+
+    run_codex_self="$(realpath -e -- "${BASH_SOURCE[0]}")"
+    coproc IDEA_BACKEND {
+        exec "$run_codex_self" --internal-idea-backend "$request_cwd"
+    }
+    backend_pid="$IDEA_BACKEND_PID"
+    exec {backend_output_fd}<&"${IDEA_BACKEND[0]}"
+    exec {backend_input_fd}>&"${IDEA_BACKEND[1]}"
+
+    cleanup_idea_dispatcher() {
+        local cleanup_status=$?
+        trap - EXIT HUP INT TERM
+        if [[ "$frontend_input_pid" =~ ^[0-9]+$ ]]; then
+            kill "$frontend_input_pid" >/dev/null 2>&1 || true
+            wait "$frontend_input_pid" 2>/dev/null || true
+        fi
+        if [[ "$backend_pid" =~ ^[0-9]+$ ]]; then
+            kill "$backend_pid" >/dev/null 2>&1 || true
+            wait "$backend_pid" 2>/dev/null || true
+        fi
+        exit "$cleanup_status"
+    }
+    trap cleanup_idea_dispatcher EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    printf '%s\n' "$initialize_line" >&"$backend_input_fd"
+    while IFS= read -r backend_line <&"$backend_output_fd"; do
+        if jq -e --argjson id "$initialize_id" \
+            '.id == $id and (.result.protocolVersion == 1)' \
+            <<<"$backend_line" >/dev/null 2>&1; then
+            backend_initialized=true
+            break
+        fi
+        printf '%s\n' "$backend_line"
+    done
+    $backend_initialized ||
+        die "Dockerized Codex exited before completing ACP initialization"
+
+    printf '%s\n' "$request_line" >&"$backend_input_fd"
+    (
+        while IFS= read -r request_line; do
+            printf '%s\n' "$request_line" >&"$backend_input_fd" || break
+        done
+        exec {backend_input_fd}>&-
+    ) &
+    frontend_input_pid=$!
+    exec {backend_input_fd}>&-
+    cat <&"$backend_output_fd"
+
+    set +e
+    wait "$backend_pid"
+    status=$?
+    kill "$frontend_input_pid" >/dev/null 2>&1 || true
+    wait "$frontend_input_pid" 2>/dev/null
+    set -e
+    backend_pid=""
+    frontend_input_pid=""
+    trap - EXIT HUP INT TERM
+    return "$status"
 }
 
 run_idea_relay_guard() {
@@ -334,6 +491,12 @@ add_codex_option() {
     [[ -n "$option" ]] || die "--codex-option cannot be empty"
 
     case "$option" in
+        clojure-mcp=*)
+            die "'clojure-mcp' is a project setting, not a Codex option. Use: run-codex PROJECT --set clojure-mcp auto|on|off"
+            ;;
+        profile=*)
+            die "'profile' is a project setting, not a Codex option. Use: run-codex PROJECT --set profile generic|cuda"
+            ;;
         model=*)
             value="${option#model=}"
             [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*$ ]] ||
@@ -460,6 +623,12 @@ parse_launch_args() {
                 IMAGE_TAG="${1#--image-version=}"
                 validate_image_tag "$IMAGE_TAG"
                 shift
+                ;;
+            --set-clojure-mcp)
+                die "Use: run-codex PROJECT --set clojure-mcp auto|on|off"
+                ;;
+            --set-profile)
+                die "Use: run-codex PROJECT --set profile generic|cuda"
                 ;;
             --*)
                 die "Unknown launch option '$1'. Use --codex-option for supported Codex options."
@@ -1200,8 +1369,20 @@ case "${1:-}" in
     --idea)
         IDEA_MODE=true
         shift
-        (($# == 1)) || die "Usage: run-codex --idea PROJECT"
+        if (($# == 0)); then
+            run_idea_dispatcher
+            exit $?
+        fi
+        (($# == 1)) || die "Usage: run-codex --idea [PROJECT]"
         PROJECT="$1"
+        ;;
+    --internal-idea-backend)
+        IDEA_MODE=true
+        shift
+        (($# == 1)) || die "Invalid IntelliJ backend invocation"
+        [[ "$1" == /* ]] || die "IntelliJ project cwd must be absolute"
+        cd -P -- "$1" || die "IntelliJ project cwd is unavailable: $1"
+        PROJECT=""
         ;;
     *)
         if (($# >= 2)) && [[ "$2" == --set ]]; then

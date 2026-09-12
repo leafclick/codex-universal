@@ -56,15 +56,24 @@ Setup:
    run-codex
    ```
 
-3. On the host, add the registered project to `~/.jetbrains/acp.json`:
+3. On the host, add the Dockerized Codex dispatcher to
+   `~/.jetbrains/acp.json`:
 
    ```bash
-   setup-codex-idea my-project
+   setup-codex-idea
    ```
+
+   JetBrains reads this as a global agent list and has no per-project
+   visibility condition. This command therefore installs one **Dockerized
+   Codex (codex-universal)** entry and removes legacy per-project entries that
+   it previously generated, while preserving unrelated custom agents. Run it
+   once after installing or updating the host scripts, not once per project.
+   For each new chat, the dispatcher matches IDEA's ACP session working
+   directory to a registered `run-codex` checkout before starting Docker.
 
 4. In IDEA, open **AI Chat**, use its upper-right menu, and select **Add Custom
    Agent (Beta)**. IDEA opens the `acp.json` file it reads. Confirm that it
-   contains **Dockerized Codex (my-project)**, then save it. In **Settings →
+   contains **Dockerized Codex (codex-universal)**, then save it. In **Settings →
    Tools → MCP Server**, also select **Enable MCP Server** if it is not already
    enabled. Leave **Project Clients Auto-Configuration**, **Clients
    Auto-Configuration**, and **Manual Client Configuration** unused for this
@@ -139,8 +148,8 @@ Working-tree changes still go through Codex inside the hardened container.
 
 `use_custom_mcp` also remains disabled. Together, these ACP flags prevent
 arbitrary host-configured MCP launch commands, including host or Snap-specific
-paths, from being forwarded into the container. Run `setup-codex-idea
-my-project` again to replace an older entry, then start a new chat. JetBrains
+paths, from being forwarded into the container. Run `setup-codex-idea` again
+to replace an older entry, then start a new chat. JetBrains
 documents both flags in its
 [ACP configuration reference](https://www.jetbrains.com/help/ai-assistant/acp.html).
 
@@ -162,7 +171,7 @@ agent chat, reinstall the host policy, and refresh the generated ACP entry:
 
 ```bash
 bin/setup-codex-host-security
-setup-codex-idea my-project
+setup-codex-idea
 docker ps --filter label=codex-universal.project=my-project
 ```
 
@@ -219,10 +228,16 @@ uses classic confinement, so it reads the normal `~/.jetbrains/acp.json`; do
 not move this file under `~/.config/JetBrains/IntelliJIdea*/`. Run
 `setup-codex-idea` outside the container as the same host user that runs IDEA.
 
-Run `setup-codex-idea` once for each registered project. The image installs an
-enforced `/etc/codex/requirements.toml` for `workspace-write`, `on-request`,
-and human review. OpenAI documents this non-overridable policy layer under
-[managed Codex configuration](https://learn.chatgpt.com/docs/enterprise/managed-configuration).
+Run `setup-codex-idea` once. Every IDEA session request includes an absolute
+working directory; the dispatcher rejects unregistered directories and starts
+the normal launcher backend for the matching project. That backend remains the
+source of truth for the registered checkout, image profile, locks, mounts, and
+managed security policy. The `clojure-mcp` project setting remains a terminal
+mode setting because IDEA sessions use IDEA's indexed MCP tools instead.
+
+The image installs an enforced `/etc/codex/requirements.toml` for
+`workspace-write`, `on-request`, and human review. OpenAI documents this
+non-overridable policy layer under [managed Codex configuration](https://learn.chatgpt.com/docs/enterprise/managed-configuration).
 
 IDEA supplies its host project path in ACP requests, so IDEA mode mounts only
 the registered checkout at the same absolute path inside the container. This
@@ -232,6 +247,12 @@ scoped, and the ACP adapter filters IDEA sessions by their exact working
 directory, so the two path forms create separate resumable session histories.
 They share authentication and persisted Codex state, but a conversation should
 not be moved between terminal and IDEA modes.
+
+## Conversation ownership and resume
+
+`run-codex my-project --sessions` is terminal-only. IDEA's conversation list
+is owned by JetBrains AI Assistant; this integration neither replaces nor
+merges it with the terminal session list.
 
 Multiple IDEA chats may run for the same project, each in its own container.
 Terminal mode remains mutually exclusive with all IDEA chats for that project,

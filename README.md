@@ -1326,10 +1326,13 @@ List the active, non-archived sessions recorded for a project:
 run-codex my-project --sessions
 ```
 
-The list contains only the session name, update time, and UUID; it does not
-print prompts or transcript previews. Names assigned automatically by Codex
-and names changed with `/rename` are both supported. Resume by full UUID or by
-a case-insensitive substring of the session name:
+This is the terminal-mode session list. IDEA's AI Chat owns its separate ACP
+chat list; see the
+[IDEA conversation notes](docs/intellij.md#conversation-ownership-and-resume).
+The terminal list contains only the session name, update time, and UUID; it
+does not print prompts or transcript previews. Names assigned automatically by
+Codex and names changed with `/rename` are both supported. Resume by full UUID
+or by a case-insensitive substring of the session name:
 
 ```bash
 run-codex my-project --resume gpu-tuning
@@ -1443,7 +1446,12 @@ and the official [Codex authentication guide](https://learn.chatgpt.com/docs/aut
 
 JetBrains IDEs with AI Assistant can connect to the same hardened, Dockerized Codex through a custom ACP agent. The complete setup, relay design, security boundaries, troubleshooting, and operational guidance are in the dedicated [IntelliJ IDEA integration guide](docs/intellij.md).
 
-The short path is: register a project, run `setup-codex-idea <project>`, add the generated custom agent in AI Chat, and keep **Ask for approval** selected.
+The short path is: register each project normally, run `setup-codex-idea` once,
+select **Dockerized Codex (codex-universal)** in AI Chat, and keep **Ask for
+approval** selected. The single global entry routes each new ACP chat from its
+IDEA working directory to the matching registered project, including its image
+profile and launcher policy. IDEA's conversation list remains owned by
+JetBrains AI Assistant.
 
 ## Container profiles
 
