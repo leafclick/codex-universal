@@ -133,6 +133,43 @@ if PATH="$atomic_bin:$PATH" run deliver collab-project --lane default "$atomic_i
 fi
 [[ ! -e "$in/$atomic_id.json" ]] || fail "replaced source was published to inbox"
 run send collab-project --lane default --to review --kind question --revision "$base" \
+    --body-file "$T/pending-body" > "$T/enumeration-id"
+enumeration_id="$(<"$T/enumeration-id")"
+find_bin="$T/find-bin"; mkdir -p "$find_bin"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'if [[ "${1:-}" == "'$out'" || "${1:-}" == "'$in'" ]]; then' \
+    '    exit 42' \
+    'fi' \
+    'exec /usr/bin/find "$@"' > "$find_bin/find"
+chmod 755 "$find_bin/find"
+out_records=("$out"/*.json)
+out_count="${#out_records[@]}"
+if PATH="$find_bin:$PATH" run send collab-project --lane default --to review \
+    --kind question --revision "$base" --body-file "$T/pending-body" \
+    >/dev/null 2> "$T/find-send.err"; then
+    fail "send accepted a partial mailbox enumeration"
+fi
+grep -Fq 'Cannot enumerate collaboration mailbox' "$T/find-send.err" ||
+    fail "send omitted its mailbox enumeration diagnostic"
+out_records=("$out"/*.json)
+[[ "${#out_records[@]}" == "$out_count" ]] ||
+    fail "failed capacity enumeration published an outbox record"
+if PATH="$find_bin:$PATH" run deliver collab-project --lane default \
+    "$enumeration_id" >/dev/null 2> "$T/find-deliver.err"; then
+    fail "delivery accepted a partial mailbox enumeration"
+fi
+grep -Fq 'Cannot enumerate collaboration mailbox' "$T/find-deliver.err" ||
+    fail "delivery omitted its mailbox enumeration diagnostic"
+[[ ! -e "$in/$enumeration_id.json" ]] ||
+    fail "failed capacity enumeration published an inbox record"
+if PATH="$find_bin:$PATH" run list collab-project --lane review \
+    >/dev/null 2> "$T/find-list.err"; then
+    fail "list accepted a partial mailbox enumeration"
+fi
+grep -Fq 'Cannot enumerate collaboration mailbox' "$T/find-list.err" ||
+    fail "list omitted its mailbox enumeration diagnostic"
+run send collab-project --lane default --to review --kind question --revision "$base" \
     --body-file "$T/pending-body" > "$T/prune-race-id"
 prune_race_id="$(<"$T/prune-race-id")"
 run deliver collab-project --lane default "$prune_race_id" >/dev/null
@@ -141,19 +178,22 @@ prune_race_marker="$delivered_dir/$prune_race_id.json"
 prune_bin="$T/prune-bin"; mkdir -p "$prune_bin"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [[ "${1:-}" == -T && "${2:-}" == -- && "${3:-}" == "'$prune_race_marker'" ]]; then' \
+    'if [[ "${1:-}" == -T && "${2:-}" == -- && "${3:-}" == "'$prune_race_record'" ]]; then' \
     '    /bin/mv "$@"' \
-    '    printf " " >> "'$prune_race_record'"' \
+    '    cp -- "$4" "$3"' \
+    '    printf " " >> "$3"' \
     '    exit 0' \
     'fi' \
     'exec /bin/mv "$@"' > "$prune_bin/mv"
 chmod 755 "$prune_bin/mv"
-if PATH="$prune_bin:$PATH" run prune collab-project --lane default >/dev/null 2>&1; then
-    fail "prune accepted a record changed after marker hold"
+PATH="$prune_bin:$PATH" run prune collab-project --lane default >/dev/null
+[[ -f "$prune_race_record" && ! -e "$prune_race_marker" ]] ||
+    fail "prune deleted the replacement record or retained the old marker"
+if find "$delivered_dir" -mindepth 1 -maxdepth 1 -type d \
+    -name ".${prune_race_id}.prune.*" -print -quit | grep -q .; then
+    fail "successful prune retained its private hold"
 fi
-[[ -f "$prune_race_record" && -f "$prune_race_marker" ]] ||
-    fail "failed prune did not restore its completion marker"
-rm -- "$prune_race_record" "$prune_race_marker"
+rm -- "$prune_race_record"
 run send collab-project --lane default --to review --kind question --revision "$base" \
     --body-file "$T/pending-body" > "$T/prune-id"
 prune_id="$(<"$T/prune-id")"

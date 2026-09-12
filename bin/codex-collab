@@ -301,8 +301,12 @@ pending_count() {
     local records="$1"
     local markers="$2"
     local timestamp_key="$3"
-    local file name id digest count=0
+    local file name id digest count=0 list_fd find_pid
 
+    exec {list_fd}< <(
+        find "$records" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0
+    )
+    find_pid=$!
     while IFS= read -r -d '' file; do
         name="${file##*/}"
         id="${name%.json}"
@@ -314,7 +318,9 @@ pending_count() {
             continue
         fi
         count=$((count + 1))
-    done < <(find "$records" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0)
+    done <&"$list_fd"
+    exec {list_fd}<&-
+    wait "$find_pid" || die "Cannot enumerate collaboration mailbox: $records"
     printf '%s\n' "$count"
 }
 
@@ -551,7 +557,7 @@ command_deliver() {
 command_list() {
     local project="$1"
     local lane="$2"
-    local inbox acks file id status invalid=false
+    local inbox acks file id status invalid=false list_fd find_pid
 
     load_lane "$project" "$lane"
     printf 'ID\tKIND\tFROM\tREVISION\tSTATUS\tCREATED\n'
@@ -560,6 +566,11 @@ command_list() {
     inbox="$MAILBOX_DIR"
     resolve_existing_mailbox "$project" "$lane" acks
     acks="$MAILBOX_DIR"
+    exec {list_fd}< <(
+        find "$inbox" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0 |
+            sort -z
+    )
+    find_pid=$!
     while IFS= read -r -d '' file; do
         id="$(basename -- "$file" .json)"
         if ! (validate_message_id "$id" && validate_message_file "$file" "$id") \
@@ -586,8 +597,12 @@ command_list() {
         fi
         jq -r --arg status "$status" \
             '[.id,.kind,.from_lane,.revision,$status,.created_at] | @tsv' "$file"
-    done < <(find "$inbox" -mindepth 1 -maxdepth 1 -type f -name '*.json' \
-        -print0 | sort -z)
+    done <&"$list_fd"
+    exec {list_fd}<&-
+    if ! wait "$find_pid"; then
+        echo "Cannot enumerate collaboration mailbox: $inbox" >&2
+        invalid=true
+    fi
     ! $invalid
 }
 
@@ -659,35 +674,53 @@ command_ack() {
 PRUNE_COUNT=0
 PRUNE_HOLD_DIR=""
 PRUNE_HELD_MARKER=""
+PRUNE_HELD_RECORD=""
 PRUNE_ORIGINAL_MARKER=""
 PRUNE_RECORD=""
+PRUNE_EXPECTED_HASH=""
+PRUNE_DELETE_COMMITTED=false
 
 clear_prune_hold() {
     PRUNE_HOLD_DIR=""
     PRUNE_HELD_MARKER=""
+    PRUNE_HELD_RECORD=""
     PRUNE_ORIGINAL_MARKER=""
     PRUNE_RECORD=""
+    PRUNE_EXPECTED_HASH=""
+    PRUNE_DELETE_COMMITTED=false
 }
 
 restore_prune_hold() {
     local preserved=""
 
     [[ -n "$PRUNE_HOLD_DIR" ]] || return 0
-    if [[ -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ]]; then
-        if [[ -e "$PRUNE_RECORD" || -L "$PRUNE_RECORD" ]]; then
-            if [[ ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]]; then
-                mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
-            else
-                preserved="$PRUNE_HELD_MARKER"
-            fi
+    if $PRUNE_DELETE_COMMITTED; then
+        rm -f -- "$PRUNE_HELD_RECORD" "$PRUNE_HELD_MARKER"
+    elif [[ -e "$PRUNE_HELD_RECORD" || -L "$PRUNE_HELD_RECORD" ]]; then
+        if [[ ! -e "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" &&
+              ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" &&
+              -f "$PRUNE_HELD_RECORD" && ! -L "$PRUNE_HELD_RECORD" &&
+              -f "$PRUNE_HELD_MARKER" && ! -L "$PRUNE_HELD_MARKER" &&
+              "$(message_hash "$PRUNE_HELD_RECORD")" == "$PRUNE_EXPECTED_HASH" ]]; then
+            mv -T -- "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
+            mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
         else
-            rm -f -- "$PRUNE_HELD_MARKER"
+            preserved="$PRUNE_HOLD_DIR"
+        fi
+    elif [[ -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ]]; then
+        if [[ -f "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" &&
+              -f "$PRUNE_HELD_MARKER" && ! -L "$PRUNE_HELD_MARKER" &&
+              "$(message_hash "$PRUNE_RECORD")" == "$PRUNE_EXPECTED_HASH" &&
+              ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]]; then
+            mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
+        else
+            preserved="$PRUNE_HOLD_DIR"
         fi
     fi
     rmdir -- "$PRUNE_HOLD_DIR" 2>/dev/null || true
     clear_prune_hold
     if [[ -n "$preserved" ]]; then
-        echo "Preserved conflicting prune marker at $preserved" >&2
+        echo "Preserved conflicting prune hold at $preserved" >&2
         return 1
     fi
 }
@@ -699,9 +732,13 @@ prune_completed_mailbox() {
     local binding_key="$4"
     local binding_value="$5"
     local project="$6"
-    local file id marker digest invalid=false
+    local file id marker digest invalid=false list_fd find_pid
 
     [[ -n "$records" && -n "$markers" ]] || return 0
+    exec {list_fd}< <(
+        find "$records" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0
+    )
+    find_pid=$!
     while IFS= read -r -d '' file; do
         id="$(basename -- "$file" .json)"
         marker="$markers/$id.json"
@@ -720,11 +757,15 @@ prune_completed_mailbox() {
         digest="$(message_hash "$file")"
         PRUNE_HOLD_DIR="$(mktemp -d "$markers/.${id}.prune.XXXXXX")"
         PRUNE_HELD_MARKER="$PRUNE_HOLD_DIR/marker.json"
+        PRUNE_HELD_RECORD="$PRUNE_HOLD_DIR/record.json"
         PRUNE_ORIGINAL_MARKER="$marker"
         PRUNE_RECORD="$file"
+        PRUNE_EXPECTED_HASH="$digest"
+        PRUNE_DELETE_COMMITTED=false
         mv -T -- "$marker" "$PRUNE_HELD_MARKER"
-        if ! (validate_message_file "$file" "$id" &&
-              [[ "$(message_hash "$file")" == "$digest" ]] &&
+        mv -T -- "$file" "$PRUNE_HELD_RECORD"
+        if ! (validate_message_file "$PRUNE_HELD_RECORD" "$id" &&
+              [[ "$(message_hash "$PRUNE_HELD_RECORD")" == "$digest" ]] &&
               validate_marker_file "$PRUNE_HELD_MARKER" "$id" "$digest" \
                   "$timestamp_key") >/dev/null 2>&1; then
             echo "Collaboration record changed while pruning: $file" >&2
@@ -732,12 +773,17 @@ prune_completed_mailbox() {
             invalid=true
             continue
         fi
-        rm -f -- "$file"
-        rm -f -- "$PRUNE_HELD_MARKER"
+        PRUNE_DELETE_COMMITTED=true
+        rm -f -- "$PRUNE_HELD_RECORD" "$PRUNE_HELD_MARKER"
         rmdir -- "$PRUNE_HOLD_DIR"
         clear_prune_hold
         PRUNE_COUNT=$((PRUNE_COUNT + 1))
-    done < <(find "$records" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0)
+    done <&"$list_fd"
+    exec {list_fd}<&-
+    if ! wait "$find_pid"; then
+        echo "Cannot enumerate collaboration mailbox: $records" >&2
+        invalid=true
+    fi
     ! $invalid
 }
 
