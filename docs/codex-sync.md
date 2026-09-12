@@ -2,6 +2,18 @@
 
 `codex-push` and `codex-pull` safely hand off Codex state between development machines through a file-synchronized directory. They are host commands: run them outside the Codex container.
 
+For new project/lane registrations, prefer the lane-aware launcher wrappers:
+
+```bash
+run-codex PROJECT --lane LANE --push-state
+run-codex PROJECT --lane LANE --pull-state
+```
+
+They select that lane's isolated Codex home, lock, local baseline, running
+container labels, and `CODEX_SYNC_ROOT/projects/PROJECT/lanes/LANE` snapshot
+namespace. The standalone commands below retain their global-state defaults for
+backward compatibility.
+
 ## Why snapshots are necessary
 
 Do not synchronize the live `~/.codex` directory with Seafile, Dropbox, Syncthing, or similar software. Codex state can contain SQLite databases and WAL files. A synchronization client copying those files while Codex is running can produce an inconsistent state on another machine.

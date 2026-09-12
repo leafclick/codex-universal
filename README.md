@@ -1104,9 +1104,13 @@ Project configuration is machine-local:
 
 ```text
 ~/.config/run-codex/projects/
+~/.config/run-codex/lanes/
+~/.config/run-codex/state/
 ```
 
-Each project has a small configuration file.
+Each project has a default-lane configuration file. Additional lanes are
+stored below `lanes/<project>/<lane>`, and each newly registered lane receives
+its own Codex home and Maven cache below `state/<project>/<lane>/`.
 
 For example:
 
@@ -1120,6 +1124,9 @@ may contain:
 path=/home/leafclick/src/my-project
 profile=cuda
 clojure_mcp=auto
+lane=default
+state=isolated
+agent=codex
 ```
 
 Another project might contain:
@@ -1130,11 +1137,15 @@ profile=generic
 clojure_mcp=off
 ```
 
-The host path may differ between machines.
+The host path may differ between machines. Old three-field and one-line
+registrations remain valid as the `default` lane and continue to use the
+legacy global `~/.codex` state. New registrations use isolated state; merely
+launching an old registration does not migrate or rewrite it.
 Registrations created by older launcher versions without a `clojure_mcp` field
 are read as `auto`; merely launching them does not rewrite the file.
 
-The project name is the stable identity. Inside the container, the project is always mounted at:
+The project name plus lane is the runtime identity. An ordinary default
+checkout is mounted at:
 
 ```text
 /workspace/<project>
@@ -1151,6 +1162,10 @@ container on both:
 ```
 
 This gives Codex a consistent project path across development machines.
+An ordinary non-default lane uses `/workspace/<project>--<lane>`. A linked Git
+worktree instead keeps its exact host path inside the container, as explained
+below, because its Git pointer metadata contains absolute paths. IDEA mode also
+always keeps the exact host path so the user, agent, and IDE index agree.
 
 ## Initialize a project
 
@@ -1177,11 +1192,137 @@ omitted on a repeat, the existing setting is preserved. Changing the registered
 path, profile, or Clojure MCP behavior requires the corresponding explicit
 command below.
 
-Linked Git worktrees and checked-out submodules are not supported as project
-roots because their `.git` pointer refers to repository metadata outside the
-single project mount. Use a standalone full clone as the registered project;
-copying or exporting the working tree into a standalone repository is also a
-safe workaround when another clone is undesirable.
+Linked Git worktrees are supported as separate lanes. Checked-out submodules
+remain unsupported because their superficially similar `.git` pointer denotes
+a different repository rather than another worktree of the same repository.
+
+### Add an isolated experiment or reviewer lane
+
+Create the checkout on the host, then register that exact checkout. For
+example:
+
+```bash
+git -C ~/src/my-project worktree add \
+  -b experiment/reviewer ~/src/my-project-review HEAD
+run-codex --init --lane review my-project ~/src/my-project-review
+```
+
+The main and review lanes may now run concurrently:
+
+```bash
+run-codex my-project --new
+run-codex my-project --lane review --new \
+  --codex-option model=gpt-5.6-sol
+```
+
+They have different checkout mounts, Codex homes, Maven caches, session indexes,
+container names, labels, and runtime locks. They still share the worktree repository's
+common Git metadata. The review container receives that metadata as one
+additional bind mount so Git works, but it does not receive the other working
+tree. Git-metadata writes remain sandbox-protected and require human approval.
+This is strong working-file and agent-state isolation, not separate Git
+security principals: approved ref/config/object changes are visible to every
+worktree. Give lanes distinct branches and coordinate approved Git operations.
+Worktrees created through symlinked or lexically non-canonical checkout paths
+are rejected because their absolute pointer/back-pointer paths would not exist
+inside the exact-path container mount; recreate them using canonical paths.
+
+To copy only login and user configuration into a new lane, opt in during
+registration:
+
+```bash
+run-codex --init --lane review \
+  --bootstrap-codex-home ~/.codex \
+  my-project ~/src/my-project-review
+```
+
+The bootstrap copies regular top-level `auth.json`, `config.toml`,
+`requirements.toml`, and `*.config.toml` files with mode `0600`. It does not
+copy sessions, history, SQLite state, logs, memories, or caches, so the new
+agent starts with an independent context. Symlinks and a non-empty destination
+are rejected. Without bootstrapping, the lane performs its own first login.
+
+An immutable initial review can be started against any commit available in the
+reviewer's repository:
+
+```bash
+run-codex my-project --lane review --review owner-branch \
+  --codex-option model=gpt-5.6-sol \
+  --codex-option reasoning=high
+```
+
+The launcher resolves the revision to a commit, refuses a default lane or a
+reviewer checkout with tracked changes, starts a fresh context, and supplies a
+read-only review task for that exact commit. `agent=codex` is the first trusted
+container adapter. The registry and Docker labels keep the adapter identity
+separate from the lane and reviewer role so a future hardened image can add a
+Claude adapter without changing the handoff or human-approval boundary.
+
+Lane state uses a separate snapshot namespace and local baseline. After
+stopping the selected lane, publish or restore it independently:
+
+```bash
+run-codex my-project --lane review --push-state
+run-codex my-project --lane review --list-state
+run-codex my-project --lane review --pull-state
+run-codex my-project --lane review --force-state 7
+```
+
+The synchronized root defaults to `~/Seafile/CodexSync` and can be changed with
+`CODEX_SYNC_ROOT`. Data is stored below
+`projects/<project>/lanes/<lane>`; local baselines and handoff locks are scoped
+the same way. Register the same project and lane names on each machine even
+when their absolute checkout paths differ. A running different lane does not block this operation, while a
+running container for the selected lane does. These commands reuse the same
+transactional archive, checksum, marker, database validation, divergence, and
+rollback implementation as `codex-push` and `codex-pull`. Code commits and
+checkout-local onboarding inputs remain separate from the Codex-state snapshot.
+
+### Declare and provision checkout-local files
+
+A lane may require ignored configuration before normal work can start. Put a
+tracked manifest at `.codex-universal/onboarding.json`, or add machine-local
+requirements at either
+`~/.config/run-codex/onboarding/<project>.json` or
+`~/.config/run-codex/onboarding/<project>/<lane>.json`. The manifests are
+additive: a local overlay cannot remove a tracked requirement.
+
+```json
+{
+  "version": 1,
+  "files": [
+    {
+      "path": ".env",
+      "template": ".env.example",
+      "secret": true,
+      "mode": "0600",
+      "placeholders": ["CHANGE_ME"]
+    },
+    {
+      "path": "config/local.edn",
+      "secret": false,
+      "mode": "0644"
+    }
+  ]
+}
+```
+
+Check readiness, then provision missing files from another checkout or from
+declared templates:
+
+```bash
+run-codex my-project --lane review --check
+run-codex my-project --lane review --onboard --from ~/src/my-project
+```
+
+Provisioning never overwrites an existing file. Source files, templates,
+destinations, and parent directories must be regular non-symlink paths inside
+their declared checkout. Secret files may not grant group or other access.
+Checks report missing files, unsafe file types, permissions, and unresolved
+placeholder presence without printing file contents or placeholder values.
+Normal sessions refuse an incomplete manifest; `--setup` deliberately opens
+the same hardened lane so missing values can be completed. Setup commands are
+not run on the host from the manifest.
 
 The default Clojure MCP setting is `auto`. It can be selected explicitly during
 initialization:
@@ -1403,9 +1544,11 @@ run-codex my-project --new
 ```
 
 Use `--new` for this first launch because there is no earlier session to resume.
-The launcher creates host `~/.codex` with restrictive permissions, mounts it
-under the container user's ephemeral home, runs with the invoking user's
-numeric UID/GID, and then starts Codex's interactive login.
+For a new registration, the launcher creates a private lane Codex home below
+`~/.config/run-codex/state/<project>/<lane>/codex-home`, mounts it at
+`~/.codex` inside the container, runs with the invoking user's numeric UID/GID,
+and then starts Codex's interactive login. Legacy registrations continue to
+mount host `~/.codex` until explicitly recreated or migrated.
 
 For a headless or container installation, the recommended ChatGPT login path is:
 

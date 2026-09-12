@@ -428,6 +428,11 @@ fi
 grep -Fq 'Wait for your sync provider to report synchronized' \
     "$ROOT/bin/codex-push" ||
     fail "codex-push lacks provider-neutral synchronization guidance"
+for sync_command in "$ROOT/bin/codex-push" "$ROOT/bin/codex-pull"; do
+    grep -Fq 'label=codex-universal.project=$CONTAINER_PROJECT' "$sync_command" &&
+        grep -Fq 'label=codex-universal.lane=$CONTAINER_LANE' "$sync_command" ||
+        fail "$(basename "$sync_command") lacks lane-scoped running-container checks"
+done
 grep -Fq 'Snapshot listing is intentionally lock-free' \
     "$ROOT/docs/codex-sync.md" ||
     fail "snapshot documentation omits the lock-free listing contract"
@@ -1004,6 +1009,7 @@ launcher_env=(
     "XDG_CONFIG_HOME=$TEST_ROOT/launcher-config"
     "CODEX_IMAGE_SLUG=example/codex-universal"
     "CODEX_IMAGE_TAG=test-version"
+    "CODEX_SYNC_ROOT=$TEST_ROOT/lane-sync"
     "CODEX_GIT_USER_NAME=host-smoke"
     "CODEX_GIT_USER_EMAIL=host-smoke.invalid"
     "CODEX_TEST_SKIP_IDEA_MCP_RELAY=1"
@@ -1024,6 +1030,7 @@ for documented_env in \
     CODEX_CONTAINER_HOME \
     CODEX_WORKSPACE_ROOT \
     CODEX_LOCK_FILE \
+    CODEX_SYNC_ROOT \
     CODEX_UNIVERSAL_WORKFLOW \
     CODEX_GIT_USER_NAME \
     CODEX_GIT_USER_EMAIL; do
@@ -1031,17 +1038,59 @@ for documented_env in \
 done
 assert_contains "$launcher_help" "reasoning=minimal|low|medium|high|xhigh"
 assert_contains "$launcher_help" "image=PROJECT_PATH"
-assert_contains "$launcher_help" "run-codex [PROJECT] --sessions"
-assert_contains "$launcher_help" "run-codex [PROJECT] --resume QUERY"
+assert_contains "$launcher_help" "run-codex [PROJECT] [--lane LANE] --sessions"
+assert_contains "$launcher_help" "run-codex [PROJECT] [--lane LANE] --resume QUERY"
 assert_contains "$launcher_help" "--image-version VERSION"
 
-if "${launcher_env[@]}" "$ROOT/bin/run-codex" \
-    --init linked-project "$TEST_ROOT/repo-linked" \
-    >"$TEST_ROOT/linked-worktree.out" 2>&1; then
-    fail "launcher registered a linked Git worktree"
+linked_init_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+        --init linked-project "$TEST_ROOT/repo-linked"
+)"
+assert_contains "$linked_init_output" "Git layout:  linked-worktree"
+linked_config="$TEST_ROOT/launcher-config/run-codex/projects/linked-project"
+grep -Fxq "path=$TEST_ROOT/repo-linked" "$linked_config" ||
+    fail "linked worktree registration did not retain its exact checkout path"
+
+linked_launch_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" linked-project --new
+)"
+assert_contains "$linked_launch_output" \
+    "$TEST_ROOT/repo-linked:$TEST_ROOT/repo-linked"
+assert_contains "$linked_launch_output" \
+    "$TEST_ROOT/repo/.git:$TEST_ROOT/repo/.git"
+
+mkdir -p "$TEST_ROOT/bootstrap-repo" "$TEST_ROOT/bootstrap-codex-home"
+git -C "$TEST_ROOT/bootstrap-repo" init -q
+printf '%s\n' '{"token":"fixture"}' > "$TEST_ROOT/bootstrap-codex-home/auth.json"
+printf '%s\n' 'model = "fixture"' > "$TEST_ROOT/bootstrap-codex-home/profile.config.toml"
+printf '%s\n' 'must-not-copy' > "$TEST_ROOT/bootstrap-codex-home/history.jsonl"
+ln -s profile.config.toml "$TEST_ROOT/bootstrap-codex-home/config.toml"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" --init \
+    --bootstrap-codex-home "$TEST_ROOT/bootstrap-codex-home" \
+    bootstrap-project "$TEST_ROOT/bootstrap-repo" \
+    >"$TEST_ROOT/bootstrap-symlink.out" 2>&1; then
+    fail "Codex-home bootstrap accepted a symlink input"
 fi
-assert_contains "$(<"$TEST_ROOT/linked-worktree.out")" \
-    "Git worktrees/submodules with a .git pointer file are not supported yet"
+grep -Fq 'must be a regular file, not a symlink' \
+    "$TEST_ROOT/bootstrap-symlink.out" ||
+    fail "Codex-home bootstrap symlink rejection was not useful"
+test ! -e "$TEST_ROOT/launcher-config/run-codex/projects/bootstrap-project" ||
+    fail "failed Codex-home bootstrap left a registered project"
+rm "$TEST_ROOT/bootstrap-codex-home/config.toml"
+printf '%s\n' 'approval_policy = "on-request"' \
+    > "$TEST_ROOT/bootstrap-codex-home/config.toml"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" --init \
+    --bootstrap-codex-home "$TEST_ROOT/bootstrap-codex-home" \
+    bootstrap-project "$TEST_ROOT/bootstrap-repo" >/dev/null
+bootstrap_destination="$TEST_ROOT/launcher-config/run-codex/state/bootstrap-project/default/codex-home"
+test -f "$bootstrap_destination/auth.json" &&
+    test -f "$bootstrap_destination/config.toml" &&
+    test -f "$bootstrap_destination/profile.config.toml" ||
+    fail "Codex-home bootstrap omitted an allowlisted file"
+test ! -e "$bootstrap_destination/history.jsonl" ||
+    fail "Codex-home bootstrap copied session history"
+[[ "$(stat -c '%a' "$bootstrap_destination/auth.json")" == 600 ]] ||
+    fail "Codex-home bootstrap did not make authentication state private"
 
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     --init --profile generic smoke-project "$TEST_ROOT/repo" >/dev/null
@@ -1049,6 +1098,8 @@ assert_contains "$(<"$TEST_ROOT/linked-worktree.out")" \
 project_config="$TEST_ROOT/launcher-config/run-codex/projects/smoke-project"
 grep -Fxq 'clojure_mcp=auto' "$project_config" ||
     fail "new project config does not default Clojure MCP to auto"
+grep -Fxq 'state=isolated' "$project_config" ||
+    fail "new default project config does not select isolated Codex state"
 config_before="$(<"$project_config")"
 init_again_output="$(
     "${launcher_env[@]}" "$ROOT/bin/run-codex" \
@@ -1058,6 +1109,68 @@ assert_contains "$init_again_output" "already initialized"
 [[ "$(<"$project_config")" == "$config_before" ]] ||
     fail "repeated project initialization changed its configuration"
 
+git -C "$TEST_ROOT/repo" worktree add -q -b smoke-review \
+    "$TEST_ROOT/repo-review"
+review_init_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+        --init --lane review smoke-project "$TEST_ROOT/repo-review"
+)"
+assert_contains "$review_init_output" "Initialized project 'smoke-project' lane 'review'"
+review_config="$TEST_ROOT/launcher-config/run-codex/lanes/smoke-project/review"
+grep -Fxq "path=$TEST_ROOT/repo-review" "$review_config" ||
+    fail "lane registration did not retain its checkout path"
+grep -Fxq 'state=isolated' "$review_config" ||
+    fail "non-default lane did not select isolated Codex state"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set profile cuda >/dev/null
+grep -Fxq 'profile=cuda' "$review_config" ||
+    fail "lane-specific profile setter did not update the selected lane"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" \
+    smoke-project --lane review --set profile generic >/dev/null
+mkdir -p "$TEST_ROOT/unrelated-lane-repo"
+git -C "$TEST_ROOT/unrelated-lane-repo" init -q
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" --init --lane unrelated \
+    smoke-project "$TEST_ROOT/unrelated-lane-repo" \
+    >"$TEST_ROOT/unrelated-lane.out" 2>&1; then
+    fail "launcher accepted an unrelated repository as a project lane"
+fi
+grep -Fq 'must be a linked worktree of project' \
+    "$TEST_ROOT/unrelated-lane.out" ||
+    fail "unrelated lane rejection was not useful"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" --rebind \
+    smoke-project "$TEST_ROOT/unrelated-lane-repo" \
+    >"$TEST_ROOT/unrelated-default-rebind.out" 2>&1; then
+    fail "launcher rebound a default lane away from its registered worktrees"
+fi
+grep -Fq 'Cannot rebind the default lane away from registered lane' \
+    "$TEST_ROOT/unrelated-default-rebind.out" ||
+    fail "inconsistent default-lane rebind rejection was not useful"
+
+lane_list_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --list)"
+assert_contains "$lane_list_output" "smoke-project"
+assert_contains "$lane_list_output" "review"
+assert_contains "$lane_list_output" "$TEST_ROOT/repo-review"
+
+review_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+        --lane review --review HEAD --codex-option model=gpt-5.6-sol
+)"
+assert_contains "$review_output" "Starting codex reviewer for 'smoke-project' lane 'review'"
+assert_contains "$review_output" "--model gpt-5.6-sol"
+assert_contains "$review_output" "Review immutable Git commit"
+assert_contains "$review_output" "codex-universal.project=smoke-project"
+assert_contains "$review_output" "codex-universal.lane=review"
+assert_contains "$review_output" "$TEST_ROOT/repo-review:$TEST_ROOT/repo-review"
+assert_contains "$review_output" "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/codex-home:/home/codex/.codex"
+assert_contains "$review_output" "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/m2:/home/codex/.m2"
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --review HEAD >"$TEST_ROOT/default-review.out" 2>&1; then
+    fail "reviewer launch accepted the default lane"
+fi
+assert_contains "$(<"$TEST_ROOT/default-review.out")" \
+    "--review requires a non-default isolated lane selected with --lane"
+
 list_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --list)"
 assert_contains "$list_output" "smoke-project"
 assert_contains "$list_output" "generic"
@@ -1065,8 +1178,29 @@ assert_contains "$list_output" "CLOJURE-MCP"
 assert_contains "$list_output" "auto"
 assert_contains "$list_output" "OK"
 
-mkdir -p -- "$TEST_ROOT/launcher-home/.codex"
-session_db="$TEST_ROOT/launcher-home/.codex/state_5.sqlite"
+isolated_codex_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/codex-home"
+isolated_m2_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/m2"
+mkdir -p -- "$isolated_codex_home"
+printf '%s\n' default-state > "$isolated_codex_home/lane-marker"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --push-state >/dev/null
+compgen -G "$TEST_ROOT/lane-sync/projects/smoke-project/lanes/default/codex-g*.tar.zst.state" >/dev/null ||
+    fail "default lane state push did not use its independent snapshot namespace"
+printf '%s\n' review-state > \
+    "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/codex-home/lane-marker"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --lane review --push-state >/dev/null
+compgen -G "$TEST_ROOT/lane-sync/projects/smoke-project/lanes/review/codex-g*.tar.zst.state" >/dev/null ||
+    fail "review lane state push did not use its independent snapshot namespace"
+lane_state_list="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" \
+        smoke-project --lane review --list-state
+)"
+assert_contains "$lane_state_list" "GENERATION"
+assert_contains "$lane_state_list" "OK"
+test -f "$TEST_ROOT/launcher-home/.local/state/run-codex/projects/smoke-project/lanes/default/codex-handoff/base.state" ||
+    fail "default lane did not receive an independent local sync baseline"
+test -f "$TEST_ROOT/launcher-home/.local/state/run-codex/projects/smoke-project/lanes/review/codex-handoff/base.state" ||
+    fail "review lane did not receive an independent local sync baseline"
+session_db="$isolated_codex_home/state_5.sqlite"
 sqlite3 "$session_db" <<'SQL'
 CREATE TABLE threads (
     id TEXT PRIMARY KEY,
@@ -1104,7 +1238,7 @@ fi
 assert_contains "$(<"$TEST_ROOT/session-image-version.out")" \
     "--sessions cannot be combined with launch options"
 
-session_handoff_lock="$TEST_ROOT/launcher-home/.cache/codex-handoff.lock"
+session_handoff_lock="$TEST_ROOT/launcher-config/run-codex/locks/smoke-project/default.handoff.lock"
 session_lock_stdout="$TEST_ROOT/session-lock.out"
 session_lock_stderr="$TEST_ROOT/session-lock.err"
 mkdir -p -- "$(dirname "$session_handoff_lock")"
@@ -1142,7 +1276,7 @@ flock -u 7
 exec 7>&-
 wait "$session_lock_pid" || fail "session listing failed after handoff lock release"
 assert_contains "$(<"$session_lock_stdout")" 'Created while handoff locked'
-pass "session reads wait for the shared state handoff lock"
+pass "session reads wait for the lane state handoff lock"
 activity "launcher doctor installation"
 
 ambiguous_docker_log="$TEST_ROOT/ambiguous-sessions-docker-argv.log"
@@ -1178,7 +1312,7 @@ unique_output="$(
         "$ROOT/bin/run-codex" smoke-project --resume vErIfIcAtIoN
 )"
 assert_contains "$unique_output" \
-    "Resuming Codex session 'Release verification' for 'smoke-project'"
+    "Resuming codex session 'Release verification' for 'smoke-project' lane 'default'"
 assert_contains "$unique_output" "resume $unique_session_id"
 assert_not_contains "$unique_output" 'resume --last'
 grep -Fxq -- 'resume' "$unique_docker_log" ||
@@ -1193,7 +1327,7 @@ exact_uuid_output="$(
         --resume 11111111-1111-4111-8111-111111111111
 )"
 assert_contains "$exact_uuid_output" \
-    "Resuming Codex session 'GPU tuning baseline' for 'smoke-project'"
+    "Resuming codex session 'GPU tuning baseline' for 'smoke-project' lane 'default'"
 grep -Fxq -- '11111111-1111-4111-8111-111111111111' \
     "$exact_uuid_docker_log" ||
     fail "exact session UUID was not passed to Codex"
@@ -1346,6 +1480,7 @@ for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "--security-opt apparmor=codex-universal"
     assert_contains "$output" "--security-opt seccomp=$ROOT/security/seccomp/codex-bwrap.json"
     assert_contains "$output" "--user $(id -u):$(id -g)"
+    assert_contains "$output" "CODEX_HOME=/home/codex/.codex"
     assert_contains "$output" "--sandbox workspace-write"
     assert_contains "$output" "--ask-for-approval on-request"
     assert_contains "$output" 'approvals_reviewer="user"'
@@ -1360,6 +1495,8 @@ for output in "$new_output" "$resume_output"; do
     assert_not_contains "$output" '"run_tests"'
     assert_contains "$output" 'mcp_servers.clojure_lsp.default_tools_approval_mode="writes"'
     assert_contains "$output" "Clojure MCP: enabled (auto-detected Clojure project)"
+    assert_contains "$output" "$isolated_codex_home:/home/codex/.codex"
+    assert_contains "$output" "$isolated_m2_home:/home/codex/.m2"
     assert_contains "$output" "$TEST_ROOT/repo:/workspace/smoke-project"
     assert_contains "$output" "example/codex-universal-generic:test-version"
 done
@@ -1563,6 +1700,26 @@ grep -Fxq -- 'example/codex-universal-cuda:test-version' "$idea_dispatch_argv" &
     grep -Fxq -- "$TEST_ROOT/non-clojure-repo:$TEST_ROOT/non-clojure-repo" \
         "$idea_dispatch_argv" ||
     fail "IDEA dispatcher did not launch the registered project profile and mount"
+
+review_idea_dispatch_argv="$TEST_ROOT/review-idea-dispatch.argv"
+review_idea_dispatch_request="$TEST_ROOT/review-idea-dispatch-request.json"
+review_idea_session_request="$(
+    jq -cn --arg cwd "$TEST_ROOT/repo-review" \
+        '{jsonrpc:"2.0",id:4,method:"session/new",params:{cwd:$cwd,mcpServers:[]}}'
+)"
+printf '%s\n' "$idea_initialize_request" "$review_idea_session_request" |
+    "${launcher_env[@]}" \
+    "CODEX_TEST_DOCKER_ACP=1" \
+    "CODEX_TEST_DOCKER_ARGV_LOG=$review_idea_dispatch_argv" \
+    "CODEX_TEST_DOCKER_ACP_REQUEST_LOG=$review_idea_dispatch_request" \
+    "$ROOT/bin/run-codex" --idea >/dev/null
+grep -Fxq -- 'codex-universal.project=smoke-project' "$review_idea_dispatch_argv" &&
+    grep -Fxq -- 'codex-universal.lane=review' "$review_idea_dispatch_argv" &&
+    grep -Fxq -- "$TEST_ROOT/repo-review:$TEST_ROOT/repo-review" \
+        "$review_idea_dispatch_argv" &&
+    grep -Fxq -- "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/codex-home:/home/codex/.codex" \
+        "$review_idea_dispatch_argv" ||
+    fail "IDEA dispatcher did not select the exact registered review lane"
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     plain-project --set profile generic >/dev/null
 
@@ -1612,6 +1769,79 @@ plain_env_output="$(
 assert_contains "$plain_env_output" "mcp_servers.clojure_lsp.enabled=true"
 assert_contains "$plain_env_output" "Clojure MCP: enabled (environment override: on)"
 
+# Project onboarding declares checkout-local files that are intentionally not
+# committed. Templates may seed ordinary configuration, while secret files
+# can be copied from a separately provisioned checkout and must remain private.
+onboarding_manifest="$TEST_ROOT/repo/.codex-universal/onboarding.json"
+mkdir -p -- "$(dirname -- "$onboarding_manifest")" "$TEST_ROOT/repo/config"
+printf '%s\n' '{"version":1,"files":[{"path":".git/config","template":"config/local.conf.template"}]}' > "$onboarding_manifest"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --onboard \
+    >"$TEST_ROOT/onboard-protected.out" 2>&1; then
+    fail "onboarding accepted a protected Git metadata destination"
+fi
+grep -Fq "Unsafe onboarding path '.git/config'" \
+    "$TEST_ROOT/onboard-protected.out" ||
+    fail "protected onboarding destination rejection was not useful"
+printf '%s\n' '{"version":1,"files":[{"path":"config/local.conf","template":"config/local.conf.template","placeholders":["CHANGE_ME"]},{"path":"secrets/token","secret":true,"mode":"0600"}]}' > "$onboarding_manifest"
+printf '%s\n' 'endpoint=https://example.invalid' 'token=CHANGE_ME' \
+    > "$TEST_ROOT/repo/config/local.conf.template"
+
+onboarding_check_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --check || true
+)"
+assert_contains "$onboarding_check_output" "MISSING     config/local.conf"
+assert_contains "$onboarding_check_output" "NEEDS-SETUP project 'smoke-project' lane 'default'"
+
+set +e
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --onboard \
+    >"$TEST_ROOT/onboard-template.out" 2>&1
+onboard_template_status=$?
+set -e
+(( onboard_template_status != 0 )) ||
+    fail "template-only onboarding unexpectedly reported readiness"
+assert_contains "$(<"$TEST_ROOT/onboard-template.out")" \
+    "Provisioned config/local.conf from template"
+grep -Fxq 'token=CHANGE_ME' "$TEST_ROOT/repo/config/local.conf" ||
+    fail "onboarding did not provision the declared template"
+assert_contains "$(<"$TEST_ROOT/onboard-template.out")" "MISSING     secrets/token"
+
+mkdir -p -- "$TEST_ROOT/onboarding-source/secrets"
+printf '%s\n' 'review-secret' > "$TEST_ROOT/onboarding-source/secrets/token"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --onboard \
+    --from "$TEST_ROOT/onboarding-source" \
+    >"$TEST_ROOT/onboard-source.out" 2>&1 || true
+assert_contains "$(<"$TEST_ROOT/onboard-source.out")" \
+    "Provisioned secrets/token from source-checkout"
+[[ "$(stat -c '%a' "$TEST_ROOT/repo/secrets/token")" == 600 ]] ||
+    fail "onboarding did not apply secret file mode 0600"
+
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new \
+    >"$TEST_ROOT/onboarding-readiness.out" 2>&1; then
+    fail "normal launch ignored unresolved onboarding input"
+fi
+assert_contains "$(<"$TEST_ROOT/onboarding-readiness.out")" \
+    "NEEDS-INPUT config/local.conf"
+setup_session_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --setup
+)"
+assert_contains "$setup_session_output" \
+    "Starting new codex session for 'smoke-project' lane 'default'"
+printf '%s\n' 'endpoint=https://example.invalid' 'token=filled' \
+    > "$TEST_ROOT/repo/config/local.conf"
+chmod 0644 "$TEST_ROOT/repo/secrets/token"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --check \
+    >"$TEST_ROOT/onboarding-permissions.out" 2>&1; then
+    fail "onboarding check accepted a world-readable secret"
+fi
+assert_contains "$(<"$TEST_ROOT/onboarding-permissions.out")" \
+    "PERMISSIONS secrets/token"
+chmod 0600 "$TEST_ROOT/repo/secrets/token"
+onboarding_ready_output="$(
+    "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --check
+)"
+assert_contains "$onboarding_ready_output" "READY       project 'smoke-project' lane 'default'"
+pass "project onboarding manifest and readiness gate"
+
 # Registrations written by older launchers have no clojure_mcp field and must
 # acquire the new auto behavior without being rewritten merely by launching.
 mkdir -p "$TEST_ROOT/legacy-repo"
@@ -1623,6 +1853,8 @@ legacy_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" legacy-project --new
 assert_not_contains "$legacy_output" "mcp_servers.clojure_lsp"
 assert_contains "$legacy_output" \
     "Clojure MCP: disabled (no Clojure project signals detected)"
+assert_contains "$legacy_output" \
+    "$TEST_ROOT/launcher-home/.codex:/home/codex/.codex"
 [[ "$(<"$legacy_config")" == "$legacy_before" ]] ||
     fail "launching rewrote a legacy project registration"
 

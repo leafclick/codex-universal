@@ -7,6 +7,8 @@ SYNC_DIR="${CODEX_SYNC_DIR:-$HOME/Seafile/CodexSync}"
 LOCK_FILE="${CODEX_LOCK_FILE:-$HOME/.cache/codex-handoff.lock}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/codex-handoff"
 BASE_FILE="$STATE_DIR/base.state"
+CONTAINER_PROJECT="${CODEX_CONTAINER_PROJECT:-}"
+CONTAINER_LANE="${CODEX_CONTAINER_LANE:-}"
 
 usage() {
     cat <<'USAGE'
@@ -366,8 +368,18 @@ fi
 
 running_codex_containers() {
     command -v docker >/dev/null 2>&1 || return 0
-    docker ps --format '{{.Names}}' 2>/dev/null |
-        grep '^codex-' || true
+    if [[ -n "$CONTAINER_PROJECT" || -n "$CONTAINER_LANE" ]]; then
+        [[ "$CONTAINER_PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ &&
+           "$CONTAINER_LANE" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
+            die "CODEX_CONTAINER_PROJECT and CODEX_CONTAINER_LANE must both be safe non-empty identifiers"
+        docker ps \
+            --filter "label=codex-universal.project=$CONTAINER_PROJECT" \
+            --filter "label=codex-universal.lane=$CONTAINER_LANE" \
+            --format '{{.Names}}' 2>/dev/null || true
+    else
+        docker ps --format '{{.Names}}' 2>/dev/null |
+            grep '^codex-' || true
+    fi
 }
 
 report_running_codex_containers() {
