@@ -811,7 +811,16 @@ grep -Fq '8>&- 9>&- &' "$ROOT/bin/run-codex" ||
     fail "IDEA relay inherits launcher lock descriptors"
 pass "shell syntax and static security invariants"
 
-if command -v python3 >/dev/null 2>&1; then
+if command -v python3 >/dev/null 2>&1 &&
+    command -v timeout >/dev/null 2>&1 &&
+    command -v bwrap >/dev/null 2>&1 &&
+    timeout --kill-after=1s 3s bwrap \
+        --unshare-user \
+        --unshare-pid \
+        --die-with-parent \
+        --ro-bind / / \
+        --dev /dev \
+        -- /bin/true >/dev/null 2>&1; then
     relay_failure_fixture="$TEST_ROOT/acp-relay-delayed-failure"
     relay_failure_bin="$relay_failure_fixture/bin"
     relay_failure_socket="$relay_failure_fixture/idea.sock"
@@ -863,7 +872,7 @@ PY
         fail "ACP started after its IntelliJ relay failed"
     pass "delayed IntelliJ relay startup failure"
 else
-    printf 'skip - delayed IntelliJ relay startup failure (python3 or Bubblewrap unavailable on host)\n'
+    printf 'skip - delayed IntelliJ relay startup failure (python3, timeout, or usable Bubblewrap unavailable on host)\n'
 fi
 
 # The launcher smoke test uses echo as a Docker frontend. This verifies the
