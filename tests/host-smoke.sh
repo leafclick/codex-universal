@@ -2291,6 +2291,9 @@ cli_rollback_path="$cli_config/run-codex/worktrees/cli-project/rollback"
 cli_rollback_config="$cli_config/run-codex/lanes/cli-project/rollback"
 cli_rollback_state="$cli_config/run-codex/state/cli-project/rollback"
 cli_rollback_branch='codex/cli-project/rollback'
+cli_default_codex_home="$cli_config/run-codex/state/cli-project/default/codex-home"
+mkdir -p "$cli_default_codex_home"
+printf '%s\n' bootstrap-auth > "$cli_default_codex_home/auth.json"
 cli_rollback_bin="$cli_root/rollback-bin"
 mkdir -p "$cli_rollback_bin"
 printf '%s\n' \
@@ -2319,6 +2322,7 @@ cli_run cli-project --lane rollback --create "$cli_base_commit" >/dev/null 2>&1
 [[ -e "$cli_rollback_path" && -f "$cli_rollback_config" &&
    "$(git -C "$cli_rollback_path" rev-parse HEAD)" == "$cli_base_commit" &&
    -d "$cli_rollback_state/codex-home" &&
+   "$(<"$cli_rollback_state/codex-home/auth.json")" == bootstrap-auth &&
    ! -e "$cli_rollback_state/.run-codex-create-owner" ]] ||
     fail "managed lane creation did not succeed after rollback retry"
 
@@ -2331,12 +2335,20 @@ if cli_run_rollback cli-project --lane rollback-preserve --create "$cli_base_com
     fail "managed lane creation ignored post-worktree failure with existing state"
 fi
 [[ "$(<"$cli_preserve_state/marker")" == "$cli_preserve_marker_before" &&
+   ! -e "$cli_preserve_state/codex-home/auth.json" &&
    ! -e "$cli_config/run-codex/worktrees/cli-project/rollback-preserve" &&
    ! -e "$cli_config/run-codex/lanes/cli-project/rollback-preserve" ]] ||
     fail "failed managed lane creation changed pre-existing lane state"
 git -C "$cli_repo" show-ref --verify --quiet \
     refs/heads/codex/cli-project/rollback-preserve &&
     fail "failed managed lane creation with existing state left its branch"
+cli_run cli-project --lane rollback-preserve --create "$cli_base_commit" \
+    >/dev/null 2>&1
+[[ "$(<"$cli_preserve_state/marker")" == "$cli_preserve_marker_before" &&
+   "$(<"$cli_preserve_state/codex-home/auth.json")" == bootstrap-auth &&
+   -e "$cli_config/run-codex/worktrees/cli-project/rollback-preserve" &&
+   -f "$cli_config/run-codex/lanes/cli-project/rollback-preserve" ]] ||
+    fail "successful retry did not seed preserved lane state"
 printf '%s\n' feature > "$cli_managed_path/feature"
 git -C "$cli_managed_path" add feature
 git -C "$cli_managed_path" -c user.name=host-smoke \

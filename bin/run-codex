@@ -1195,6 +1195,7 @@ create_managed_lane() {
     local lane="$2"
     local revision="$3"
     local default_file lane_file default_root commit profile clojure_mcp agent
+    local default_state_mode
     local managed_parent managed_path branch lock_file lock_fd
 
     validate_project_name "$name"
@@ -1227,6 +1228,7 @@ create_managed_lane() {
     profile="$CONFIG_PROFILE"
     clojure_mcp="$CONFIG_CLOJURE_MCP"
     agent="$CONFIG_AGENT"
+    default_state_mode="$CONFIG_STATE_MODE"
     managed_path="$(managed_lane_path "$name" "$lane")" ||
         die "Cannot resolve managed lane path"
     managed_parent="$(dirname -- "$managed_path")"
@@ -1270,6 +1272,15 @@ create_managed_lane() {
         local state_owner=""
         local state_owner_file=""
         local state_quarantine=""
+        local state_project_path=""
+        local state_stage_path=""
+        local state_stage_created=false
+        local lane_codex_home=""
+        local codex_home_created=false
+        local m2_created=false
+        local seed_source seed_destination seed_name seed_index
+        local seeded_sources=()
+        local seeded_destinations=()
 
         rollback_managed_lane_create() {
             local status=$?
@@ -1293,6 +1304,23 @@ create_managed_lane() {
                     git -C "$default_root" update-ref -d \
                         "refs/heads/$branch" "$commit" >/dev/null 2>&1 || true
                 fi
+                if ! $state_created; then
+                    for ((seed_index = 0;
+                          seed_index < ${#seeded_destinations[@]};
+                          seed_index++)); do
+                        seed_destination="${seeded_destinations[$seed_index]}"
+                        seed_source="${seeded_sources[$seed_index]}"
+                        if [[ -f "$seed_destination" && ! -L "$seed_destination" &&
+                              -f "$seed_source" && ! -L "$seed_source" &&
+                              "$seed_destination" -ef "$seed_source" ]]; then
+                            rm -f -- "$seed_destination"
+                        fi
+                    done
+                    $codex_home_created && rmdir -- "$lane_state_path/codex-home" \
+                        2>/dev/null || true
+                    $m2_created && rmdir -- "$lane_state_path/m2" \
+                        2>/dev/null || true
+                fi
                 if $state_created; then
                     if [[ -d "$lane_state_path" && ! -L "$lane_state_path" &&
                           -f "$state_owner_file" && ! -L "$state_owner_file" &&
@@ -1314,9 +1342,19 @@ create_managed_lane() {
                         echo "WARNING: managed lane state ownership changed; preserving '$lane_state_path' for inspection." >&2
                     fi
                 fi
+                if $state_stage_created; then
+                    if [[ -d "$state_stage_path" && ! -L "$state_stage_path" &&
+                          "$state_stage_path" == "$state_project_path/"* ]]; then
+                        rm -rf -- "$state_stage_path"
+                    else
+                        echo "WARNING: bootstrap staging ownership changed; preserving '$state_stage_path' for inspection." >&2
+                    fi
+                fi
                 if [[ -e "$temp_path" || -L "$temp_path" ||
                       -e "$managed_path" || -L "$managed_path" ||
                       -e "$lane_file" || -L "$lane_file" ||
+                      ( "$state_stage_created" == true &&
+                        ( -e "$state_stage_path" || -L "$state_stage_path" ) ) ||
                       ( "$state_created" == true &&
                         ( -e "$lane_state_path" || -e "$state_quarantine" ) ) ]] ||
                    git -C "$default_root" show-ref --verify --quiet \
@@ -1342,6 +1380,16 @@ create_managed_lane() {
         mkdir -p -- "$LANE_STATE_ROOT"
         state_root="$(realpath -e -- "$LANE_STATE_ROOT")" ||
             die "Cannot resolve lane state root: $LANE_STATE_ROOT"
+        mkdir -p -- "$state_root/$name"
+        state_project_path="$(realpath -e -- "$state_root/$name")" ||
+            die "Cannot resolve project lane state root"
+        [[ "$state_project_path" == "$state_root/"* ]] ||
+            die "Project lane state root escapes its managed root: $state_project_path"
+        state_stage_path="$(mktemp -d \
+            "$state_project_path/.${lane}.bootstrap.XXXXXX")"
+        state_stage_created=true
+        stage_managed_lane_codex_home "$name" "$lane" \
+            "$default_state_mode" "$state_stage_path"
         lane_state_path="$(realpath -m -- "$state_root/$name/$lane")" ||
             die "Cannot resolve managed lane state path"
         [[ "$lane_state_path" == "$state_root/"* ]] ||
@@ -1355,8 +1403,30 @@ create_managed_lane() {
             state_owner_file="$lane_state_path/.run-codex-create-owner"
             printf '%s\n' "$state_owner" > "$state_owner_file"
             state_created=true
-            seed_new_managed_lane_codex_home "$name" "$lane"
         fi
+        [[ -e "$lane_state_path/codex-home" ||
+           -L "$lane_state_path/codex-home" ]] || codex_home_created=true
+        [[ -e "$lane_state_path/m2" || -L "$lane_state_path/m2" ]] ||
+            m2_created=true
+        resolve_lane_codex_home "$name" "$lane" isolated
+        lane_codex_home="$CODEX_HOST_HOME"
+        need ln
+        while IFS= read -r -d '' seed_source; do
+            seed_name="$(basename -- "$seed_source")"
+            seed_destination="$lane_codex_home/$seed_name"
+            if [[ -e "$seed_destination" || -L "$seed_destination" ]]; then
+                [[ -f "$seed_destination" && ! -L "$seed_destination" ]] ||
+                    die "Codex bootstrap destination must be a regular file, not a symlink: $seed_destination"
+                continue
+            fi
+            if ln -- "$seed_source" "$seed_destination"; then
+                seeded_sources+=("$seed_source")
+                seeded_destinations+=("$seed_destination")
+            elif [[ ! -f "$seed_destination" || -L "$seed_destination" ]]; then
+                die "Cannot publish Codex bootstrap file: $seed_destination"
+            fi
+        done < <(find "$state_stage_path/codex-home" -mindepth 1 -maxdepth 1 \
+            -type f -print0)
         write_project_config "$name" "$lane" "$managed_path" "$profile" \
             "$clojure_mcp" isolated "$agent"
         registration_created=true
@@ -1368,6 +1438,9 @@ create_managed_lane() {
         trap - EXIT HUP INT TERM
         if $state_created && ! rm -f -- "$state_owner_file"; then
             echo "WARNING: retained managed lane creation marker: $state_owner_file" >&2
+        fi
+        if $state_stage_created && ! rm -rf -- "$state_stage_path"; then
+            echo "WARNING: retained managed lane bootstrap staging directory: $state_stage_path" >&2
         fi
         echo "Created project '$name' lane '$lane':"
         echo "  path:   $managed_path"
@@ -2329,6 +2402,24 @@ bootstrap_lane_codex_home() {
 
     resolve_lane_codex_home "$project" "$lane" isolated
     copy_codex_bootstrap_files "$requested_source" "$CODEX_HOST_HOME" true
+}
+
+stage_managed_lane_codex_home() {
+    local project="$1"
+    local lane="$2"
+    local default_state_mode="$3"
+    local stage_root="$4"
+    local default_codex_home
+
+    validate_project_name "$project"
+    validate_lane_name "$lane"
+    [[ -d "$stage_root" && ! -L "$stage_root" ]] ||
+        die "Managed lane bootstrap staging path is unsafe: $stage_root"
+    resolve_lane_codex_home "$project" default "$default_state_mode"
+    default_codex_home="$CODEX_HOST_HOME"
+    mkdir -p -- "$stage_root/codex-home" "$stage_root/m2"
+    copy_codex_bootstrap_files "$default_codex_home" \
+        "$stage_root/codex-home" false
 }
 
 seed_managed_lane_codex_home() {
