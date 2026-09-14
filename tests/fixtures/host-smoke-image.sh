@@ -64,11 +64,13 @@ case "$check_phase" in
         command -v python3 >/dev/null
         command -v codex >/dev/null
         command -v node >/dev/null
+        command -v npm >/dev/null
+        [[ "$(npm --version)" == 12.0.2 ]]
         command -v java >/dev/null
         command -v codex-acp >/dev/null
         command -v codex-acp-entrypoint >/dev/null
         command -v agent-lsp >/dev/null
-        [[ "$(agent-lsp --version)" == 0.19.2 ]]
+        [[ "$(agent-lsp --version)" == 0.19.1 ]]
         command -v codex-clojure-lsp-mcp >/dev/null
         command -v codex-lsp-message-proxy >/dev/null
         command -v codex-no-nested-userns >/dev/null

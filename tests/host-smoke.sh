@@ -507,10 +507,12 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
     done
     grep -Fxq 'ARG CODEX_VERSION=0.154.0' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not default to Codex 0.154.0"
+    grep -Fxq 'ARG NPM_VERSION=12.0.2' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not pin npm 12.0.2"
     grep -Fxq 'ARG CODEX_ACP_VERSION=1.11.0' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not pin codex-acp 1.11.0"
-    grep -Fxq 'ARG AGENT_LSP_VERSION=0.19.2' "$dockerfile" ||
-        fail "$(basename "$dockerfile") does not pin agent-lsp 0.19.2"
+    grep -Fxq 'ARG AGENT_LSP_VERSION=0.19.1' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not pin agent-lsp 0.19.1"
     metadata_arg_line="$(
         grep -n '^ARG IMAGE_VERSION=' "$dockerfile" | cut -d: -f1 || true
     )"
@@ -2650,9 +2652,10 @@ build_output="$(
 )"
 assert_not_contains "$build_output" "--build-arg UID="
 assert_not_contains "$build_output" "--build-arg GID="
+assert_contains "$build_output" "--build-arg NPM_VERSION=12.0.2"
 assert_contains "$build_output" "--build-arg CODEX_VERSION=0.154.0"
 assert_contains "$build_output" "--build-arg CODEX_ACP_VERSION=1.11.0"
-assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=0.19.2"
+assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=0.19.1"
 assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:latest"

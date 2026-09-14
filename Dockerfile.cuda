@@ -147,7 +147,7 @@ RUN /usr/local/src/install-system-runtimes \
 RUN install -d -o root -g root -m 0755 /usr/local/share/npm-global
 
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
-ENV PATH=${PATH}:/usr/local/share/npm-global/bin
+ENV PATH=/usr/local/share/npm-global/bin:${PATH}
 
 # Clojure CLI, Leiningen, and native deps.clj. Versions and checksums live in
 # one shared config so routine updates stay straightforward.
@@ -167,10 +167,14 @@ RUN /usr/local/src/install-clojure-tools \
 
 # Keep frequently changing agent packages and integration files after the
 # stable Java and Clojure runtime layers so their updates preserve that cache.
+ARG NPM_VERSION=12.0.2
 ARG CODEX_VERSION=0.154.0
 ARG CODEX_ACP_VERSION=1.11.0
-ARG AGENT_LSP_VERSION=0.19.2
-RUN npm install -g \
+ARG AGENT_LSP_VERSION=0.19.1
+RUN npm install -g "npm@${NPM_VERSION}" \
+    && hash -r \
+    && [[ "$(npm --version)" == "$NPM_VERSION" ]] \
+    && npm install -g \
         "@openai/codex@${CODEX_VERSION}" \
         "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
         "@blackwell-systems/agent-lsp@${AGENT_LSP_VERSION}" \

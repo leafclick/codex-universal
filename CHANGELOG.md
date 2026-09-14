@@ -14,7 +14,8 @@ This change log follows the conventions of
 
 ### Changed
 
-- Update the pinned `agent-lsp` package to 0.19.2.
+- Pin the image npm CLI to 12.0.2 while retaining the newest registry-published
+  `agent-lsp` package, 0.19.1.
 
 ### Fixed
 

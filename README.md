@@ -316,15 +316,18 @@ Unrelated working files do not change the image version.
 A specific Codex, ACP adapter, or LSP bridge version can be used:
 
 ```bash
+NPM_VERSION=12.0.2 \
 CODEX_VERSION=0.154.0 \
 CODEX_ACP_VERSION=1.11.0 \
-AGENT_LSP_VERSION=0.19.2 \
+AGENT_LSP_VERSION=0.19.1 \
   ./docker-build.sh all
 ```
 
-`CODEX_ACP_VERSION` selects the `@agentclientprotocol/codex-acp` npm version
-used by the optional IntelliJ integration. `AGENT_LSP_VERSION` selects the
-`agent-lsp` MCP bridge used for Clojure semantic navigation.
+`NPM_VERSION` selects the npm CLI used to install and run the image's global
+Node packages. `CODEX_ACP_VERSION` selects the
+`@agentclientprotocol/codex-acp` npm version used by the optional IntelliJ
+integration. `AGENT_LSP_VERSION` selects the `agent-lsp` MCP bridge used for
+Clojure semantic navigation.
 
 To update an agent package, first build both profiles with the candidate
 version supplied explicitly, run `./tests/host-smoke.sh` with those local
