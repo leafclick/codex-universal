@@ -51,7 +51,7 @@
    {:id "clojure-runtime"        :name "Clojure runtime lifecycle" :timeout 180}
    {:id "bubblewrap"             :name "nested Bubblewrap sandbox" :timeout 30}
    {:id "clojure-lsp-runtime"    :name "sandboxed Clojure LSP"     :timeout 30}
-   {:id "clojure-lsp"            :name "Clojure MCP/LSP workflow"  :timeout 210}
+   {:id "clojure-lsp"            :name "Clojure MCP/LSP workflow"  :timeout 270}
    {:id "cli-smoke"              :name "installed CLI smoke"       :timeout 60}
    {:id "cuda-runtime"           :name "CUDA runtime"              :timeout 60
     :profile "cuda"}])

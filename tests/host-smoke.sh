@@ -103,6 +103,14 @@ done
 bash -n \
     "$ROOT/container/clojure-tool-versions.conf" \
     "$ROOT/container/system-tool-versions.conf"
+clojure_lsp_fixture="$ROOT/tests/fixtures/clojure-lsp-project"
+[[ -f "$clojure_lsp_fixture/deps.edn" &&
+   -f "$clojure_lsp_fixture/src/lsp_fixture/core.clj" &&
+   -f "$clojure_lsp_fixture/test/lsp_fixture/core_test.clj" ]] ||
+    fail "committed Clojure LSP fixture is incomplete"
+grep -Fq '/opt/codex-universal/tests/fixtures/check-clojure-lsp-mcp.py' \
+    "$ROOT/tests/fixtures/host-smoke-image.sh" ||
+    fail "container image smoke does not use the committed Clojure LSP harness"
 set +e
 image_diagnostic_output="$(
     bash "$ROOT/tests/fixtures/host-smoke-image.sh" \
@@ -501,8 +509,8 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
         fail "$(basename "$dockerfile") does not default to Codex 0.154.0"
     grep -Fxq 'ARG CODEX_ACP_VERSION=1.11.0' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not pin codex-acp 1.11.0"
-    grep -Fxq 'ARG AGENT_LSP_VERSION=0.19.1' "$dockerfile" ||
-        fail "$(basename "$dockerfile") does not pin agent-lsp 0.19.1"
+    grep -Fxq 'ARG AGENT_LSP_VERSION=0.19.2' "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not pin agent-lsp 0.19.2"
     metadata_arg_line="$(
         grep -n '^ARG IMAGE_VERSION=' "$dockerfile" | cut -d: -f1 || true
     )"
@@ -743,6 +751,14 @@ fi
 [[ -x "$ROOT/container/codex-lsp-message-proxy" ]] ||
     fail "LSP message proxy is not executable"
 if command -v python3 >/dev/null 2>&1 && command -v bwrap >/dev/null 2>&1; then
+    python3 - "$ROOT/tests/fixtures/check-clojure-lsp-mcp.py" <<'PY' ||
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1]).read_text()
+compile(source, sys.argv[1], "exec")
+PY
+        fail "Clojure MCP/LSP fixture harness has invalid Python syntax"
     python3 "$ROOT/tests/fixtures/check-lsp-message-proxy.py" \
         "$ROOT/container/codex-lsp-message-proxy" \
         "$ROOT/tests/fixtures/fake-lsp-init-error.py" ||
@@ -1517,7 +1533,8 @@ assert_contains "$doctor_output" "PASS  Image declares a fixed non-root user (65
 # host kernel, AppArmor, seccomp, and Bubblewrap actually enforced the probe.
 assert_contains "$doctor_output" \
     "PASS  Portable runtime identity, read-only image, tools, and managed Codex policy"
-assert_contains "$doctor_output" "PASS  Clojure LSP MCP handshake and tool allowlist"
+assert_contains "$doctor_output" \
+    "PASS  Clojure LSP MCP semantic query and tool allowlist"
 assert_contains "$doctor_output" "Diagnostics passed with 0 warning(s)."
 assert_contains "$doctor_output" "--network none"
 assert_contains "$doctor_output" "--cap-drop=ALL"
@@ -1582,7 +1599,7 @@ doctor_no_mcp_output="$(
         "$ROOT/bin/run-codex" --doctor smoke-project
 )"
 assert_contains "$doctor_no_mcp_output" \
-    "SKIP  Clojure LSP MCP handshake (environment override: off)"
+    "SKIP  Clojure LSP MCP semantic query (environment override: off)"
 
 if "${launcher_env[@]}" \
     CODEX_SECCOMP_PROFILE="$TEST_ROOT/missing-seccomp.json" \
@@ -2635,7 +2652,7 @@ assert_not_contains "$build_output" "--build-arg UID="
 assert_not_contains "$build_output" "--build-arg GID="
 assert_contains "$build_output" "--build-arg CODEX_VERSION=0.154.0"
 assert_contains "$build_output" "--build-arg CODEX_ACP_VERSION=1.11.0"
-assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=0.19.1"
+assert_contains "$build_output" "--build-arg AGENT_LSP_VERSION=0.19.2"
 assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:latest"
@@ -2833,7 +2850,7 @@ chmod 0555 -- \
    "$(stat -c %a "$image_smoke_runner")" == 555 ]] ||
     fail "temporary container image smoke files are not executable by the container user"
 
-image_timeout_seconds="${CODEX_TEST_IMAGE_TIMEOUT_SECONDS:-660}"
+image_timeout_seconds="${CODEX_TEST_IMAGE_TIMEOUT_SECONDS:-720}"
 image_heartbeat_seconds="${CODEX_TEST_IMAGE_HEARTBEAT_SECONDS:-10}"
 image_kill_after_seconds="${CODEX_TEST_IMAGE_KILL_AFTER_SECONDS:-5}"
 for image_timing_name in \

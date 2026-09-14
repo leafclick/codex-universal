@@ -103,8 +103,9 @@ invoke `sudo`, mount the project into its diagnostic container, or modify
 persistent Codex state. It reports the registered project and profile, fixed
 non-root image identity, host runtime UID/GID, read-only image boundary,
 sandbox operation, installed tool versions, and the Clojure LSP MCP initialize
-handshake. A CUDA project additionally checks GPU access and NVIDIA entrypoint
-execution. Optional integrations are reported as warnings or skips.
+handshake plus a semantic query against a disposable Clojure fixture. A CUDA
+project additionally checks GPU access and NVIDIA entrypoint execution.
+Optional integrations are reported as warnings or skips.
 
 Then exit Codex and run the host smoke suite from the `codex-universal`
 checkout. This short form skips optional state-synchronization tests but still
@@ -317,7 +318,7 @@ A specific Codex, ACP adapter, or LSP bridge version can be used:
 ```bash
 CODEX_VERSION=0.154.0 \
 CODEX_ACP_VERSION=1.11.0 \
-AGENT_LSP_VERSION=0.19.1 \
+AGENT_LSP_VERSION=0.19.2 \
   ./docker-build.sh all
 ```
 
@@ -525,7 +526,9 @@ duplicated as `window/logMessage`, which the adapter forwards to Codex. If the
 server reports a type-1 error before returning its initialize result, the proxy
 turns that result into an initialization error, so `start_lsp` cannot report a
 successful start after a known classpath/indexing failure. Later server errors
-remain visible notifications; readiness still requires semantic evidence.
+remain visible notifications. Unexpected server EOF and framing failures are
+reported on bridge stderr with the child status; readiness still requires
+semantic evidence.
 
 The terminal bridge requests agent-lsp JSON output so native LSP URI/range
 locations survive navigation results. This is a location-preservation
@@ -927,7 +930,9 @@ commands, Codex policy components, and a real Bubblewrap namespace using the
 installed AppArmor policy and repository seccomp policy. The Clojure helper,
 process supervisor, Unix transport, bounded decoder, and one-off lifecycle
 fixtures run here with the image's pinned Babashka rather than an arbitrary
-host installation. The CUDA check additionally starts the
+host installation. The committed `tests/fixtures/clojure-lsp-project` test bed
+also exercises the full MCP-to-LSP path with sequential, delayed, and concurrent
+symbol exploration followed by a cross-file reference query. The CUDA check additionally starts the
 container with `--gpus all` and verifies `nvcc`, CUDA headers, and
 `nvidia-smi`. It therefore requires the NVIDIA driver and Container Toolkit
 described in [CUDA host setup](#cuda-host-setup).
@@ -941,7 +946,7 @@ stderr tails. The host also applies an outer deadline to the Docker run and
 removes the specifically named test container on failure or interruption.
 
 The default image-suite heartbeat is 10 seconds, the process kill grace period
-is 5 seconds, and the outer per-image deadline is 660 seconds. Override these
+is 5 seconds, and the outer per-image deadline is 720 seconds. Override these
 positive integer values when diagnosing unusually slow hosts:
 
 ```bash
@@ -1484,10 +1489,11 @@ daemon, registered project, selected image, fixed non-root image identity,
 host runtime identity, read-only root, managed policy,
 AppArmor/seccomp/Bubblewrap sandbox, and image runtime checks pass. When the
 terminal Clojure MCP integration is enabled, the runtime check performs a real
-MCP initialize handshake and verifies that the selected image advertises every
-allowlisted tool. It uses a disposable networkless container with no host
-mounts; it never pulls, builds, installs, or changes the registered checkout or
-live `~/.codex` state.
+MCP initialize handshake, verifies that the selected image advertises every
+allowlisted tool, starts Clojure LSP, and inspects a symbol in a disposable
+Clojure fixture. It uses a networkless container with no host mounts; it never
+pulls, builds, installs, or changes the registered checkout or live `~/.codex`
+state.
 
 ## Change a project's profile
 

@@ -150,8 +150,9 @@ doctor_mcp_probe() {
     local image="$1"
     local required_tools="$2"
 
-    # Keep this separate from the tool/policy probe so a failed MCP handshake
-    # has a precise diagnosis. Like the runtime probe, it has no host mounts.
+    # Keep this separate from the tool/policy probe so a failed MCP startup or
+    # semantic query has a precise diagnosis. Like the runtime probe, it has no
+    # host mounts.
     docker run --rm --pull=never \
         --network none \
         --cap-drop=ALL \
@@ -168,13 +169,36 @@ doctor_mcp_probe() {
         "$image" /bin/bash -c '
             set -Eeuo pipefail
 
+            fixture_dir=/workspace/clojure-lsp-doctor
+            bridge_stderr="$HOME/clojure-lsp-doctor.stderr"
+            mkdir -p "$fixture_dir/src/doctor_fixture"
+            printf "%s\n" \
+                "{:paths [\"src\"]}" \
+                > "$fixture_dir/deps.edn"
+            printf "%s\n" \
+                "(ns doctor-fixture.core)" \
+                "" \
+                "(defn health-check [value]" \
+                "  (str \"healthy:\" value))" \
+                > "$fixture_dir/src/doctor_fixture/core.clj"
+            cd "$fixture_dir"
             coproc MCP_BRIDGE {
                 exec codex-clojure-lsp-mcp clojure:clojure-lsp
-            }
+            } 2>"$bridge_stderr"
             mcp_pid="$MCP_BRIDGE_PID"
             mcp_input_fd="${MCP_BRIDGE[1]}"
             mcp_output_fd="${MCP_BRIDGE[0]}"
             mcp_ready=0
+
+            cleanup_mcp_bridge() {
+                kill "$mcp_pid" 2>/dev/null || true
+                wait "$mcp_pid" 2>/dev/null || true
+            }
+            fail_mcp_probe() {
+                tail -n 40 -- "$bridge_stderr" >&2 || true
+                exit 1
+            }
+            trap cleanup_mcp_bridge EXIT
 
             printf '\''%s\n'\'' \
                 '\''{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"run-codex-doctor","version":"1"}}}'\'' \
@@ -190,7 +214,7 @@ doctor_mcp_probe() {
                 fi
             done
 
-            ((mcp_ready == 1))
+            ((mcp_ready == 1)) || fail_mcp_probe
 
             printf '\''%s\n'\'' \
                 '\''{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'\'' \
@@ -208,12 +232,48 @@ doctor_mcp_probe() {
                 fi
             done
 
-            kill "$mcp_pid" 2>/dev/null || true
-            wait "$mcp_pid" 2>/dev/null || true
-            [[ -n "$tools_response" ]]
+            [[ -n "$tools_response" ]] || fail_mcp_probe
             jq -e --argjson required "$1" \
                 '\''($required - [.result.tools[].name]) | length == 0'\'' \
-                <<<"$tools_response" >/dev/null
+                <<<"$tools_response" >/dev/null || fail_mcp_probe
+
+            printf '\''{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"start_lsp","arguments":{"root_dir":"%s","language_id":"clojure","ready_timeout_seconds":30}}}\n'\'' \
+                "$fixture_dir" >&"$mcp_input_fd"
+            start_response=""
+            for _ in {1..45}; do
+                if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
+                   jq -e '\''.id == 3'\'' <<<"$mcp_line" >/dev/null 2>&1; then
+                    start_response="$mcp_line"
+                    break
+                fi
+            done
+            if ! jq -e \
+                '\''.result.isError != true and
+                   ([.result.content[]?.text] | join("\\n") |
+                    contains("LSP server started successfully"))'\'' \
+                <<<"$start_response" >/dev/null; then
+                fail_mcp_probe
+            fi
+
+            printf '\''{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"inspect_symbol","arguments":{"file_path":"%s/src/doctor_fixture/core.clj","line":3,"column":7,"language_id":"clojure"}}}\n'\'' \
+                "$fixture_dir" >&"$mcp_input_fd"
+            semantic_response=""
+            for _ in {1..30}; do
+                if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
+                   jq -e '\''.id == 4'\'' <<<"$mcp_line" >/dev/null 2>&1; then
+                    semantic_response="$mcp_line"
+                    break
+                fi
+            done
+            if ! jq -e \
+                '\''.result.isError != true and
+                   ([.result.content[]?.text] | join("\\n") | length > 0)'\'' \
+                <<<"$semantic_response" >/dev/null; then
+                fail_mcp_probe
+            fi
+
+            cleanup_mcp_bridge
+            trap - EXIT
         ' run-codex-doctor "$required_tools"
 }
 
@@ -331,14 +391,14 @@ run_doctor() {
             if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
                 local mcp_output=""
                 if mcp_output="$(doctor_mcp_probe "$IMAGE" "$CLOJURE_LSP_MCP_ALLOWED_TOOLS" 2>&1)"; then
-                    doctor_pass "Clojure LSP MCP handshake and tool allowlist"
+                    doctor_pass "Clojure LSP MCP semantic query and tool allowlist"
                 else
-                    doctor_fail "Clojure LSP MCP handshake or tool allowlist failed"
+                    doctor_fail "Clojure LSP MCP semantic query or tool allowlist failed"
                     [[ -z "$mcp_output" ]] || printf '      %s\n' "$mcp_output"
                     doctor_note "Rebuild or replace the selected image, then rerun the doctor."
                 fi
             else
-                doctor_skip "Clojure LSP MCP handshake ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
+                doctor_skip "Clojure LSP MCP semantic query ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
             fi
         else
             doctor_skip "Runtime probes because an earlier required check failed"

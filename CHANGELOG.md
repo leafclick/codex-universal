@@ -7,8 +7,19 @@ This change log follows the conventions of
 
 ## [Unreleased]
 
+### Added
+
+- Add a committed Clojure LSP project fixture that verifies sequential,
+  delayed, and concurrent semantic queries through the image MCP bridge.
+
+### Changed
+
+- Update the pinned `agent-lsp` package to 0.19.2.
+
 ### Fixed
 
+- Surface unexpected language-server exits and protocol forwarding failures
+  from the Clojure LSP message proxy.
 - Run Clojure-helper runtime smoke fixtures with the image's pinned Babashka
   instead of an arbitrary host installation.
 - Keep forced snapshot recovery available when the live Codex SQLite state is

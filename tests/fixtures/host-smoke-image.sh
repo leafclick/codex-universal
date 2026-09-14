@@ -1,44 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-mcp_pid=""
-mcp_input_fd=""
-mcp_output_fd=""
-
-close_mcp_fd() {
-    local fd="$1"
-
-    [[ "$fd" =~ ^[0-9]+$ ]] || return 0
-    exec {fd}>&- 2>/dev/null || true
-}
-
-cleanup_mcp_bridge() {
-    local pid="${mcp_pid:-}"
-
-    [[ -n "$pid" ]] || return 0
-    close_mcp_fd "${mcp_input_fd:-}"
-    close_mcp_fd "${mcp_output_fd:-}"
-    mcp_input_fd=""
-    mcp_output_fd=""
-    for _ in {1..20}; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.05
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -TERM "$pid" 2>/dev/null || true
-    fi
-    for _ in {1..20}; do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.05
-    done
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid" 2>/dev/null || true
-    fi
-    wait "$pid" 2>/dev/null || true
-    mcp_pid=""
-}
-trap cleanup_mcp_bridge EXIT
-
 check_phase="${1:-}"
 shift || true
 (($# == 4)) || {
@@ -106,6 +68,7 @@ case "$check_phase" in
         command -v codex-acp >/dev/null
         command -v codex-acp-entrypoint >/dev/null
         command -v agent-lsp >/dev/null
+        [[ "$(agent-lsp --version)" == 0.19.2 ]]
         command -v codex-clojure-lsp-mcp >/dev/null
         command -v codex-lsp-message-proxy >/dev/null
         command -v codex-no-nested-userns >/dev/null
@@ -178,81 +141,16 @@ case "$check_phase" in
         codex-clojure-lsp-mcp --check-clojure-lsp >/dev/null
         ;;
     clojure-lsp)
+        fixture_source=/opt/codex-universal/tests/fixtures/clojure-lsp-project
         fixture_dir="$HOME/clojure-lsp-smoke"
-        mkdir -p "$fixture_dir/src/example" "$fixture_dir/test/example" "$fixture_dir/dev"
-        printf "%s\n" \
-            "(ns example.core)" \
-            "(defn public-fn [] :ok)" \
-            > "$fixture_dir/src/example/core.clj"
-        printf "%s\n" \
-            "(ns example.core-test" \
-            "  (:require [clojure.test :refer [deftest is]]" \
-            "            [example.core :as sut]))" \
-            "(deftest public-fn-test" \
-            "  (is (= :ok (sut/public-fn))))" \
-            > "$fixture_dir/test/example/core_test.clj"
-        cd "$fixture_dir"
-        coproc MCP_BRIDGE {
-            exec codex-clojure-lsp-mcp clojure:clojure-lsp
-        }
-        mcp_pid="$MCP_BRIDGE_PID"
-        mcp_input_fd="${MCP_BRIDGE[1]}"
-        mcp_output_fd="${MCP_BRIDGE[0]}"
-        mcp_ready=0
-        printf '%s\n' \
-            '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"host-smoke","version":"1"}}}' \
-            >&"$mcp_input_fd"
-        for _ in {1..10}; do
-            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
-               jq -e \
-                   '.id == 1 and .result.serverInfo.name == "agent-lsp"' \
-                   <<<"$mcp_line" >/dev/null 2>&1; then
-                mcp_ready=1
-                break
-            fi
-        done
-        (( mcp_ready == 1 )) || {
-            printf "host-smoke: Clojure MCP bridge did not become ready; last response: %s\n" \
-                "${mcp_line:-<none>}" >&2
-            exit 1
-        }
-        check_phase=lsp-startup
-        lsp_ready=0
-        printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"start_lsp","arguments":{"root_dir":"%s","language_id":"clojure","ready_timeout_seconds":60}}}\n' \
-            "$fixture_dir" >&"$mcp_input_fd"
-        for _ in {1..75}; do
-            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
-               jq -e \
-                   '.id == 2 and .result.content[0].text == "LSP server started successfully"' \
-                   <<<"$mcp_line" >/dev/null 2>&1; then
-                lsp_ready=1
-                break
-            fi
-        done
-        (( lsp_ready == 1 )) || {
-            printf "host-smoke: Clojure LSP server did not become ready; last response: %s\n" \
-                "${mcp_line:-<none>}" >&2
-            exit 1
-        }
-        check_phase=lsp-references
-        references_ready=0
-        printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"find_references","arguments":{"file_path":"%s/src/example/core.clj","line":2,"column":7,"language_id":"clojure","include_declaration":true}}}\n' \
-            "$fixture_dir" >&"$mcp_input_fd"
-        for _ in {1..75}; do
-            if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
-               jq -e --arg test_file "$fixture_dir/test/example/core_test.clj" \
-                   '.id == 3 and ([.result.content[]?.text] | join("\\n") | contains($test_file))' \
-                   <<<"$mcp_line" >/dev/null 2>&1; then
-                references_ready=1
-                break
-            fi
-        done
-        cleanup_mcp_bridge
-        (( references_ready == 1 )) || {
-            printf "host-smoke: Clojure LSP reference query did not return the expected test reference; last response: %s\n" \
-                "${mcp_line:-<none>}" >&2
-            exit 1
-        }
+        mcp_stderr="$fixture_dir/mcp-stderr.log"
+        [[ -f "$fixture_source/deps.edn" ]]
+        [[ -f "$fixture_source/src/lsp_fixture/core.clj" ]]
+        [[ -f "$fixture_source/test/lsp_fixture/core_test.clj" ]]
+        mkdir -p "$fixture_dir"
+        cp -R -- "$fixture_source/." "$fixture_dir/"
+        python3 /opt/codex-universal/tests/fixtures/check-clojure-lsp-mcp.py \
+            "$fixture_dir" "$mcp_stderr"
         ;;
     cli-smoke)
         codex-clojure-lsp-mcp --check-java >/dev/null

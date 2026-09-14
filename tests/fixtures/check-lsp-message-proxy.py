@@ -48,5 +48,6 @@ early_stderr = early_exit.stderr.read()
 early_exit.stdin.close()
 early_exit.stdout.close()
 early_exit.stderr.close()
-assert early_status == 0
+assert early_status == 1
+assert b"language server exited unexpectedly (status 0)" in early_stderr
 assert b"Fatal Python error" not in early_stderr

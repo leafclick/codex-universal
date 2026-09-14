@@ -67,19 +67,27 @@ def main():
         "initialize_id": None,
         "initialize_finished": False,
         "initialize_error": None,
+        "client_eof": False,
+        "exit_requested": False,
+        "termination_signal": None,
     }
     state_lock = threading.Lock()
     client_input = os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0)
     client_stop = threading.Event()
 
-    def terminate_child(signum, _frame):
+    def terminate_child(signum):
         try:
             os.killpg(child.pid, signum)
         except ProcessLookupError:
             pass
 
-    signal.signal(signal.SIGTERM, terminate_child)
-    signal.signal(signal.SIGINT, terminate_child)
+    def handle_signal(signum, _frame):
+        with state_lock:
+            state["termination_signal"] = signum
+        terminate_child(signum)
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
 
     def forward_client():
         try:
@@ -89,17 +97,26 @@ def main():
                     continue
                 body = read_frame(client_input)
                 if body is None:
+                    with state_lock:
+                        state["client_eof"] = True
                     break
                 try:
                     message = json.loads(body)
                     if message.get("method") == "initialize":
                         with state_lock:
                             state["initialize_id"] = message.get("id")
+                    elif message.get("method") == "exit":
+                        with state_lock:
+                            state["exit_requested"] = True
                 except (json.JSONDecodeError, AttributeError):
                     pass
                 write_frame(child.stdin, body)
-        except (BrokenPipeError, EOFError, OSError, ValueError, UnicodeError):
-            pass
+        except (BrokenPipeError, EOFError, OSError, ValueError, UnicodeError) as error:
+            print(
+                f"codex-lsp-message-proxy: client forwarding stopped: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
         finally:
             try:
                 child.stdin.close()
@@ -109,10 +126,12 @@ def main():
     client_thread = threading.Thread(target=forward_client, daemon=True)
     client_thread.start()
 
+    child_eof = False
     try:
         while True:
             body = read_frame(child.stdout)
             if body is None:
+                child_eof = True
                 break
             message = None
             try:
@@ -160,18 +179,38 @@ def main():
                             }
                             body = json.dumps(message, separators=(",", ":")).encode()
             write_frame(sys.stdout.buffer, body)
-    except (BrokenPipeError, EOFError, OSError, ValueError, UnicodeError):
-        pass
+    except (BrokenPipeError, EOFError, OSError, ValueError, UnicodeError) as error:
+        print(
+            f"codex-lsp-message-proxy: server forwarding stopped: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
     finally:
         if child.poll() is None:
-            terminate_child(signal.SIGTERM, None)
+            terminate_child(signal.SIGTERM)
             try:
                 child.wait(timeout=2)
             except subprocess.TimeoutExpired:
-                terminate_child(signal.SIGKILL, None)
+                terminate_child(signal.SIGKILL)
+                child.wait(timeout=2)
         client_stop.set()
         client_thread.join(timeout=2)
         client_input.close()
+    with state_lock:
+        unexpected_exit = (
+            child_eof
+            and not state["client_eof"]
+            and not state["exit_requested"]
+            and state["termination_signal"] is None
+        )
+    if unexpected_exit:
+        print(
+            "codex-lsp-message-proxy: language server exited unexpectedly "
+            f"(status {child.returncode})",
+            file=sys.stderr,
+            flush=True,
+        )
+        return child.returncode or 1
     return child.returncode or 0
 
 

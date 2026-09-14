@@ -169,7 +169,7 @@ RUN /usr/local/src/install-clojure-tools \
 # stable Java and Clojure runtime layers so their updates preserve that cache.
 ARG CODEX_VERSION=0.154.0
 ARG CODEX_ACP_VERSION=1.11.0
-ARG AGENT_LSP_VERSION=0.19.1
+ARG AGENT_LSP_VERSION=0.19.2
 RUN npm install -g \
         "@openai/codex@${CODEX_VERSION}" \
         "@agentclientprotocol/codex-acp@${CODEX_ACP_VERSION}" \
