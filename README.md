@@ -692,12 +692,16 @@ executable, action, and scope. A shell prelude such as `set -Eeuo pipefail`, an
 environment assignment, or a generic shell wrapper is not a meaningful
 approval target, and approving one never authorizes a later command. In
 particular, destructive operations must name their exact action and target in
-their own approval request. `run-auto` keeps generated audit IDs out of the
-command line so an unchanged substantive command has a stable approval string.
-A reusable rule for the full invocation must include the substantive argv after
-`--`; never approve the observer alone as a generic wrapper. Approval layers
-that can unwrap argv should match only that substantive command. This is
-advisory guidance rather than a CLI policy enforcement hook.
+their own approval request. The persistent approval identity is the exact
+substantive operation, such as `clojure -M:test`, never `bash -lc ...` or the
+observer invocation. A matcher must bind the complete substantive argv and
+reject shell interpolation, arbitrary trailing arguments, changed working
+directory or network destination, output outside the approved lane, and
+environment changes that materially alter the operation. If it cannot bind
+that context, the wrapped command requires one-time approval. The launcher does
+not expose a generic "remember all Bash commands" option. This is an approval
+contract for compatible clients; the bundled observer does not implement a CLI
+policy hook.
 
 The assets require Codex CLI 0.153.4 or newer, which supports
 `~/.codex/agents`, `~/.codex/skills`, and a global `~/.codex/AGENTS.md`.

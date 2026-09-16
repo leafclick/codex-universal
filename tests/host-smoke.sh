@@ -263,7 +263,7 @@ test -f "$concurrent_home/codex-state/agents/code_reader.toml" ||
     fail "session opt-out removed assets during a concurrent enabled install"
 test -f "$concurrent_home/codex-state/skills/clojure-development/SKILL.md" ||
     fail "session opt-out removed skill assets during a concurrent enabled install"
-grep -Fq 'substantive executable, action, and scope' \
+grep -Fq 'must name the substantive executable' \
     "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not require substantive approval prompts"
 grep -Fq 'Approval of such a prelude never' \
@@ -288,12 +288,34 @@ grep -Fq 'Use `summary RUN_ID` first' "$ROOT/container/codex-workflow/AGENTS.md"
 grep -Fq 'run-auto -- COMMAND ...' \
     "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not keep generated run IDs out of commands"
-grep -Fq 'generated run ID as audit metadata' \
+grep -Fq 'generated run ID as audit transport' \
     "$ROOT/container/codex-workflow/AGENTS.md" ||
-    fail "workflow guidance does not treat generated run IDs as audit metadata"
-grep -Fq 'never recommend one for the observer alone' \
+    fail "workflow guidance does not treat generated run IDs as audit transport"
+grep -Fq 'Never recommend a reusable rule for' \
     "$ROOT/container/codex-workflow/skills/clojure-development/SKILL.md" ||
     fail "Clojure guidance permits an overbroad observer approval prefix"
+grep -Fq 'A persistent approval is the exact substantive operation' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not identify the substantive approval operation"
+grep -Fq 'must reject shell interpolation' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance permits unsafe persistent approval matching"
+grep -Fq 'extra trailing arguments' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance permits approval argument extension"
+grep -Fq 'changed working directory' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not bind persistent approval cwd"
+grep -Fq 'changed network' "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not bind persistent approval network scope"
+grep -Fq 'output paths outside the approved lane' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not bind persistent approval output scope"
+grep -Fq 'environment changes' "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not bind material approval environment"
+grep -Fq 'remember all Bash commands' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not prohibit generic Bash approval"
 if grep -R -Fq '$CODEX_HOME/scripts/codex-worker-observe' \
     "$ROOT/container/codex-workflow/AGENTS.md" \
     "$ROOT/container/codex-workflow/agents"; then
@@ -308,7 +330,7 @@ observe_help="$(CODEX_WORKER_OBSERVE_DIR=/not/below/tmp "$observe_helper" help)"
 assert_contains "$observe_help" 'Inspect commands run by delegated Codex workers.'
 assert_contains "$observe_help" 'codex-worker-observe list'
 assert_contains "$observe_help" 'codex-worker-observe run-auto -- COMMAND [ARG ...]'
-assert_contains "$observe_help" 'Use run-auto when the command line must remain stable'
+assert_contains "$observe_help" 'Use run-auto to keep the generated audit ID out of the recorded command.'
 assert_contains "$observe_help" 'List recorded runs with status, liveness, and start time.'
 assert_contains "$observe_help" 'codex-worker-observe show RUN_ID'
 assert_contains "$observe_help" 'codex-worker-observe summary RUN_ID'
@@ -1121,6 +1143,8 @@ assert_contains "$launcher_help" "image=PROJECT_PATH"
 assert_contains "$launcher_help" "run-codex [PROJECT] [--lane LANE] --sessions"
 assert_contains "$launcher_help" "run-codex [PROJECT] [--lane LANE] --resume QUERY"
 assert_contains "$launcher_help" "--image-version VERSION"
+assert_not_contains "$launcher_help" "remember all Bash commands"
+assert_not_contains "$launcher_help" "remember-all-bash"
 
 linked_init_output="$(
     "${launcher_env[@]}" "$ROOT/bin/run-codex" \
@@ -1765,6 +1789,7 @@ for unsafe_codex_option in \
     'profile=unsafe' \
     'add-dir=/tmp' \
     'approve-for-me' \
+    'remember-all-bash' \
     'dangerously-bypass-approvals-and-sandbox' \
     'remote=ws://example.invalid' \
     'enable=unknown' \

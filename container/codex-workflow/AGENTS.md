@@ -85,7 +85,7 @@ announce its role, scope, and the observer record root. Run it non-interactively
 through `~/.codex/scripts/codex-worker-observe run-auto -- COMMAND ...`; the
 worker relays the generated run ID and exact stdout/stderr paths as soon as the
 helper reserves them. Use `run RUN_ID -- COMMAND ...` only when a predetermined
-audit ID is required and a changing ID will not defeat reusable approval.
+audit ID is required.
 Inspect the durable record before an extended wait and relay its exact command,
 cwd, PID, status, exit code, and relevant log excerpts. Use `summary RUN_ID` first
 and open a longer tail only when its bounded evidence is insufficient.
@@ -94,13 +94,19 @@ messages are enough when direct parent messaging is useful. However, do not assu
 Do not wrap persistent `clojure-development` REPL actions, which already
 preserve evaluation records. Never expose secrets.
 
-Keep the changing run ID out of the reusable approval identity for an observed
-command. Invoke `run-auto` directly instead of embedding it in `bash -lc`, and
-request approval for the substantive executable, action, and scope after the
-observer's `--`. A reusable rule for the full stable invocation must include
-that substantive prefix; never request one for the observer alone because it
-can wrap arbitrary commands. When supported, prefer an approval matcher that
-inspects only argv after `--`; treat the generated run ID as audit metadata.
+Treat the observer and generated run ID as audit transport, never as approval
+identity. A persistent approval is the exact substantive operation, for example
+`clojure -M:test`, not `bash -lc ...` or `codex-worker-observe run-auto ...`.
+Never request a reusable rule for a shell or observer wrapper: both can execute
+arbitrary commands. If the approval layer cannot identify the argv after `--`,
+request one-time approval for the wrapped invocation instead.
+
+A reusable matcher for a substantive operation must reject shell interpolation,
+extra trailing arguments, a changed working directory, a changed network
+destination, output paths outside the approved lane, and environment changes
+that materially alter the operation. Do not offer or recommend a generic
+"remember all Bash commands" rule. Treat any context the matcher cannot bind as
+ineligible for persistent approval.
 
 Treat `agent status`, `show active probes`, `show probe RUN_ID`, `summarize probe
 RUN_ID`, `tail probe RUN_ID`, and `worker inspection help` as inspection
@@ -109,7 +115,7 @@ interrupting the worker. Preserve its `not-visible-or-exited` distinction;
 cross-sandbox PID invisibility does not prove exit. Do not rely on experimental
 Codex features for observability.
 
-Approval questions and reusable prefixes must name the substantive executable, action, and scope.
-Shell setup, environment assignments, or generic wrappers are not the approved
-operation. Approval of such a prelude never authorizes a later command; name the exact
-destructive action and target separately.
+Approval questions and reusable rules must name the substantive executable,
+action, and scope. Shell setup, environment assignments, or generic wrappers
+are not the approved operation. Approval of such a prelude never authorizes a
+later command; name the exact destructive action and target separately.

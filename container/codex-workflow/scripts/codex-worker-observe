@@ -36,7 +36,7 @@ Usage:
 
 RUN_ID must contain only letters, numbers, dots, underscores, and hyphens.
 Each ID is immutable. Choose a new ID rather than replacing prior evidence.
-Use run-auto when the command line must remain stable across repeated runs.
+Use run-auto to keep the generated audit ID out of the recorded command.
 
 Installed path: ~/.codex/scripts/codex-worker-observe
 EOF

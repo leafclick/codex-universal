@@ -111,12 +111,15 @@ commands. Stop task-owned REPLs and watchers before handoff.
 For observable fresh-process runs, keep approval identity independent of the
 run ID. Invoke `codex-worker-observe run-auto -- clojure ...` directly rather
 than embedding it in `bash -lc`; capture the generated ID for later inspection.
-Describe/request approval for the substantive Clojure command, alias, and test
-scope. A reusable rule for the full stable invocation must include the
-substantive argv after `--`; never recommend one for the observer alone because
-it can wrap arbitrary commands. Use explicit `run RUN_ID -- ...` only when a
-predetermined audit ID is required and reusable approval is irrelevant. Plan
-one elevated run that covers the known acceptance criteria, and do not create
+Describe/request approval for the exact substantive Clojure command, alias,
+and test scope, such as `clojure -M:test`. Never recommend a reusable rule for
+the observer or a shell wrapper because either can run arbitrary commands. If
+the approval layer cannot match the substantive argv after `--`, use one-time
+approval for the wrapped invocation. A persistent matcher must reject shell
+interpolation, trailing arguments, changed cwd or network destinations, output
+paths outside the approved lane, and material environment changes. Use explicit
+`run RUN_ID -- ...` only when a predetermined audit ID is required. Plan one
+elevated run that covers the known acceptance criteria, and do not create
 speculative retries.
 
 Verify a persistent REPL and `clojure_probe` across commands: start the named
