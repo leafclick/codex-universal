@@ -689,8 +689,12 @@ executable, action, and scope. A shell prelude such as `set -Eeuo pipefail`, an
 environment assignment, or a generic shell wrapper is not a meaningful
 approval target, and approving one never authorizes a later command. In
 particular, destructive operations must name their exact action and target in
-their own approval request. This is advisory guidance rather than a CLI policy
-enforcement hook.
+their own approval request. For observer-wrapped commands, the dated run ID is
+audit metadata rather than part of the reusable approval identity: approval
+should match the substantive command argv after `--`, never the observer as a
+generic wrapper. Until the approval layer can unwrap that argv, base images
+should authorize the documented command before observation. This is advisory
+guidance rather than a CLI policy enforcement hook.
 
 The assets require Codex CLI 0.153.4 or newer, which supports
 `~/.codex/agents`, `~/.codex/skills`, and a global `~/.codex/AGENTS.md`.

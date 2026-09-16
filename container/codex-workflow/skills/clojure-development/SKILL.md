@@ -98,6 +98,16 @@ after behavior is confirmed against the intended implementation. Use a fresh
 process for classpath/JVM-option/native-state changes and configured integration
 commands. Stop task-owned REPLs and watchers before handoff.
 
+For observable fresh-process runs, keep approval identity independent of the
+dated run ID. Invoke the observer directly rather than embedding
+`observer run RUN_ID -- ...` in `bash -lc`, and describe/request approval for
+the substantive Clojure command, alias, and test scope. Do not recommend a
+reusable approval prefix for the observer itself because it can wrap arbitrary
+commands. Base agent/skill images should either authorize documented Clojure
+test argv before wrapping it or teach the approval layer to inspect the command
+after the observer's `--`; the run ID must remain audit metadata, not part of
+the reusable approval key.
+
 Verify a persistent REPL and `clojure_probe` across commands: start the named
 runtime, define a harmless unique sentinel in one probe, consume that retained
 value in a separate probe, check that status reports the same running runtime,

@@ -285,6 +285,12 @@ grep -Fq 'genuinely independent' "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not require genuinely independent delegation"
 grep -Fq 'Use `summary RUN_ID` first' "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not prefer bounded worker summaries"
+grep -Fq 'treat the run ID as audit metadata' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance makes observed-command approval depend on the run ID"
+grep -Fq 'reusable approval prefix for the observer itself' \
+    "$ROOT/container/codex-workflow/skills/clojure-development/SKILL.md" ||
+    fail "Clojure guidance permits an overbroad observer approval prefix"
 if grep -R -Fq '$CODEX_HOME/scripts/codex-worker-observe' \
     "$ROOT/container/codex-workflow/AGENTS.md" \
     "$ROOT/container/codex-workflow/agents"; then

@@ -92,6 +92,14 @@ are enough when direct parent messaging is useful. However, do not assume such m
 Do not wrap persistent `clojure-development` REPL actions, which already
 preserve evaluation records. Never expose secrets.
 
+Keep the changing run ID out of the reusable approval identity for an observed
+command. Invoke the observer directly instead of embedding it in `bash -lc`,
+and request approval for the substantive executable, action, and scope after
+the observer's `--`. Never request a reusable approval prefix for the observer
+itself because it can wrap arbitrary commands. Base agent and skill images
+should authorize the documented command argv before observation or make the
+approval layer inspect that post-`--` argv; treat the run ID as audit metadata.
+
 Treat `agent status`, `show active probes`, `show probe RUN_ID`, `summarize probe
 RUN_ID`, `tail probe RUN_ID`, and `worker inspection help` as inspection
 requests. Use the helper's `list`, `show`, `summary`, `tail`, or `help` without
