@@ -652,27 +652,30 @@ This deliberate corroboration does not authorize the primary to repeat either
 search.
 
 Delegated substantial and long-running commands are observable without an
-experimental Codex feature. The primary announces the role, scope, assigned run
-ID, and separate stdout/stderr paths before execution, then reads the exact
-command, cwd, PID, and status from the run record. Fresh-process commands use
+experimental Codex feature. The primary announces the role, scope, and observer
+record root before execution. The helper then reports its generated run ID and
+separate stdout/stderr paths before launching the child; the primary reads the
+exact command, cwd, PID, and status from that record. Fresh-process commands use
 the managed helper:
 
 ```bash
 ~/.codex/scripts/codex-worker-observe help
-~/.codex/scripts/codex-worker-observe run cla-gpu-1 -- clojure -M:mkl:cuda -m simulation ...
+~/.codex/scripts/codex-worker-observe run-auto -- clojure -M:mkl:cuda -m simulation ...
 ~/.codex/scripts/codex-worker-observe list
-~/.codex/scripts/codex-worker-observe show cla-gpu-1
-~/.codex/scripts/codex-worker-observe summary cla-gpu-1
-~/.codex/scripts/codex-worker-observe tail cla-gpu-1
-~/.codex/scripts/codex-worker-observe tail --stderr --follow cla-gpu-1
+~/.codex/scripts/codex-worker-observe show auto-20260916T082618Z-Ab3dE9fG
+~/.codex/scripts/codex-worker-observe summary auto-20260916T082618Z-Ab3dE9fG
+~/.codex/scripts/codex-worker-observe tail auto-20260916T082618Z-Ab3dE9fG
+~/.codex/scripts/codex-worker-observe tail --stderr --follow auto-20260916T082618Z-Ab3dE9fG
 ```
 
 On its first user-visible response in a session, the primary announces the
 natural-language `agent status` and `show active probes` requests and points to
-the helper's `help` catalog. The primary assigns run IDs before substantial
-delegated commands and reads the durable record directly. It uses the bounded
-`summary` view first and opens a longer log tail only when needed;
-worker-to-parent messaging is used when available but is not required.
+the helper's `help` catalog. `run-auto` allocates an immutable ID atomically and
+prints it with the record directory before the child starts. The explicit
+`run RUN_ID -- ...` form remains available when an external audit process needs
+a predetermined ID. The primary uses the bounded `summary` view first and opens
+a longer log tail only when needed; worker-to-parent messaging is used when
+available but is not required.
 
 The helper mirrors output into the normal tool transcript while retaining
 immutable, per-run metadata and separate logs under
@@ -689,12 +692,12 @@ executable, action, and scope. A shell prelude such as `set -Eeuo pipefail`, an
 environment assignment, or a generic shell wrapper is not a meaningful
 approval target, and approving one never authorizes a later command. In
 particular, destructive operations must name their exact action and target in
-their own approval request. For observer-wrapped commands, the dated run ID is
-audit metadata rather than part of the reusable approval identity: approval
-should match the substantive command argv after `--`, never the observer as a
-generic wrapper. Until the approval layer can unwrap that argv, base images
-should authorize the documented command before observation. This is advisory
-guidance rather than a CLI policy enforcement hook.
+their own approval request. `run-auto` keeps generated audit IDs out of the
+command line so an unchanged substantive command has a stable approval string.
+A reusable rule for the full invocation must include the substantive argv after
+`--`; never approve the observer alone as a generic wrapper. Approval layers
+that can unwrap argv should match only that substantive command. This is
+advisory guidance rather than a CLI policy enforcement hook.
 
 The assets require Codex CLI 0.153.4 or newer, which supports
 `~/.codex/agents`, `~/.codex/skills`, and a global `~/.codex/AGENTS.md`.

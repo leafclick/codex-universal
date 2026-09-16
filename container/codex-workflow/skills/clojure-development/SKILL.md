@@ -13,6 +13,16 @@ JVM options cannot be selected safely from file presence or textual searches.
 For a one-off Babashka probe, an explicit `:one-off` recipe is likewise the
 reliable project interface.
 
+Resolve required runtime capabilities before starting a persistent REPL. A
+container profile such as `generic` or `cuda` only establishes what the
+container can support; it does not select a project runtime or change
+`:default-runtime`. When a task requires CUDA or another native backend, start
+an explicitly configured runtime whose documented argv enables that backend.
+Do not first try the default, CPU, or generic runtime, and do not invent a
+one-off shell wrapper as a fallback. If no matching runtime is declared, do not
+start a REPL: report the missing recipe and, when project edits are authorized,
+add one from the project's documented command before continuing.
+
 When the file is absent, inspect root `AGENTS.md`, project README and developer
 documents, `deps.edn`, `project.clj`, `bb.edn`, and relevant tool configuration
 before asking for it. Read them to establish documented commands and profiles;
@@ -99,14 +109,15 @@ process for classpath/JVM-option/native-state changes and configured integration
 commands. Stop task-owned REPLs and watchers before handoff.
 
 For observable fresh-process runs, keep approval identity independent of the
-dated run ID. Invoke the observer directly rather than embedding
-`observer run RUN_ID -- ...` in `bash -lc`, and describe/request approval for
-the substantive Clojure command, alias, and test scope. Do not recommend a
-reusable approval prefix for the observer itself because it can wrap arbitrary
-commands. Base agent/skill images should either authorize documented Clojure
-test argv before wrapping it or teach the approval layer to inspect the command
-after the observer's `--`; the run ID must remain audit metadata, not part of
-the reusable approval key.
+run ID. Invoke `codex-worker-observe run-auto -- clojure ...` directly rather
+than embedding it in `bash -lc`; capture the generated ID for later inspection.
+Describe/request approval for the substantive Clojure command, alias, and test
+scope. A reusable rule for the full stable invocation must include the
+substantive argv after `--`; never recommend one for the observer alone because
+it can wrap arbitrary commands. Use explicit `run RUN_ID -- ...` only when a
+predetermined audit ID is required and reusable approval is irrelevant. Plan
+one elevated run that covers the known acceptance criteria, and do not create
+speculative retries.
 
 Verify a persistent REPL and `clojure_probe` across commands: start the named
 runtime, define a harmless unique sentinel in one probe, consume that retained

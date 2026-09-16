@@ -17,6 +17,10 @@ Usage:
       Run a non-interactive command, mirror its output, and record its command,
       cwd, PID, status, timestamps, exit code, stdout, and stderr.
 
+  codex-worker-observe run-auto -- COMMAND [ARG ...]
+      Run and record a command under an automatically generated immutable ID.
+      Print the selected run ID and record directory before launching it.
+
   codex-worker-observe list
       List recorded runs with status, liveness, and start time.
 
@@ -32,6 +36,7 @@ Usage:
 
 RUN_ID must contain only letters, numbers, dots, underscores, and hyphens.
 Each ID is immutable. Choose a new ID rather than replacing prior evidence.
+Use run-auto when the command line must remain stable across repeated runs.
 
 Installed path: ~/.codex/scripts/codex-worker-observe
 EOF
@@ -120,6 +125,78 @@ print_log_summary() {
     fi
 }
 
+execute_run() {
+    local run_id="$1"
+    local run_dir="$2"
+    local announce_run="$3"
+    shift 3
+
+    chmod 0700 -- "$run_dir"
+    printf '%s\n' "$(pwd -P)" > "$run_dir/cwd"
+    printf '%q ' "$@" > "$run_dir/command"
+    printf '\n' >> "$run_dir/command"
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/started-at"
+    printf '%s\n' "$$" > "$run_dir/wrapper-pid"
+    : > "$run_dir/stdout.log"
+    : > "$run_dir/stderr.log"
+    printf '%s\n' starting > "$run_dir/status"
+
+    if ((announce_run == 1)); then
+        printf 'run-id: %s\n' "$run_id" >&2
+        printf 'record-dir: %s\n' "$run_dir" >&2
+        printf 'stdout: %s/stdout.log\n' "$run_dir" >&2
+        printf 'stderr: %s/stderr.log\n' "$run_dir" >&2
+    fi
+
+    child_pid=""
+    finished=0
+    finish_interrupted() {
+        local signal_name="$1"
+        local exit_code="$2"
+        if [[ -n "$child_pid" ]]; then
+            kill -"$signal_name" "$child_pid" 2>/dev/null || true
+            wait "$child_pid" 2>/dev/null || true
+        fi
+        printf '%s\n' interrupted > "$run_dir/status"
+        printf '%s\n' "$exit_code" > "$run_dir/exit-code"
+        printf '%s\n' "$signal_name" > "$run_dir/signal"
+        printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
+        finished=1
+        exit "$exit_code"
+    }
+    finish_unknown() {
+        local exit_code=$?
+        if ((finished == 0)); then
+            printf '%s\n' unknown > "$run_dir/status"
+            printf '%s\n' "$exit_code" > "$run_dir/wrapper-exit-code"
+            printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
+        fi
+    }
+    trap 'finish_interrupted HUP 129' HUP
+    trap 'finish_interrupted INT 130' INT
+    trap 'finish_interrupted TERM 143' TERM
+    trap finish_unknown EXIT
+
+    "$@" > >(tee -- "$run_dir/stdout.log") \
+        2> >(tee -- "$run_dir/stderr.log" >&2) &
+    child_pid=$!
+    printf '%s\n' "$child_pid" > "$run_dir/pid"
+    printf '%s\n' running > "$run_dir/status"
+    set +e
+    wait "$child_pid"
+    exit_code=$?
+    set -e
+    printf '%s\n' "$exit_code" > "$run_dir/exit-code"
+    printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
+    if ((exit_code == 0)); then
+        printf '%s\n' completed > "$run_dir/status"
+    else
+        printf '%s\n' failed > "$run_dir/status"
+    fi
+    finished=1
+    exit "$exit_code"
+}
+
 command_name="${1:-}"
 case "$command_name" in
     root)
@@ -136,63 +213,20 @@ case "$command_name" in
             echo "Run ID already exists or cannot be created: $run_id" >&2
             exit 2
         fi
-        chmod 0700 -- "$run_dir"
-        printf '%s\n' "$(pwd -P)" > "$run_dir/cwd"
-        printf '%q ' "$@" > "$run_dir/command"
-        printf '\n' >> "$run_dir/command"
-        printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/started-at"
-        printf '%s\n' "$$" > "$run_dir/wrapper-pid"
-        : > "$run_dir/stdout.log"
-        : > "$run_dir/stderr.log"
-        printf '%s\n' starting > "$run_dir/status"
-
-        child_pid=""
-        finished=0
-        finish_interrupted() {
-            local signal_name="$1"
-            local exit_code="$2"
-            if [[ -n "$child_pid" ]]; then
-                kill -"$signal_name" "$child_pid" 2>/dev/null || true
-                wait "$child_pid" 2>/dev/null || true
-            fi
-            printf '%s\n' interrupted > "$run_dir/status"
-            printf '%s\n' "$exit_code" > "$run_dir/exit-code"
-            printf '%s\n' "$signal_name" > "$run_dir/signal"
-            printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
-            finished=1
-            exit "$exit_code"
+        execute_run "$run_id" "$run_dir" 0 "$@"
+        ;;
+    run-auto)
+        (($# >= 3)) || usage
+        [[ "$2" == -- ]] || usage
+        shift 2
+        run_dir="$(mktemp -d -- \
+            "$state_root/auto-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXXXX")" || {
+            echo "Could not allocate an automatic run ID below $state_root" >&2
+            exit 2
         }
-        finish_unknown() {
-            local exit_code=$?
-            if ((finished == 0)); then
-                printf '%s\n' unknown > "$run_dir/status"
-                printf '%s\n' "$exit_code" > "$run_dir/wrapper-exit-code"
-                printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
-            fi
-        }
-        trap 'finish_interrupted HUP 129' HUP
-        trap 'finish_interrupted INT 130' INT
-        trap 'finish_interrupted TERM 143' TERM
-        trap finish_unknown EXIT
-
-        "$@" > >(tee -- "$run_dir/stdout.log") \
-            2> >(tee -- "$run_dir/stderr.log" >&2) &
-        child_pid=$!
-        printf '%s\n' "$child_pid" > "$run_dir/pid"
-        printf '%s\n' running > "$run_dir/status"
-        set +e
-        wait "$child_pid"
-        exit_code=$?
-        set -e
-        printf '%s\n' "$exit_code" > "$run_dir/exit-code"
-        printf '%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$run_dir/finished-at"
-        if ((exit_code == 0)); then
-            printf '%s\n' completed > "$run_dir/status"
-        else
-            printf '%s\n' failed > "$run_dir/status"
-        fi
-        finished=1
-        exit "$exit_code"
+        run_id="${run_dir##*/}"
+        validate_id "$run_id"
+        execute_run "$run_id" "$run_dir" 1 "$@"
         ;;
     list)
         (($# == 1)) || usage

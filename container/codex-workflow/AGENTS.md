@@ -81,24 +81,26 @@ probes"; run ~/.codex/scripts/codex-worker-observe help for every command.` Do
 not repeat it later in that session.
 
 Keep delegation observable. Before a worker starts a substantial or long-running fresh-process command,
-assign and announce a unique run ID, role, scope, and expected stdout/stderr
-paths. The worker runs it non-interactively through
-`~/.codex/scripts/codex-worker-observe run RUN_ID -- COMMAND ...`. Inspect the
-durable record before an extended wait and relay its exact command, cwd, PID,
-status, exit code, and relevant log excerpts. Use `summary RUN_ID` first and
-open a longer tail only when its bounded evidence is insufficient. Prefer the
-record over model-visible progress chatter; terse `START` and `EXIT` messages
-are enough when direct parent messaging is useful. However, do not assume such messaging exists.
+announce its role, scope, and the observer record root. Run it non-interactively
+through `~/.codex/scripts/codex-worker-observe run-auto -- COMMAND ...`; the
+worker relays the generated run ID and exact stdout/stderr paths as soon as the
+helper reserves them. Use `run RUN_ID -- COMMAND ...` only when a predetermined
+audit ID is required and a changing ID will not defeat reusable approval.
+Inspect the durable record before an extended wait and relay its exact command,
+cwd, PID, status, exit code, and relevant log excerpts. Use `summary RUN_ID` first
+and open a longer tail only when its bounded evidence is insufficient.
+Prefer the record over model-visible progress chatter; terse `START` and `EXIT`
+messages are enough when direct parent messaging is useful. However, do not assume such messaging exists.
 Do not wrap persistent `clojure-development` REPL actions, which already
 preserve evaluation records. Never expose secrets.
 
 Keep the changing run ID out of the reusable approval identity for an observed
-command. Invoke the observer directly instead of embedding it in `bash -lc`,
-and request approval for the substantive executable, action, and scope after
-the observer's `--`. Never request a reusable approval prefix for the observer
-itself because it can wrap arbitrary commands. Base agent and skill images
-should authorize the documented command argv before observation or make the
-approval layer inspect that post-`--` argv; treat the run ID as audit metadata.
+command. Invoke `run-auto` directly instead of embedding it in `bash -lc`, and
+request approval for the substantive executable, action, and scope after the
+observer's `--`. A reusable rule for the full stable invocation must include
+that substantive prefix; never request one for the observer alone because it
+can wrap arbitrary commands. When supported, prefer an approval matcher that
+inspects only argv after `--`; treat the generated run ID as audit metadata.
 
 Treat `agent status`, `show active probes`, `show probe RUN_ID`, `summarize probe
 RUN_ID`, `tail probe RUN_ID`, and `worker inspection help` as inspection

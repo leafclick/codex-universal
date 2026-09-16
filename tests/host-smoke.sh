@@ -285,10 +285,13 @@ grep -Fq 'genuinely independent' "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not require genuinely independent delegation"
 grep -Fq 'Use `summary RUN_ID` first' "$ROOT/container/codex-workflow/AGENTS.md" ||
     fail "workflow guidance does not prefer bounded worker summaries"
-grep -Fq 'treat the run ID as audit metadata' \
+grep -Fq 'run-auto -- COMMAND ...' \
     "$ROOT/container/codex-workflow/AGENTS.md" ||
-    fail "workflow guidance makes observed-command approval depend on the run ID"
-grep -Fq 'reusable approval prefix for the observer itself' \
+    fail "workflow guidance does not keep generated run IDs out of commands"
+grep -Fq 'generated run ID as audit metadata' \
+    "$ROOT/container/codex-workflow/AGENTS.md" ||
+    fail "workflow guidance does not treat generated run IDs as audit metadata"
+grep -Fq 'never recommend one for the observer alone' \
     "$ROOT/container/codex-workflow/skills/clojure-development/SKILL.md" ||
     fail "Clojure guidance permits an overbroad observer approval prefix"
 if grep -R -Fq '$CODEX_HOME/scripts/codex-worker-observe' \
@@ -304,6 +307,8 @@ observe_helper="$ROOT/container/codex-workflow/scripts/codex-worker-observe"
 observe_help="$(CODEX_WORKER_OBSERVE_DIR=/not/below/tmp "$observe_helper" help)"
 assert_contains "$observe_help" 'Inspect commands run by delegated Codex workers.'
 assert_contains "$observe_help" 'codex-worker-observe list'
+assert_contains "$observe_help" 'codex-worker-observe run-auto -- COMMAND [ARG ...]'
+assert_contains "$observe_help" 'Use run-auto when the command line must remain stable'
 assert_contains "$observe_help" 'List recorded runs with status, liveness, and start time.'
 assert_contains "$observe_help" 'codex-worker-observe show RUN_ID'
 assert_contains "$observe_help" 'codex-worker-observe summary RUN_ID'
@@ -355,6 +360,55 @@ observe_reuse_exit=$?
 set -e
 [[ "$observe_reuse_exit" == 2 ]] ||
     fail "worker observability helper replaced an immutable run ID"
+
+for auto_attempt in first second; do
+    set +e
+    auto_stdout="$(
+        CODEX_WORKER_OBSERVE_DIR="$observe_root" \
+            "$observe_helper" run-auto -- \
+            bash -c 'printf "auto-out\n"; printf "auto-err\n" >&2; exit 9' \
+            2>"$TEST_ROOT/observe-auto-$auto_attempt-stderr"
+    )"
+    auto_exit=$?
+    set -e
+    [[ "$auto_exit" == 9 ]] ||
+        fail "automatic worker observation lost command exit status"
+    [[ "$auto_stdout" == auto-out ]] ||
+        fail "automatic worker observation lost stdout"
+    auto_id="$(sed -n 's/^run-id: //p' \
+        "$TEST_ROOT/observe-auto-$auto_attempt-stderr")"
+    auto_dir="$(sed -n 's/^record-dir: //p' \
+        "$TEST_ROOT/observe-auto-$auto_attempt-stderr")"
+    [[ "$auto_id" =~ ^auto-[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9]+$ ]] ||
+        fail "automatic worker observation emitted an invalid run ID"
+    [[ "$auto_dir" == "$observe_root/$auto_id" ]] ||
+        fail "automatic worker observation emitted the wrong record directory"
+    grep -Fxq "stdout: $auto_dir/stdout.log" \
+        "$TEST_ROOT/observe-auto-$auto_attempt-stderr" ||
+        fail "automatic worker observation did not report its stdout path"
+    grep -Fxq "stderr: $auto_dir/stderr.log" \
+        "$TEST_ROOT/observe-auto-$auto_attempt-stderr" ||
+        fail "automatic worker observation did not report its stderr path"
+    grep -Fxq auto-err "$auto_dir/stderr.log" ||
+        fail "automatic worker observation did not retain stderr"
+    grep -Fxq failed "$auto_dir/status" ||
+        fail "automatic worker observation did not record failure"
+    printf -v "auto_id_$auto_attempt" '%s' "$auto_id"
+done
+[[ "$auto_id_first" != "$auto_id_second" ]] ||
+    fail "automatic worker observation reused a generated run ID"
+auto_show="$(CODEX_WORKER_OBSERVE_DIR="$observe_root" \
+    "$observe_helper" show "$auto_id_first")"
+assert_contains "$auto_show" 'status:      failed'
+assert_contains "$auto_show" 'exit-code:   9'
+
+set +e
+CODEX_WORKER_OBSERVE_DIR="$observe_root" \
+    "$observe_helper" run-auto true >/dev/null 2>&1
+auto_usage_exit=$?
+set -e
+[[ "$auto_usage_exit" == 2 ]] ||
+    fail "automatic worker observation accepted a command without --"
 pass "worker command observability"
 activity "static security and runtime invariants"
 
