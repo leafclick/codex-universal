@@ -1323,10 +1323,11 @@ Records remain available for audit until the host operator explicitly runs
 valid delivery receipt and inbox records with a valid acknowledgment; malformed,
 unresolved, or concurrently changed records are retained and reported.
 
-This first controller slice is local to one host's registered linked-worktree
-lanes. It does not yet broker messages across machines or automatically wake an
-agent. Run the command on the host, not inside an agent container; containers
-do not receive the other lane's inbox or state directory.
+This controller is intentionally local to one host's registered linked-worktree
+lanes. Cross-machine brokering, automatic wakeup, and multi-provider
+coordination belong to `clojure-agent-harness`. Run the command on the host, not
+inside an agent container; containers do not receive another lane's inbox or
+state directory.
 
 To copy only login and user configuration into a new lane, opt in during
 registration:
@@ -1364,10 +1365,8 @@ conflicting managed path is rejected rather than overwritten.
 
 The launcher refuses a default lane or a reviewer checkout with tracked
 changes, starts a fresh context, and supplies a read-only review task for that
-exact commit. `agent=codex` is the first trusted container adapter. The
-registry and Docker labels keep the adapter identity separate from the lane
-and reviewer role so a future hardened image can add a Claude adapter without
-changing the handoff or human-approval boundary.
+exact commit. `agent=codex` is the only supported container adapter in this
+repository. Multi-provider adapters belong to `clojure-agent-harness`.
 
 Lane state uses a separate snapshot namespace and local baseline. After
 stopping the selected lane, publish or restore it independently:

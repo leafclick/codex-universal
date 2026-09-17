@@ -6,9 +6,11 @@ in `REVIEW-ARCHIVE.md`; current execution evidence and probe failures remain in
 `STATUS.md`.
 
 Issue 23 remains deferred. Issue 44 now has a substantial source implementation
-and remains in progress for live/multi-machine acceptance and expansion of the
-local collaboration mailbox into a broker. See the
-[project isolation and cooperation plan](docs/project-isolation-plan.md) for
+and remains in progress for live-image and second-machine Codex lane acceptance.
+The existing local mailbox remains supported, but multi-agent coordination,
+cross-provider adapters, broker expansion, and automatic wakeup belong to the
+separate `clojure-agent-harness` project and are not roadmap items here. See the
+[project isolation and lane handoff plan](docs/project-isolation-plan.md) for
 scope, tradeoffs, migration, implementation phases, and acceptance gates.
 Checkout onboarding (including ignored configuration, completed templates, and
 machine-specific inputs) is required in the initial lane implementation.
@@ -36,7 +38,7 @@ not a current handoff correctness defect.
 
 | ID | Type | Work item | Evidence | Status | Complexity | Reason |
 |---:|---|---|---|---|---|---|
-| 44 | New feature | Add project/lane isolation, independent state handoff, and cooperation between isolated agents. | SOURCE IMPLEMENTED (partial) | Local lanes now have distinct checkout/state/cache/container/lock identities, managed and adopted linked-worktree support, onboarding gates, contextual handoff markers, local exact-commit fast-forward result import, guarded managed-lane cleanup, fixed-revision Codex review, and a bounded host-side mailbox with explicit delivery and acknowledgment. Live second-machine/image acceptance, cross-machine message brokering and wakeup, and a future Claude adapter remain. See `docs/project-isolation-plan.md`. | H, phased | Preserve the user's IDEA checkout while enabling independent experiments and cross-machine work. |
+| 44 | New feature | Add Codex project/lane isolation and independent state handoff. | SOURCE IMPLEMENTED (partial) | Local lanes now have distinct checkout/state/cache/container/lock identities, managed and adopted linked-worktree support, onboarding gates, contextual handoff markers, local exact-commit fast-forward result import, guarded managed-lane cleanup, fixed-revision Codex review, and a bounded local mailbox with explicit delivery and acknowledgment. Live-image and real second-machine Codex handoff acceptance remain. The mailbox is intentionally local-only; multi-agent and multi-provider expansion is out of scope. See `docs/project-isolation-plan.md`. | H, phased | Preserve the user's IDEA checkout while enabling independent Codex experiments and cross-machine handoff. |
 
 ### Selective synchronization design gate
 

@@ -16,6 +16,9 @@ This change log follows the conventions of
 
 - Pin the image npm CLI to 12.0.2 while retaining the newest registry-published
   `agent-lsp` package, 0.19.1.
+- Keep this repository's roadmap focused on the standalone Codex container,
+  Codex lanes, and state handoff; move multi-agent and multi-provider
+  coordination scope to `clojure-agent-harness`.
 
 ### Fixed
 

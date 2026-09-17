@@ -1,21 +1,23 @@
-# Project isolation and cooperating agents
+# Project isolation and Codex lane handoff
 
 Design and implementation record, 2026-09-12. The first local-lane slice is
-implemented in `run-codex`; later synchronization and collaboration-broker
-phases remain planned. Issue 23 remains deferred.
+implemented in `run-codex`; live-image and second-machine handoff acceptance
+remain planned. The existing local Codex mailbox is retained, but multi-agent
+and multi-provider coordination belongs to `clojure-agent-harness`. Issue 23
+remains deferred.
 
 ## Outcomes and boundaries
 
 The user and the foreground IDEA agent continue to see and edit the exact
 checkout open in IDEA. A CLI experiment runs in another directory and container.
 Independent projects, and independent experiments within a project, can move
-between machines separately. Two agents can contribute to one feature through
-explicit messages and reviewed commits.
+between machines separately. Codex review and result import remain explicit,
+revision-bound operations.
 
 Preserve non-root Docker execution, dropped capabilities, no-new-privileges,
 read-only image roots, Bubblewrap, workspace-write, and user-reviewed escalation.
-Cooperation does not give either agent access to the Docker socket, a host shell,
-the other agent's writable directory, or its credentials.
+Lane operations do not give a container access to the Docker socket, a host
+shell, another lane's writable directory, or its credentials.
 
 The isolation claim is bounded: protect lanes from unintended file, Git, and
 runtime interference by containerized agents. The host user and IDEA remain
@@ -31,7 +33,6 @@ at an external service.
 | Lane | An independently evolving line of work belonging to a project | Across launches and machine handoffs |
 | Binding | Machine-local mapping of lane ID to canonical checkout path | Local registration |
 | Session | One running agent, model selection, and frontend | One launch/resume |
-| Collaboration | Shared objective, participants, base revision, and acceptance criteria | One feature or investigation |
 
 Names such as `cortex/main` and `cortex/gpu-experiment` are user-facing aliases.
 Opaque IDs prevent accidental namespace collisions. A path or Git common
@@ -211,51 +212,17 @@ require explicit allocation. CPU/memory limits and GPU workload coordination
 prevent resource starvation; separate containers do not partition GPU memory by
 themselves. Match existing CUDA and approved-execution behavior in validation.
 
-## Cooperation protocol for two independent models
+## Coordination scope
 
-“Reviewer” is a collaboration role, not a Codex approval reviewer or a product
-name. A trusted container adapter maps an agent kind to its image, executable,
-state root, authentication bootstrap, model/options, prompt transport, and IDE
-capabilities. Adapter selection is data in the lane record and Docker labels;
-it is never a shell command supplied by a repository. The first adapter is
-`codex`, using a lane-specific `CODEX_HOME` and the supported `--model` flag.
-A future `claude` adapter must ship as a reviewed container entrypoint and meet
-the same non-root, Docker, Bubblewrap, network, mount, and human-approval
-requirements before it is accepted. The revision/message protocol below does
-not depend on either adapter.
+This repository supports Codex-only lanes, fixed-revision review, explicit
+result import, and the already implemented bounded local mailbox. Mailbox
+messages remain inert data: they do not authorize commands, approvals, Git
+writes, imports, wakeups, or container creation.
 
-Start with the foreground agent as feature owner and a background agent as
-independent reviewer/test author. This needs only two sessions. When a feature
-has separable components, both can implement against an agreed interface.
-
-1. Record the objective, base commit, interface contract, acceptance tests, and
-   each participant's responsibility. File ownership reduces overlap but is not
-   a security mechanism or proof that changes are compatible.
-2. Start each agent in its lane with independent model selection and context.
-   Record model, image/runtime version, lane ID, and base revision in results.
-3. Exchange bounded messages: question, interface proposal, result available,
-   review finding, or integration result. Include sender identity, message ID,
-   and the revision being discussed. Recipients acknowledge durable messages;
-   retries must not duplicate actions.
-4. Publish immutable commits/bundles with a brief result and test evidence.
-   Import the requested revision into the recipient's own checkout for testing.
-   Never review a moving branch name as though it were a fixed result.
-5. The feature owner integrates accepted commits sequentially and runs combined
-   acceptance tests. Failed integration returns a concrete finding to its owner.
-   Changes to the shared interface require explicit renegotiation.
-
-Messages are peer-provided data, not authorization to run commands, approve
-escalation, or expand a task. Use a small controller that routes structured
-messages and artifacts through per-session inboxes/outboxes. Each agent can
-write only its own outbox. Avoid a shared writable task file or general host
-execution endpoint. Runtime container creation remains a host launcher action.
-
-For the first release, manual send/receive and result import are sufficient;
-automatic wakeup can follow after delivery, cancellation, and crash recovery
-are reliable. Bound message size, rounds, elapsed time, and model spend. Show
-both agents' status and pending approvals together. Do not automatically merge
-to the foreground checkout while the user is editing it: check the expected
-revision and dirty state and require an explicit integration action.
+The mailbox is intentionally local to one host and is not a foundation for a
+new coordinator here. Cross-provider adapters, generic agent abstractions,
+cross-machine message brokering, automatic wakeup, and consolidated multi-agent
+status belong to `clojure-agent-harness`.
 
 ## Implementation sequence and acceptance gates
 
@@ -266,16 +233,15 @@ revision and dirty state and require an explicit integration action.
 | 2 | Per-lane state, runtime locks, scoped safety checks, and minimal checkout onboarding | Two projects run concurrently; local configuration can be adopted/copied/completed; existing files preserved; missing inputs block normal launch but permit setup | Implemented locally | M-H |
 | 3 | Per-lane snapshots and explicit machine handoff | Independent generations; incomplete transfer refusal; destination configuration reprovisioned/rebound; divergence preserves both copies; rollback tested | Partial: snapshots now bind a clean required commit, immutable runtime labels, and onboarding contract/readiness to each lane; local two-root refusal/restore fixtures pass, while live second-machine acceptance remains | M-H |
 | 4 | Background checkout creation, onboarding, and Git result exchange | Shared-Git authority bounded; independent branches; usable local configuration; source checkout unchanged; cleanup protects unpublished code and local inputs | Partial: managed creation, local exact-commit fast-forward import, and guarded cleanup pass host fixtures; live-image acceptance remains | M-H |
-| 5 | Two-agent cooperation and revision-specific review | Distinct containers/models; durable messages; cross-lane writes denied; result import and combined tests demonstrated | Partial: revision-specific Codex review, guarded local result import, and an inert host-side send/deliver/read/ack/prune mailbox pass local fixtures; cross-machine brokering, automatic wakeup, live-image isolation, and combined-result acceptance remain | M-H |
+| 5 | Codex revision-specific review and local mailbox | Durable inert messages; cross-lane writes denied; result import remains explicit | Implemented in host fixtures: fixed-revision Codex review, guarded local result import, and send/deliver/read/ack/prune. The mailbox is intentionally local-only and has no multi-agent expansion roadmap here. | M-H |
 | 6 | Stricter checkout backend | Private Git authority or broker is proven without breaking exact-checkout IDE use | Not started; optional | H; optional |
 
 Phases 2 and 3 together deliver independent project handoff. The implemented
 part of Phase 4 delivers managed independent worktrees alongside IDEA, guarded
 fast-forward result import, and conservative cleanup under an explicit
-shared-Git trust model. Phase 5 now provides a fixed-revision reviewer and a
-bounded local host controller for immutable, explicitly delivered peer
-messages. Cross-machine transport, automatic wakeup, unified status, and live
-combined-result acceptance still need the later broker work described above.
+shared-Git trust model. Phase 5 provides a fixed-revision Codex reviewer and a
+bounded local host controller for immutable, explicitly delivered messages.
+Further coordination work is outside this repository's scope.
 
 ## Migration, verification, and operational costs
 
@@ -298,13 +264,12 @@ model. Host argument checks alone are not evidence of effective isolation.
 Validate generic and CUDA profiles when shared image behaviour changes.
 
 Mailbox race coverage currently uses deterministic command wrappers rather
-than real multi-process stress. Collaboration locks coordinate supported
+than real multi-process stress. Mailbox locks coordinate supported
 commands, but they are not a security boundary against another same-account
 process that edits mailbox paths directly; check-to-rename windows can still be
 won by such a writer, with conflicting data restored or quarantined on the
-covered paths. Keep the host state root private to the operator and retain this
-risk until stress testing and live container/runtime isolation checks run on a
-Docker host.
+covered paths. Keep the host state root private to the operator. No stronger
+multi-process or cross-machine mailbox guarantee is claimed here.
 
 Costs include duplicated dependencies and indexes, additional model context and
 review effort, credential management, interrupted handoffs, and extra disk/GPU
@@ -312,19 +277,10 @@ usage. Parallel implementation is useful only when decomposition and integration
 cost less than the time saved. Prefer independent review when work is tightly
 coupled; competing implementations are alternatives, not automatically mergeable.
 
-## Evidence informing the proposal
+## Evidence informing the design
 
 - [Git worktree documentation](https://git-scm.com/docs/git-worktree): shared
   refs/configuration and per-worktree administrative state explain why worktree
   file separation is not a complete Git security boundary.
-- [incident.io, June 27, 2025](https://incident.io/blog/shipping-faster-with-claude-code-and-git-worktrees):
-  practical parallel feature development with worktrees and dedicated environments.
-- [Anthropic, February 5, 2026](https://www.anthropic.com/engineering/building-c-compiler):
-  separate container clones, strong verification, and the failure of parallelism
-  when agents all tackle the same bottleneck. Its permission-bypassing harness
-  is not adopted here.
-- [Cursor, February 5, 2026](https://cursor.com/blog/self-driving-codebases):
-  coordination lock failures and integration bottlenecks. The reported scale is
-  far larger than two agents; our feature owner is a deliberate bounded choice.
-
-These reports inform the design; our implementation must supply its own evidence.
+The implementation must supply its own runtime evidence for every isolation and
+handoff claim.
