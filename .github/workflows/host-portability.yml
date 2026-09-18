@@ -1,0 +1,34 @@
+name: Host portability
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  compatibility-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install synchronization dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq lsof sqlite3 zstd
+      - name: Run compatibility, synchronization, and collaboration smoke tests
+        run: |
+          bash tests/host-smoke-compat.sh
+          bash tests/host-smoke-sync.sh
+          bash tests/host-smoke-collab.sh
+
+  compatibility-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GNU host utilities and synchronization dependencies
+        run: |
+          brew install bash coreutils gnu-tar flock jq zstd
+      - name: Run compatibility, synchronization, and collaboration smoke tests
+        run: |
+          export PATH="$(brew --prefix bash)/bin:$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix gnu-tar)/libexec/gnubin:$(brew --prefix)/bin:$PATH"
+          bash tests/host-smoke-compat.sh
+          bash tests/host-smoke-sync.sh
+          bash tests/host-smoke-collab.sh
