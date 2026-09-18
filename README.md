@@ -1131,7 +1131,11 @@ retained for recovery. `--list` verifies every retained bundle and marks the
 active one. Use `--rollback BUNDLE_ID` to verify and atomically reactivate an
 older bundle for the same operating-system backend; no bundles are deleted.
 The checkout-oriented `--check` continues to report a mismatch while a bundle
-from an older checkout is active.
+from an older checkout is active. To reclaim space, first inspect an inactive
+bundle with `--remove BUNDLE_ID --dry-run`, then remove it with
+`--remove BUNDLE_ID`. Removal refuses the active bundle and preserves a named
+tombstone if filesystem deletion fails so the same command can retry cleanup
+or report the exact path requiring manual recovery.
 
 On GNU/Linux the bundle includes `run-codex`, `setup-codex-idea`, and the
 standalone synchronization and collaboration commands. On macOS it installs
