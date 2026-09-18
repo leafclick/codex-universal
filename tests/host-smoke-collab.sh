@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-T="$(mktemp -d)"; trap 'rm -rf -- "$T"' EXIT
+ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 fail(){ echo "not ok - $1" >&2; exit 1; }; pass(){ echo "ok - $1"; }
 for c in awk git jq stat sha256sum mktemp date od tr sort install cmp flock find sed; do command -v "$c" >/dev/null || fail "missing $c"; done
+if [[ "$(uname -s)" == Darwin ]]; then
+    CODEX_TEST_MV_NAME=gmv
+else
+    CODEX_TEST_MV_NAME=mv
+fi
+CODEX_TEST_REAL_MV="$(command -v "$CODEX_TEST_MV_NAME")" ||
+    fail "missing $CODEX_TEST_MV_NAME"
+CODEX_TEST_REAL_INSTALL="$(command -v install)" || fail "missing install"
+export CODEX_TEST_REAL_MV CODEX_TEST_REAL_INSTALL
 repo="$T/repo"; mkdir -p "$repo" "$T/home" "$T/config/run-codex/projects" "$T/config/run-codex/lanes/collab-project"
 git -C "$repo" init -q -b main; printf '%s\n' base > "$repo/payload"; git -C "$repo" add payload
 git -C "$repo" -c user.name=smoke -c user.email=smoke.invalid commit -qm base
@@ -89,8 +98,8 @@ bulk_completed="$T/bulk-completed"
 bulk_unresolved="$T/bulk-unresolved"
 mkdir -p "$delivered_dir" "$acks_dir" "$bulk_completed" "$bulk_unresolved"
 generate_records "$T/original.json" "$bulk_completed" 1 1000
-cp -- "$bulk_completed"/*.json "$out/"
-cp -- "$bulk_completed"/*.json "$in/"
+cp "$bulk_completed"/*.json "$out/"
+cp "$bulk_completed"/*.json "$in/"
 sha256sum "$bulk_completed"/*.json | while read -r digest file; do
     extra_id="${file##*/}"
     extra_id="${extra_id%.json}"
@@ -106,14 +115,14 @@ capacity_id="$(<"$T/capacity-id")"
 run deliver collab-project --lane default "$capacity_id" >/dev/null ||
     fail "acknowledged inbox records consumed pending limit"
 generate_records "$T/original.json" "$bulk_unresolved" 1001 1999
-cp -- "$bulk_unresolved"/*.json "$out/"
-cp -- "$bulk_unresolved/$(printf '%032x' 1001).json" "$in/"
+cp "$bulk_unresolved"/*.json "$out/"
+cp "$bulk_unresolved/$(printf '%032x' 1001).json" "$in/"
 if run send collab-project --lane default --to review --kind question --revision "$base" \
     --body-file "$T/pending-body" >/dev/null 2>&1; then fail "unresolved outbox records did not consume pending limit"; fi
-rm -- "$out"/0000000000000000000000000000*.json
-rm -- "$in"/0000000000000000000000000000*.json
-rm -- "$delivered_dir"/0000000000000000000000000000*.json
-rm -- "$acks_dir"/0000000000000000000000000000*.json
+rm "$out"/0000000000000000000000000000*.json
+rm "$in"/0000000000000000000000000000*.json
+rm "$delivered_dir"/0000000000000000000000000000*.json
+rm "$acks_dir"/0000000000000000000000000000*.json
 
 atomic_body="$T/atomic-body"; printf atomic > "$atomic_body"
 run send collab-project --lane default --to review --kind question --revision "$base" \
@@ -122,11 +131,11 @@ atomic_id="$(<"$T/atomic-id")"; atomic_source="$out/$atomic_id.json"
 atomic_bin="$T/atomic-bin"; mkdir -p "$atomic_bin"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
-    'if [[ "${3:-}" == -- && "${4:-}" == "'$atomic_source'" ]]; then' \
-    '    jq ''.to_lane="default"'' "$4" > "$4.replaced"' \
-    '    mv -- "$4.replaced" "$4"' \
+    'if [[ "${3:-}" == "'$atomic_source'" ]]; then' \
+    '    jq ''.to_lane="default"'' "$3" > "$3.replaced"' \
+    '    mv "$3.replaced" "$3"' \
     'fi' \
-    'exec /bin/install "$@"' > "$atomic_bin/install"
+    'exec "$CODEX_TEST_REAL_INSTALL" "$@"' > "$atomic_bin/install"
 chmod 755 "$atomic_bin/install"
 if PATH="$atomic_bin:$PATH" run deliver collab-project --lane default "$atomic_id" >/dev/null 2>&1; then
     fail "delivery accepted an atomically replaced source"
@@ -184,13 +193,13 @@ prune_pre_bin="$T/prune-pre-bin"; mkdir -p "$prune_pre_bin"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ "${1:-}" == -T && "${2:-}" == -- && "${3:-}" == "'$prune_pre_race_marker'" ]]; then' \
-    '    /bin/mv "$@"' \
-    '    cp -- "'$prune_pre_replacement'" "'$prune_pre_race_record'.replacement"' \
-    '    /bin/mv -T -- "'$prune_pre_race_record'.replacement" "'$prune_pre_race_record'"' \
+    '    "$CODEX_TEST_REAL_MV" "$@"' \
+    '    cp "'$prune_pre_replacement'" "'$prune_pre_race_record'.replacement"' \
+    '    "$CODEX_TEST_REAL_MV" -T -- "'$prune_pre_race_record'.replacement" "'$prune_pre_race_record'"' \
     '    exit 0' \
     'fi' \
-    'exec /bin/mv "$@"' > "$prune_pre_bin/mv"
-chmod 755 "$prune_pre_bin/mv"
+    'exec "$CODEX_TEST_REAL_MV" "$@"' > "$prune_pre_bin/$CODEX_TEST_MV_NAME"
+chmod 755 "$prune_pre_bin/$CODEX_TEST_MV_NAME"
 if PATH="$prune_pre_bin:$PATH" run prune collab-project --lane default \
     >/dev/null 2>&1; then
     fail "prune accepted a record replaced before its hold"
@@ -200,10 +209,11 @@ jq -e '.body == "pre-move replacement"' "$prune_pre_race_record" >/dev/null ||
 [[ ! -e "$prune_pre_race_marker" ]] ||
     fail "pre-move replacement inherited the stale completion marker"
 prune_pre_quarantine="$T/config/run-codex/state/collab-project/default/collaboration/quarantine"
-prune_pre_stale_marker="$(find "$prune_pre_quarantine" -mindepth 1 -maxdepth 1 \
+prune_pre_stale_marker="$(find "$prune_pre_quarantine" \
+    -path "$prune_pre_quarantine/*/*" -prune -o \
     -type f -name "$prune_pre_race_id.prune-marker.*.json" -print -quit)"
 [[ -f "$prune_pre_stale_marker" ]] || fail "stale prune marker was not quarantined"
-rm -- "$prune_pre_race_record" "$prune_pre_stale_marker"
+rm "$prune_pre_race_record" "$prune_pre_stale_marker"
 run send collab-project --lane default --to review --kind question --revision "$base" \
     --body-file "$T/pending-body" > "$T/prune-race-id"
 prune_race_id="$(<"$T/prune-race-id")"
@@ -214,21 +224,21 @@ prune_bin="$T/prune-bin"; mkdir -p "$prune_bin"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ "${1:-}" == -T && "${2:-}" == -- && "${3:-}" == "'$prune_race_record'" ]]; then' \
-    '    /bin/mv "$@"' \
-    '    cp -- "$4" "$3"' \
+    '    "$CODEX_TEST_REAL_MV" "$@"' \
+    '    cp "$4" "$3"' \
     '    printf " " >> "$3"' \
     '    exit 0' \
     'fi' \
-    'exec /bin/mv "$@"' > "$prune_bin/mv"
-chmod 755 "$prune_bin/mv"
+    'exec "$CODEX_TEST_REAL_MV" "$@"' > "$prune_bin/$CODEX_TEST_MV_NAME"
+chmod 755 "$prune_bin/$CODEX_TEST_MV_NAME"
 PATH="$prune_bin:$PATH" run prune collab-project --lane default >/dev/null
 [[ -f "$prune_race_record" && ! -e "$prune_race_marker" ]] ||
     fail "prune deleted the replacement record or retained the old marker"
-if find "$delivered_dir" -mindepth 1 -maxdepth 1 -type d \
+if find "$delivered_dir" -path "$delivered_dir/*/*" -prune -o -type d \
     -name ".${prune_race_id}.prune.*" -print -quit | grep -q .; then
     fail "successful prune retained its private hold"
 fi
-rm -- "$prune_race_record"
+rm "$prune_race_record"
 run send collab-project --lane default --to review --kind question --revision "$base" \
     --body-file "$T/pending-body" > "$T/prune-id"
 prune_id="$(<"$T/prune-id")"

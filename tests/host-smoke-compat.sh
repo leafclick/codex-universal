@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 umask 077
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEST_ROOT="$(mktemp -d)"
-trap 'rm -rf -- "$TEST_ROOT"' EXIT
+trap 'rm -rf "$TEST_ROOT"' EXIT
 
 pass() { printf '  ok - %s\n' "$1"; }
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
@@ -24,10 +24,10 @@ codex_host_require_capabilities \
 pass "native host capability checks"
 
 fixture="$TEST_ROOT/fixture"
-mkdir -p -- "$fixture/sub"
+mkdir -p "$fixture/sub"
 printf 'z\n' > "$fixture/z file"
 printf 'a\n' > "$fixture/sub/a"
-chmod 600 -- "$fixture/z file"
+chmod 600 "$fixture/z file"
 
 assert_eq "$(codex_host_path_existing "$fixture/sub/../z file")" \
     "$fixture/z file" "existing path resolution"
@@ -39,7 +39,8 @@ assert_eq "$(codex_host_file_link_count "$fixture/z file")" "1" "link count"
 assert_eq "$(codex_host_file_owner_mode "$fixture/z file")" \
     "$(id -u):600" "owner and mode"
 assert_eq "$(codex_host_sha256_file "$fixture/z file")" \
-    "$(sha256sum -- "$fixture/z file" | awk '{print $1}')" "file checksum"
+    "c865f6c5ab8d1b0bcd383a5e1e3879d22681c96bf462c269b7581d523fbe70ab" \
+    "file checksum"
 assert_eq "$(printf 'compat\n' | codex_host_sha256_stdin)" \
     "$(printf 'compat\n' | sha256sum | awk '{print $1}')" "stdin checksum"
 assert_eq "$(printf '%s\0' z a 'with space' | codex_host_sort_null | tr '\0' '\n')" \
@@ -67,21 +68,21 @@ tar_two="$TEST_ROOT/archive-two.tar"
 codex_host_canonical_tar "$fixture" >"$tar_one"
 sleep 1
 codex_host_canonical_tar "$fixture" >"$tar_two"
-cmp -s -- "$tar_one" "$tar_two" || fail "canonical tar output changed between runs"
+cmp -s "$tar_one" "$tar_two" || fail "canonical tar output changed between runs"
 tar_listing="$(tar -tf "$tar_one")"
 assert_contains "$tar_listing" $'./sub/a' "canonical tar listing"
 assert_contains "$tar_listing" $'./z file' "canonical tar listing"
 pass "canonical deterministic tar"
 
 fake_root="$TEST_ROOT/fake-darwin"
-mkdir -p -- "$fake_root"
+mkdir -p "$fake_root"
 cat >"$fake_root/uname" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' Darwin
 EOF
-chmod 755 -- "$fake_root/uname"
+chmod 755 "$fake_root/uname"
 for tool in realpath stat sha256sum flock mv sort tar; do
-    ln -s -- "$(command -v "$tool")" "$fake_root/g$tool"
+    ln -s "$(command -v "$tool")" "$fake_root/g$tool"
 done
 
 darwin_output="$(
@@ -93,13 +94,13 @@ darwin_output="$(
             set -Eeuo pipefail
             source "$CODEX_COMPAT_ROOT/bin/codex-host-compat.bash"
             codex_host_require_capabilities path stat checksum lock atomic-replace null-sort canonical-tar
-            [[ "$CODEX_HOST_BACKEND" == darwin-homebrew ]]
+            [[ "$CODEX_HOST_BACKEND" == darwin-gnu ]]
             [[ "$CODEX_HOST_REALPATH" == grealpath ]]
             [[ "$(codex_host_path_existing "$CODEX_COMPAT_FIXTURE/sub/../z file")" == \
                 "$CODEX_COMPAT_FIXTURE/z file" ]]
             [[ "$(codex_host_file_mode "$CODEX_COMPAT_FIXTURE/z file")" == 600 ]]
             [[ "$(codex_host_sha256_file "$CODEX_COMPAT_FIXTURE/z file")" == \
-                "$(sha256sum -- "$CODEX_COMPAT_FIXTURE/z file" | awk "{print \$1}")" ]]
+                c865f6c5ab8d1b0bcd383a5e1e3879d22681c96bf462c269b7581d523fbe70ab ]]
             sorted_output="$(printf "%s\\0" z a | codex_host_sort_null | tr "\\0" "\\n")"
             [[ "$sorted_output" == a* && "$sorted_output" != z* ]]
             printf replacement > "$CODEX_COMPAT_FIXTURE/darwin-replacement"
@@ -118,7 +119,7 @@ darwin_output="$(
 )"
 assert_contains "$darwin_output" "Darwin backend semantic operations passed" \
     "Darwin backend semantic operations"
-pass "Darwin Homebrew GNU backend semantic operations"
+pass "Darwin GNU backend semantic operations"
 
 set +e
 security_output="$(PATH="$fake_root:$REAL_PATH" bash -c \
@@ -132,12 +133,12 @@ assert_contains "$security_output" "hardened launcher and host security setup re
 pass "Darwin Linux-security rejection"
 
 unsupported_root="$TEST_ROOT/fake-unsupported"
-mkdir -p -- "$unsupported_root"
+mkdir -p "$unsupported_root"
 cat >"$unsupported_root/uname" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' FreeBSD
 EOF
-chmod 755 -- "$unsupported_root/uname"
+chmod 755 "$unsupported_root/uname"
 set +e
 unsupported_output="$(PATH="$unsupported_root:$REAL_PATH" bash -c \
     'source "$1/bin/codex-host-compat.bash"; codex_host_select_backend' \
@@ -150,8 +151,8 @@ assert_contains "$unsupported_output" "unsupported host 'FreeBSD'" \
 pass "unsupported platform diagnostic"
 
 missing_root="$TEST_ROOT/missing-darwin"
-mkdir -p -- "$missing_root"
-cp -- "$fake_root/uname" "$missing_root/uname"
+mkdir -p "$missing_root"
+cp "$fake_root/uname" "$missing_root/uname"
 set +e
 missing_output="$(PATH="$missing_root:$REAL_PATH" bash -c \
     'source "$1/bin/codex-host-compat.bash"; codex_host_require_capabilities path' \
@@ -165,16 +166,16 @@ assert_contains "$missing_output" \
 pass "missing Darwin tool diagnostic"
 
 incompatible_root="$TEST_ROOT/fake-incompatible"
-mkdir -p -- "$incompatible_root"
-cp -- "$fake_root/uname" "$incompatible_root/uname"
+mkdir -p "$incompatible_root"
+cp "$fake_root/uname" "$incompatible_root/uname"
 for tool in stat sha256sum flock mv sort tar; do
-    ln -s -- "$(command -v "$tool")" "$incompatible_root/g$tool"
+    ln -s "$(command -v "$tool")" "$incompatible_root/g$tool"
 done
 cat >"$incompatible_root/grealpath" <<'EOF'
 #!/usr/bin/env bash
 exit 1
 EOF
-chmod 755 -- "$incompatible_root/grealpath"
+chmod 755 "$incompatible_root/grealpath"
 set +e
 missing_capability_output="$(PATH="$incompatible_root:$REAL_PATH" \
     bash -c 'source "$1/bin/codex-host-compat.bash"; codex_host_require_capabilities path' \

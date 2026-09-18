@@ -2,11 +2,11 @@
 set -Eeuo pipefail
 umask 077
 
-ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEST_ROOT="$(mktemp -d)"
 
 cleanup() {
-    rm -rf -- "$TEST_ROOT"
+    rm -rf "$TEST_ROOT"
 }
 trap cleanup EXIT
 
@@ -209,7 +209,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     printf 'generation one\n' > "$TEST_ROOT/a/live/payload"
     generation_one_hash="$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')"
     sqlite3 "$TEST_ROOT/a/live/state.sqlite" \
-        'CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ("ok");'
+        "CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ('ok');"
 
     if env \
         "HOME=$TEST_ROOT/a/home" \
@@ -251,7 +251,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     no_change="$(run_machine a "$PUSH_COMMAND")"
     assert_contains "$no_change" "No changes"
 
-    lock_snapshot_count="$(find "$SYNC_ROOT" -maxdepth 1 -type f | wc -l)"
+    lock_snapshot_count="$(find "$SYNC_ROOT" -path "$SYNC_ROOT/*/*" -prune -o -type f -print | wc -l)"
     lock_live_hash="$(fixture_state_hash "$TEST_ROOT/a/live")"
     exec 8>"$LOCK_FILE"
     flock -n -x 8 || fail "could not acquire snapshot contention lock"
@@ -260,7 +260,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     fi
     assert_contains "$(<"$TEST_ROOT/lock-push.log")" \
         "Codex is running, starting, or another push/pull is active"
-    [[ "$(find "$SYNC_ROOT" -maxdepth 1 -type f | wc -l)" == \
+    [[ "$(find "$SYNC_ROOT" -path "$SYNC_ROOT/*/*" -prune -o -type f -print | wc -l)" == \
        "$lock_snapshot_count" &&
        "$(fixture_state_hash "$TEST_ROOT/a/live")" == "$lock_live_hash" ]] ||
         fail "locked snapshot push mutated state"
@@ -326,7 +326,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         fail "older forced pull did not bypass an incomplete newest generation"
     grep -Fxq 'generation=4' "$TEST_ROOT/c/state/codex-handoff/base.state" ||
         fail "older forced pull did not preserve the remote head baseline"
-    rm -f -- "$incomplete_state"
+    rm -f "$incomplete_state"
     pass "older forced recovery bypasses incomplete remote head"
 
     run_machine b "$PULL_COMMAND" --force 1 >/dev/null
@@ -381,14 +381,14 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         "$corrupt_live_root/sync"
     printf 'replace corrupt live state\n' > "$corrupt_live_root/live/payload"
     sqlite3 "$corrupt_live_root/live/state.sqlite" \
-        'CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ("ok");'
+        "CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ('ok');"
     dd if=/dev/zero of="$corrupt_live_root/live/state.sqlite" \
         bs=1 count=100 seek=4096 conv=notrunc status=none
     corrupt_source="$TEST_ROOT/corrupt-source"
     mkdir -p "$corrupt_source"
     printf 'valid restored state\n' > "$corrupt_source/payload"
     sqlite3 "$corrupt_source/state.sqlite" \
-        'CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ("ok");'
+        "CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ('ok');"
     corrupt_archive="$corrupt_live_root/sync/codex-g0000000001-corrupt.tar.zst"
     make_fixture_archive "$corrupt_source" "$corrupt_archive"
     corrupt_archive_hash="$(sha256sum "$corrupt_archive" | awk '{print $1}')"
@@ -410,7 +410,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     mkdir -p "$suffix_root/live" "$suffix_root/home" "$suffix_root/sync"
     printf 'suffix live state\n' > "$suffix_root/live/payload"
     sqlite3 "$suffix_root/live/codex-state.db" \
-        'CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ("ok");'
+        "CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ('ok');"
     dd if=/dev/zero of="$suffix_root/live/codex-state.db" \
         bs=1 count=100 seek=4096 conv=notrunc status=none
     suffix_archive="$suffix_root/sync/codex-g0000000001-suffix.tar.zst"
@@ -462,7 +462,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     sidecar_shm_hash="$(sha256sum "$sidecar_db-shm" | awk '{print $1}')"
     exec 7>&-
     wait "$sidecar_writer"
-    rm -f -- "$sidecar_fifo"
+    rm -f "$sidecar_fifo"
     printf '%s\n' "$sidecar_archive_hash" > "$sidecar_archive.sha256"
     {
         printf 'format=1\ngeneration=1\nsha256=%s\n' "$sidecar_state_hash"
@@ -486,7 +486,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         fail "restored SQLite state hash differs from snapshot hash"
     sidecar_query_root="$TEST_ROOT/sidecar-query"
     mkdir -p "$sidecar_query_root"
-    cp -- "$sidecar_root/live/codex-state.db" \
+    cp "$sidecar_root/live/codex-state.db" \
         "$sidecar_root/live/codex-state.db-wal" \
         "$sidecar_root/live/codex-state.db-shm" "$sidecar_query_root/"
     [[ "$(sqlite3 "$sidecar_query_root/codex-state.db" \
@@ -545,7 +545,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     printf 'contextual handoff state\n' > "$handoff_source/live/payload"
     mkdir -p "$handoff_sync_root"
     run_handoff handoff-a "$PUSH_COMMAND" >/dev/null
-    handoff_state="$(find "$handoff_sync_root" -maxdepth 1 -name '*.state' -print -quit)"
+    handoff_state="$(find "$handoff_sync_root" -path "$handoff_sync_root/*/*" -prune -o -name '*.state' -print -quit)"
     [[ -n "$handoff_state" ]] || fail "contextual push did not publish snapshot metadata"
     for handoff_field in \
         'handoff_format=1' \
@@ -575,7 +575,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     handoff_commit="$original_handoff_commit"
 
     mkdir -p "$TEST_ROOT/handoff-c/live" "$TEST_ROOT/handoff-c/home"
-    cp -- "$handoff_source/live/payload" "$TEST_ROOT/handoff-c/live/payload"
+    cp "$handoff_source/live/payload" "$TEST_ROOT/handoff-c/live/payload"
     no_base_handoff_output="$(run_handoff handoff-c "$PUSH_COMMAND")"
     assert_contains "$no_base_handoff_output" \
         "publishing lane handoff requirements"
@@ -702,7 +702,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     write_handoff_snapshot "$metadata_pull_root/sync" \
         "$metadata_pull_source" 8 head "$handoff_commit"
     metadata_pull_before="$(fixture_state_hash "$metadata_pull_root/live")"
-    metadata_pull_files_before="$(find "$metadata_pull_root/sync" -maxdepth 1 \
+    metadata_pull_files_before="$(find "$metadata_pull_root/sync" -path "$metadata_pull_root/sync/*/*" -prune -o \
         -type f -print | LC_ALL=C sort)"
     if run_metadata_handoff "$metadata_pull_root" "$PULL_COMMAND" --force 7 \
         >"$metadata_pull_root/divergence.log" 2>&1; then
@@ -712,7 +712,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     [[ "$(fixture_state_hash "$metadata_pull_root/live")" == \
        "$metadata_pull_before" ]] ||
         fail "metadata-divergent pull mutated live state"
-    [[ "$(find "$metadata_pull_root/sync" -maxdepth 1 -type f -print | \
+    [[ "$(find "$metadata_pull_root/sync" -path "$metadata_pull_root/sync/*/*" -prune -o -type f -print | \
         LC_ALL=C sort)" == "$metadata_pull_files_before" ]] ||
         fail "metadata-divergent pull mutated synchronization state"
     pass "pull rejects conflicting handoff metadata before mutation"
@@ -722,13 +722,13 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     mkdir -p "$metadata_push_root/live" "$metadata_push_root/home" \
         "$metadata_push_root/sync" "$metadata_push_source"
     printf 'metadata push payload\n' > "$metadata_push_source/payload"
-    cp -- "$metadata_push_source/payload" "$metadata_push_root/live/payload"
+    cp "$metadata_push_source/payload" "$metadata_push_root/live/payload"
     write_handoff_snapshot "$metadata_push_root/sync" \
         "$metadata_push_source" 9 alpha "$handoff_commit"
     write_handoff_snapshot "$metadata_push_root/sync" \
         "$metadata_push_source" 9 zeta \
         'cccccccccccccccccccccccccccccccccccccccc'
-    metadata_push_files_before="$(find "$metadata_push_root/sync" -maxdepth 1 \
+    metadata_push_files_before="$(find "$metadata_push_root/sync" -path "$metadata_push_root/sync/*/*" -prune -o \
         -type f -print | LC_ALL=C sort)"
     metadata_push_live_before="$(fixture_state_hash "$metadata_push_root/live")"
     if run_metadata_handoff "$metadata_push_root" "$PUSH_COMMAND" \
@@ -736,7 +736,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         fail "push accepted conflicting remote handoff metadata"
     fi
     assert_contains "$(<"$metadata_push_root/divergence.log")" "DIVERGENCE"
-    [[ "$(find "$metadata_push_root/sync" -maxdepth 1 -type f -print | \
+    [[ "$(find "$metadata_push_root/sync" -path "$metadata_push_root/sync/*/*" -prune -o -type f -print | \
         LC_ALL=C sort)" == "$metadata_push_files_before" ]] ||
         fail "metadata-divergent push published or removed synchronization files"
     [[ "$(fixture_state_hash "$metadata_push_root/live")" == \
