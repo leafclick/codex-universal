@@ -76,7 +76,7 @@ case "$HOST_KERNEL" in
         ;;
     Darwin)
         HOST_REALPATH=grealpath
-        host_commands=(bash git grep jq grealpath gstat gsha256sum flock gchmod gmv gsort gtar)
+        host_commands=(bash git grep jq grealpath gstat gsha256sum flock gchmod gmv gsort gtail gtar gtee)
         ;;
     *)
         fail "unsupported host kernel '$HOST_KERNEL'"
@@ -95,7 +95,9 @@ if [[ "$HOST_KERNEL" == Darwin ]]; then
         "chmod:$(command -v gchmod)" \
         "mv:$(command -v gmv)" \
         "sort:$(command -v gsort)" \
-        "tar:$(command -v gtar)"; do
+        "tail:$(command -v gtail)" \
+        "tar:$(command -v gtar)" \
+        "tee:$(command -v gtee)"; do
         ln -s "${host_tool_mapping#*:}" \
             "$TEST_HOST_BIN/${host_tool_mapping%%:*}"
     done
