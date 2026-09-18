@@ -171,7 +171,7 @@ case "$TARGET" in
         ;;
 esac
 
-codex_host_require_gnu_linux || exit 1
+codex_host_require_linux_security || exit 1
 
 case "$TAG_LATEST" in
     0|1) ;;

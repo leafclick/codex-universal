@@ -186,9 +186,14 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
+run_codex_require_capabilities() {
+    codex_host_require_linux_security || return 1
+    codex_host_require_capabilities "$@"
+}
+
 run_idea_dispatcher() {
     need jq
-    codex_host_require_capabilities path || exit 1
+    run_codex_require_capabilities path || exit 1
     ((HOST_UID > 0 && HOST_GID > 0)) ||
         die "Run this command as a non-root user with a non-root primary group"
 
@@ -427,7 +432,7 @@ run_idea_relay_guard() {
     [[ "$PPID" == "$IDEA_GUARD_LAUNCHER_PID" ]] ||
         die "IntelliJ relay launcher exited before guard startup"
 
-    codex_host_require_capabilities stat || exit 1
+    run_codex_require_capabilities stat || exit 1
     need docker
     need socat
     runtime_owner_mode="$(codex_host_file_owner_mode "$IDEA_GUARD_RUNTIME_DIR")"
@@ -1806,7 +1811,7 @@ init_project() {
     local candidate_git_layout candidate_git_common_dir default_file default_root
 
     need git
-    codex_host_require_capabilities path || exit 1
+    run_codex_require_capabilities path || exit 1
     mkdir -p "$PROJECTS_DIR"
 
     path="$(canonical_dir "$requested_path")" ||
@@ -1920,7 +1925,7 @@ rebind_project() {
     [[ -f "$file" ]] || die "Project '$name' is not registered. Use --init instead."
 
     need git
-    codex_host_require_capabilities path || exit 1
+    run_codex_require_capabilities path || exit 1
 
     read_project_config "$file"
     profile="$CONFIG_PROFILE"
@@ -2511,7 +2516,7 @@ run_lane_state_sync() {
             die "Cannot resolve the lane's required Git commit"
 
         need jq
-        codex_host_require_capabilities checksum || exit 1
+        run_codex_require_capabilities checksum || exit 1
         load_onboarding_manifests "$PROJECT" "$LANE"
         if ! check_onboarding true; then
             check_onboarding false || true
@@ -2607,7 +2612,7 @@ load_onboarding_manifests() {
     done
     if ((${#ONBOARDING_MANIFESTS[@]} > 0)); then
         need grep
-        codex_host_require_capabilities stat || exit 1
+        run_codex_require_capabilities stat || exit 1
         need install
     fi
 }
@@ -2801,6 +2806,9 @@ load_doctor_module() {
     local launcher_dir doctor_module
 
     if command -v realpath >/dev/null 2>&1; then
+        codex_host_select_backend || exit 1
+    fi
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
         launcher_source="$(codex_host_path_existing "$launcher_source")" ||
             die "Cannot resolve run-codex installation path"
     fi
@@ -2833,18 +2841,18 @@ case "${1:-}" in
     --list)
         (($# == 1)) || die "--list takes no arguments"
         need git
-        codex_host_require_capabilities path || exit 1
+        run_codex_require_capabilities path || exit 1
         list_projects
         exit 0
         ;;
     --init)
-        codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+        run_codex_require_capabilities path stat checksum lock atomic-replace || exit 1
         shift
         init_project "$@"
         exit 0
         ;;
     --rebind)
-        codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+        run_codex_require_capabilities path stat checksum lock atomic-replace || exit 1
         shift
         rebind_args=()
         rebind_lane="default"
@@ -2884,7 +2892,7 @@ case "${1:-}" in
         IDEA_MODE=true
         shift
         if (($# == 0)); then
-            codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+            run_codex_require_capabilities path stat checksum lock atomic-replace || exit 1
             run_idea_dispatcher
             exit $?
         fi
@@ -2901,14 +2909,14 @@ case "${1:-}" in
         ;;
     *)
         if (($# >= 2)) && [[ "$2" == --set ]]; then
-            codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+            run_codex_require_capabilities path stat checksum lock atomic-replace || exit 1
             (($# == 4)) ||
                 die "Usage: run-codex PROJECT --set profile|clojure-mcp|model|reasoning VALUE"
             set_project_value "$1" default "$3" "$4"
             exit 0
         fi
         if (($# >= 4)) && [[ "$2" == --lane && "$4" == --set ]]; then
-            codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+            run_codex_require_capabilities path stat checksum lock atomic-replace || exit 1
             (($# == 6)) ||
                 die "Usage: run-codex PROJECT --lane LANE --set profile|clojure-mcp|model|reasoning VALUE"
             set_project_value "$1" "$3" "$5" "$6"
@@ -2930,7 +2938,7 @@ if [[ -n "$LANE_MANAGEMENT_MODE" ]]; then
         die "Lane management actions cannot be combined with launch, onboarding, or state options"
     fi
     need git
-    codex_host_require_capabilities path lock || exit 1
+    run_codex_require_capabilities path lock || exit 1
     case "$LANE_MANAGEMENT_MODE" in
         create)
             create_managed_lane "$PROJECT" "$LANE" "$LANE_MANAGEMENT_REVISION"
@@ -3008,7 +3016,7 @@ fi
 # Resolve first so an unconfigured project gets useful setup instructions even
 # on a new machine whose Docker setup is not complete yet.
 need git
-codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+run_codex_require_capabilities path stat checksum lock atomic-replace || exit 1
 if $REVIEW_REVISION_SET && $LANE_SET && [[ "$LANE" != default ]] &&
    [[ -n "$PROJECT" ]]; then
     provision_missing_review_lane "$PROJECT" "$LANE" "$REVIEW_REVISION"

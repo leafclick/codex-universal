@@ -2,13 +2,21 @@
 
 # Host utility compatibility boundary for codex-universal commands.
 #
-# The first backend deliberately supports GNU/Linux only.  Callers use the
-# semantic operations below instead of depending directly on GNU option
-# spellings, so another backend can be added without changing safety-critical
-# path, locking, hashing, or publication logic.
+# Callers use the semantic operations below instead of depending directly on
+# platform command names.  The Darwin backend deliberately uses Homebrew GNU
+# tools where their exact behavior is part of the state or locking protocol.
 
 [[ -z "${CODEX_HOST_COMPAT_API_LOADED:-}" ]] || return 0
 readonly CODEX_HOST_COMPAT_API_LOADED=1
+
+CODEX_HOST_BACKEND=""
+CODEX_HOST_REALPATH=""
+CODEX_HOST_STAT=""
+CODEX_HOST_SHA256SUM=""
+CODEX_HOST_FLOCK=""
+CODEX_HOST_MV=""
+CODEX_HOST_SORT=""
+CODEX_HOST_TAR=""
 
 codex_host_compat_error() {
     printf 'ERROR: Host compatibility: %s\n' "$*" >&2
@@ -24,9 +32,10 @@ codex_host_require_command() {
             "missing command '$command_name' required for $capability"
 }
 
-codex_host_require_gnu_linux() {
+codex_host_select_backend() {
     local system
 
+    [[ -z "$CODEX_HOST_BACKEND" ]] || return 0
     if ((BASH_VERSINFO[0] < 4 ||
          (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1))); then
         codex_host_compat_error \
@@ -38,9 +47,40 @@ codex_host_require_gnu_linux() {
         codex_host_compat_error "cannot determine the host operating system"
         return 1
     }
-    [[ "$system" == Linux ]] || {
+    case "$system" in
+        Linux)
+            CODEX_HOST_BACKEND=gnu-linux
+            CODEX_HOST_REALPATH=realpath
+            CODEX_HOST_STAT=stat
+            CODEX_HOST_SHA256SUM=sha256sum
+            CODEX_HOST_FLOCK=flock
+            CODEX_HOST_MV=mv
+            CODEX_HOST_SORT=sort
+            CODEX_HOST_TAR=tar
+            ;;
+        Darwin)
+            CODEX_HOST_BACKEND=darwin-homebrew
+            CODEX_HOST_REALPATH=grealpath
+            CODEX_HOST_STAT=gstat
+            CODEX_HOST_SHA256SUM=gsha256sum
+            CODEX_HOST_FLOCK=flock
+            CODEX_HOST_MV=gmv
+            CODEX_HOST_SORT=gsort
+            CODEX_HOST_TAR=gtar
+            ;;
+        *)
+            codex_host_compat_error \
+                "unsupported host '$system'; available utility backends are GNU/Linux and macOS"
+            return 1
+            ;;
+    esac
+}
+
+codex_host_require_linux_security() {
+    codex_host_select_backend || return 1
+    [[ "$CODEX_HOST_BACKEND" == gnu-linux ]] || {
         codex_host_compat_error \
-            "unsupported host '$system'; this release supports GNU/Linux only (macOS and BSD backends are not implemented)"
+            "the hardened launcher and host security setup require GNU/Linux; macOS supports only standalone state synchronization and collaboration commands"
         return 1
     }
 }
@@ -50,42 +90,55 @@ codex_host_require_capability() {
 
     case "$capability" in
         path)
-            codex_host_require_command realpath "canonical path resolution" || return 1
-            realpath -e -- / >/dev/null 2>&1 &&
-                realpath -m -- /codex-universal-capability-probe >/dev/null 2>&1 ||
+            codex_host_require_command "$CODEX_HOST_REALPATH" \
+                "canonical path resolution for $CODEX_HOST_BACKEND" || return 1
+            "$CODEX_HOST_REALPATH" -e -- / >/dev/null 2>&1 &&
+                "$CODEX_HOST_REALPATH" -m -- /codex-universal-capability-probe >/dev/null 2>&1 ||
                 codex_host_compat_error \
-                    "'realpath' lacks required GNU -e/-m semantics"
+                    "'$CODEX_HOST_REALPATH' lacks required GNU -e/-m semantics"
             ;;
         stat)
-            codex_host_require_command stat "file metadata inspection" || return 1
-            stat -c '%a' -- / >/dev/null 2>&1 ||
-                codex_host_compat_error "'stat' lacks required GNU -c semantics"
+            codex_host_require_command "$CODEX_HOST_STAT" \
+                "file metadata inspection for $CODEX_HOST_BACKEND" || return 1
+            "$CODEX_HOST_STAT" -c '%a' -- / >/dev/null 2>&1 ||
+                codex_host_compat_error \
+                    "'$CODEX_HOST_STAT' lacks required GNU -c semantics"
             ;;
         checksum)
-            codex_host_require_command sha256sum "SHA-256 hashing" || return 1
-            printf '' | sha256sum >/dev/null 2>&1 ||
-                codex_host_compat_error "'sha256sum' cannot hash standard input"
+            codex_host_require_command "$CODEX_HOST_SHA256SUM" \
+                "SHA-256 hashing for $CODEX_HOST_BACKEND" || return 1
+            printf '' | "$CODEX_HOST_SHA256SUM" >/dev/null 2>&1 ||
+                codex_host_compat_error \
+                    "'$CODEX_HOST_SHA256SUM' cannot hash standard input"
             ;;
         lock)
-            codex_host_require_command flock "advisory file locking" || return 1
-            flock --version >/dev/null 2>&1 ||
-                codex_host_compat_error "'flock' is not the required util-linux implementation"
+            codex_host_require_command "$CODEX_HOST_FLOCK" \
+                "fd-based advisory file locking for $CODEX_HOST_BACKEND" || return 1
+            "$CODEX_HOST_FLOCK" -V >/dev/null 2>&1 ||
+                codex_host_compat_error \
+                    "'$CODEX_HOST_FLOCK' lacks the required fd-locking interface"
             ;;
         atomic-replace)
-            codex_host_require_command mv "atomic file replacement" || return 1
-            mv --version >/dev/null 2>&1 ||
-                codex_host_compat_error "'mv' is not the required GNU implementation"
+            codex_host_require_command "$CODEX_HOST_MV" \
+                "atomic replacement for $CODEX_HOST_BACKEND" || return 1
+            "$CODEX_HOST_MV" --version >/dev/null 2>&1 ||
+                codex_host_compat_error \
+                    "'$CODEX_HOST_MV' is not the required GNU implementation"
             ;;
         null-sort)
-            codex_host_require_command sort "NUL-delimited sorting" || return 1
-            printf '' | sort -z >/dev/null 2>&1 ||
-                codex_host_compat_error "'sort' lacks required GNU -z semantics"
+            codex_host_require_command "$CODEX_HOST_SORT" \
+                "NUL-delimited sorting for $CODEX_HOST_BACKEND" || return 1
+            printf '' | "$CODEX_HOST_SORT" -z >/dev/null 2>&1 ||
+                codex_host_compat_error \
+                    "'$CODEX_HOST_SORT' lacks required GNU -z semantics"
             ;;
         canonical-tar)
-            codex_host_require_command tar "deterministic state archives" || return 1
+            codex_host_require_command "$CODEX_HOST_TAR" \
+                "deterministic state archives for $CODEX_HOST_BACKEND" || return 1
             codex_host_require_command grep "GNU tar identification" || return 1
-            tar --version 2>/dev/null | grep -Fq 'GNU tar' ||
-                codex_host_compat_error "'tar' is not GNU tar; deterministic snapshot hashing requires GNU tar"
+            "$CODEX_HOST_TAR" --version 2>/dev/null | grep -Fq 'GNU tar' ||
+                codex_host_compat_error \
+                    "'$CODEX_HOST_TAR' is not GNU tar; deterministic snapshot hashing requires GNU tar"
             ;;
         *)
             codex_host_compat_error "unknown requested capability '$capability'"
@@ -96,78 +149,78 @@ codex_host_require_capability() {
 codex_host_require_capabilities() {
     local capability
 
-    codex_host_require_gnu_linux || return 1
+    codex_host_select_backend || return 1
     for capability in "$@"; do
         codex_host_require_capability "$capability" || return 1
     done
 }
 
 codex_host_path_existing() {
-    realpath -e -- "$1"
+    "$CODEX_HOST_REALPATH" -e -- "$1"
 }
 
 codex_host_path_allow_missing() {
-    realpath -m -- "$1"
+    "$CODEX_HOST_REALPATH" -m -- "$1"
 }
 
 codex_host_file_mode() {
-    stat -c '%a' -- "$1"
+    "$CODEX_HOST_STAT" -c '%a' -- "$1"
 }
 
 codex_host_file_size() {
-    stat -c '%s' -- "$1"
+    "$CODEX_HOST_STAT" -c '%s' -- "$1"
 }
 
 codex_host_file_link_count() {
-    stat -c '%h' -- "$1"
+    "$CODEX_HOST_STAT" -c '%h' -- "$1"
 }
 
 codex_host_file_owner_mode() {
-    stat -c '%u:%a' -- "$1"
+    "$CODEX_HOST_STAT" -c '%u:%a' -- "$1"
 }
 
 codex_host_sha256_file() {
     local output
 
-    output="$(sha256sum -- "$1")" || return 1
+    output="$("$CODEX_HOST_SHA256SUM" -- "$1")" || return 1
     printf '%s\n' "${output%% *}"
 }
 
 codex_host_sha256_stdin() {
     local output
 
-    output="$(sha256sum)" || return 1
+    output="$("$CODEX_HOST_SHA256SUM")" || return 1
     printf '%s\n' "${output%% *}"
 }
 
 codex_host_lock_exclusive() {
-    flock -x "$1"
+    "$CODEX_HOST_FLOCK" -x "$1"
 }
 
 codex_host_lock_try_exclusive() {
-    flock -n -x "$1"
+    "$CODEX_HOST_FLOCK" -n -x "$1"
 }
 
 codex_host_lock_shared() {
-    flock -s "$1"
+    "$CODEX_HOST_FLOCK" -s "$1"
 }
 
 codex_host_lock_try_shared() {
-    flock -n -s "$1"
+    "$CODEX_HOST_FLOCK" -n -s "$1"
 }
 
 codex_host_atomic_replace() {
-    mv -T -- "$1" "$2"
+    "$CODEX_HOST_MV" -T -- "$1" "$2"
 }
 
 codex_host_sort_null() {
-    sort -z
+    "$CODEX_HOST_SORT" -z
 }
 
 codex_host_canonical_tar() {
     local directory="$1"
 
-    LC_ALL=C tar \
+    LC_ALL=C "$CODEX_HOST_TAR" \
         --sort=name \
         --format=gnu \
         --mtime='@0' \
@@ -176,4 +229,21 @@ codex_host_canonical_tar() {
         --numeric-owner \
         -C "$directory" \
         -cf - .
+}
+
+codex_host_state_archive_create() {
+    local directory="$1"
+
+    "$CODEX_HOST_TAR" -C "$directory" -cf - .
+}
+
+codex_host_state_archive_extract() {
+    local destination="$1"
+
+    "$CODEX_HOST_TAR" -xf - \
+        --no-same-owner \
+        --same-permissions \
+        --transform='s,^\.$,content,rSH' \
+        --transform='s,^\./,content/,rSH' \
+        -C "$destination"
 }

@@ -36,6 +36,7 @@ fi
 
 ((EUID != 0)) || die "Run this command as the regular Docker user; it invokes sudo only for AppArmor installation"
 
+codex_host_require_linux_security || exit 1
 codex_host_require_capabilities path || exit 1
 SOURCE_ROOT="$(codex_host_path_existing "$SCRIPT_DIR/..")"
 SOURCE_APPARMOR="$SOURCE_ROOT/security/apparmor/codex-universal"

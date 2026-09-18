@@ -302,6 +302,17 @@ run_doctor() {
     doctor_pass "Required host commands are available"
 
     if ! compatibility_error="$(
+        codex_host_require_linux_security 2>&1
+    )"; then
+        doctor_fail "Hardened launcher host check failed"
+        doctor_note "${compatibility_error#ERROR: }"
+        echo
+        printf 'Diagnostics failed: %d failure(s), %d warning(s).\n' \
+            "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
+        return 1
+    fi
+
+    if ! compatibility_error="$(
         codex_host_require_capabilities path lock 2>&1
     )"; then
         doctor_fail "Host utility compatibility check failed"

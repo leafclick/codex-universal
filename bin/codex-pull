@@ -181,7 +181,7 @@ check_sqlite() {
     while IFS= read -r -d '' db; do
         [[ -r "$db" ]] || die "Could not inspect file for SQLite data: $db"
         if [[ "$db" != *.sqlite ]] &&
-           ! LC_ALL=C head -c 15 -- "$db" | grep -Fqx 'SQLite format 3'; then
+           ! LC_ALL=C head -c 15 < "$db" | grep -Fqx 'SQLite format 3'; then
             continue
         fi
 
@@ -245,7 +245,7 @@ write_base() {
         echo "sha256=$hash"
     } > "$tmp"
 
-    mv -- "$tmp" "$BASE_FILE"
+    codex_host_atomic_replace "$tmp" "$BASE_FILE"
 }
 
 REMOTE_GEN=""
@@ -497,7 +497,7 @@ report_running_codex_containers() {
     return 0
 }
 
-for cmd in tar zstd find grep head cp sqlite3 lsof hostname; do
+for cmd in zstd find grep head cp sqlite3 lsof hostname; do
     need "$cmd"
 done
 
@@ -599,12 +599,7 @@ trap cleanup EXIT
 
 echo "Extracting generation $WANTED_GEN..."
 zstd -q -d -c "$SELECTED_ARCHIVE" |
-    tar -xf - \
-        --no-same-owner \
-        --same-permissions \
-        --transform='s,^\.$,content,rSH' \
-        --transform='s,^\./,content/,rSH' \
-        -C "$RESTORE_TMP"
+    codex_host_state_archive_extract "$RESTORE_TMP"
 
 [[ -d "$RESTORE_TMP/content" ]] ||
     die "Generation $WANTED_GEN archive has no Codex directory"

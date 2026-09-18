@@ -45,6 +45,7 @@ esac
 }
 
 need jq
+codex_host_require_linux_security || exit 1
 codex_host_require_capabilities path atomic-replace || exit 1
 
 RUN_CODEX="${CODEX_RUN_CODEX:-}"

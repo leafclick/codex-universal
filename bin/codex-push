@@ -157,7 +157,7 @@ check_sqlite() {
     while IFS= read -r -d '' db; do
         [[ -r "$db" ]] || die "Could not inspect file for SQLite data: $db"
         if [[ "$db" != *.sqlite ]] &&
-           ! LC_ALL=C head -c 15 -- "$db" | grep -Fqx 'SQLite format 3'; then
+           ! LC_ALL=C head -c 15 < "$db" | grep -Fqx 'SQLite format 3'; then
             continue
         fi
 
@@ -204,7 +204,7 @@ write_base() {
         echo "sha256=$hash"
     } > "$tmp"
 
-    mv "$tmp" "$BASE_FILE"
+    codex_host_atomic_replace "$tmp" "$BASE_FILE"
 }
 
 BASE_GEN=""
@@ -529,9 +529,7 @@ archive="$tmpdir/$archive_name"
 
 echo "Creating generation $NEXT_GEN..."
 
-tar \
-    -C "$CODEX_DIR" \
-    -cf - . |
+codex_host_state_archive_create "$CODEX_DIR" |
     zstd \
         -T0 \
         -10 \
