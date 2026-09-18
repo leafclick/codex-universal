@@ -66,7 +66,21 @@ assert_not_contains() {
 }
 
 activity "host prerequisites and syntax checks"
-for command in bash git grep jq realpath setpriv flock; do
+HOST_KERNEL="$(uname -s)"
+case "$HOST_KERNEL" in
+    Linux)
+        HOST_REALPATH=realpath
+        host_commands=(bash git grep jq realpath setpriv flock)
+        ;;
+    Darwin)
+        HOST_REALPATH=grealpath
+        host_commands=(bash git grep jq grealpath flock)
+        ;;
+    *)
+        fail "unsupported host kernel '$HOST_KERNEL'"
+        ;;
+esac
+for command in "${host_commands[@]}"; do
     need "$command"
 done
 
@@ -1105,6 +1119,23 @@ printf '%s\n' \
     'printf "%s\n" Linux' \
     > "$TEST_ROOT/fake-bin/uname"
 chmod 755 "$TEST_ROOT/fake-bin/uname"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'exit 1' \
+    > "$TEST_ROOT/fake-bin/setpriv"
+chmod 755 "$TEST_ROOT/fake-bin/setpriv"
+if [[ "$HOST_KERNEL" == Darwin ]]; then
+    for linux_tool_mapping in \
+        "realpath:$(command -v grealpath)" \
+        "stat:$(command -v gstat)" \
+        "sha256sum:$(command -v gsha256sum)" \
+        "mv:$(command -v gmv)" \
+        "sort:$(command -v gsort)" \
+        "tar:$(command -v gtar)"; do
+        ln -s "${linux_tool_mapping#*:}" \
+            "$TEST_ROOT/fake-bin/${linux_tool_mapping%%:*}"
+    done
+fi
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'exit 0' \
@@ -2305,7 +2336,11 @@ test_idea_parent_death_cleanup() (
     guard_runtime=""
     trap - EXIT
 )
-test_idea_parent_death_cleanup
+if [[ "$HOST_KERNEL" == Linux ]]; then
+    test_idea_parent_death_cleanup
+else
+    printf 'skip - IntelliJ relay parent-death cleanup (requires Linux setpriv and /proc)\n'
+fi
 
 mkdir -p "$TEST_ROOT/no-jq-bin"
 for bootstrap_command in bash dirname id; do
@@ -2704,7 +2739,7 @@ jq -e '.theme == "dark"' "$ACP_FILE" >/dev/null ||
 jq -e '.agent_servers.Existing.command == "existing-agent"' "$ACP_FILE" >/dev/null ||
     fail "IDEA setup replaced an existing agent"
 jq -e \
-    --arg command "$(realpath -e "$ROOT/bin/run-codex")" \
+    --arg command "$("$HOST_REALPATH" -e "$ROOT/bin/run-codex")" \
     '.agent_servers["Dockerized Codex (codex-universal)"] == {
         "command": $command,
         "args": ["--idea"],
@@ -2740,7 +2775,7 @@ printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" Darwin' \
     > "$darwin_launcher_bin/uname"
 chmod 755 "$darwin_launcher_bin/uname"
 for tool_mapping in \
-    "grealpath:$(command -v realpath)" \
+    "grealpath:$(command -v "$HOST_REALPATH")" \
     "gstat:$(command -v stat)" \
     "gsha256sum:$(command -v sha256sum)" \
     "flock:$(command -v flock)" \
@@ -3120,7 +3155,11 @@ smoke_image() {
         --tmpfs "/workspace:rw,nosuid,nodev,uid=$runtime_uid,gid=$runtime_gid,mode=0700"
         --cap-drop=ALL
         --security-opt=no-new-privileges
-        --security-opt apparmor=codex-universal
+    )
+    if [[ "$HOST_KERNEL" == Linux ]]; then
+        docker_args+=(--security-opt apparmor=codex-universal)
+    fi
+    docker_args+=(
         --security-opt "seccomp=$ROOT/security/seccomp/codex-bwrap.json"
         --user "$runtime_uid:$runtime_gid"
         --mount "type=bind,src=$ROOT,dst=/opt/codex-universal,readonly"
@@ -3146,7 +3185,7 @@ smoke_image() {
     ACTIVE_TEST_CONTAINER="$preflight_name"
     ACTIVE_TEST_CONTAINER_TOKEN="$preflight_token"
     set +e
-    timeout --signal=TERM --kill-after="${image_kill_after_seconds}s" 30s \
+    "$IMAGE_TIMEOUT_COMMAND" --signal=TERM --kill-after="${image_kill_after_seconds}s" 30s \
         docker "${docker_args[@]}" \
             --label "codex-universal.smoke-token=$preflight_token" \
             --name "$preflight_name" \
@@ -3176,7 +3215,7 @@ smoke_image() {
     ACTIVE_TEST_CONTAINER="$suite_name"
     ACTIVE_TEST_CONTAINER_TOKEN="$suite_token"
     set +e
-    timeout --signal=TERM --kill-after="${image_kill_after_seconds}s" \
+    "$IMAGE_TIMEOUT_COMMAND" --signal=TERM --kill-after="${image_kill_after_seconds}s" \
         "${image_timeout_seconds}s" \
         docker "${docker_args[@]}" \
             --label "codex-universal.smoke-token=$suite_token" \
@@ -3201,8 +3240,13 @@ elif ! command -v docker >/dev/null 2>&1 ||
      ! docker info >/dev/null 2>&1; then
     printf 'skip - container images (Docker daemon is not available)\n'
 else
-    command -v timeout >/dev/null 2>&1 ||
-        fail "local container image checks require host command 'timeout'"
+    if [[ "$HOST_KERNEL" == Darwin ]]; then
+        IMAGE_TIMEOUT_COMMAND=gtimeout
+    else
+        IMAGE_TIMEOUT_COMMAND=timeout
+    fi
+    command -v "$IMAGE_TIMEOUT_COMMAND" >/dev/null 2>&1 ||
+        fail "local container image checks require host command '$IMAGE_TIMEOUT_COMMAND'"
     if docker image inspect "$GENERIC_TEST_IMAGE" >/dev/null 2>&1; then
         smoke_image generic "$GENERIC_TEST_IMAGE"
     else
@@ -3210,7 +3254,9 @@ else
             "$GENERIC_TEST_IMAGE"
     fi
 
-    if [[ "${CODEX_TEST_SKIP_CUDA:-0}" == 1 ]]; then
+    if [[ "$HOST_KERNEL" == Darwin ]]; then
+        printf 'skip - CUDA container image (unsupported by the macOS backend)\n'
+    elif [[ "${CODEX_TEST_SKIP_CUDA:-0}" == 1 ]]; then
         printf 'skip - CUDA container image (CODEX_TEST_SKIP_CUDA=1)\n'
     elif docker image inspect "$CUDA_TEST_IMAGE" >/dev/null 2>&1; then
         smoke_image cuda "$CUDA_TEST_IMAGE"
