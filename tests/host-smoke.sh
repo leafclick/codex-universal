@@ -85,6 +85,7 @@ esac
 for command in "${host_commands[@]}"; do
     need "$command"
 done
+TEST_ROOT="$("$HOST_REALPATH" -e "$TEST_ROOT")"
 if [[ "$HOST_KERNEL" == Darwin ]]; then
     TEST_HOST_BIN="$TEST_ROOT/host-bin"
     mkdir -p "$TEST_HOST_BIN"
