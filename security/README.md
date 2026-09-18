@@ -4,6 +4,15 @@ Codex uses Bubblewrap for its Linux command sandbox. Docker's default seccomp
 and AppArmor policies intentionally block the namespace and mount operations
 Bubblewrap needs, so `run-codex` uses the profiles in this directory.
 
+On macOS, Docker Desktop and OrbStack commonly reject the second user
+namespace required by Bubblewrap. The generic launcher keeps the non-root,
+read-only, capability-free, `no-new-privileges`, and seccomp-confined outer
+container, and explicitly selects Codex's Landlock compatibility sandbox for
+spawned commands. It disables the persistent Clojure service and Clojure LSP
+MCP wrapper because those helpers require their own Bubblewrap boundary. The
+GNU/Linux path continues to require the nested Bubblewrap probe and the
+AppArmor policy described below.
+
 `apparmor/codex-universal` is derived from Moby's `docker-default` profile at
 commit `61eaf32614c7c71b60bd8927d3e6a4ffc8ff1f31`. It keeps the outer
 restrictions and additionally permits unprivileged user namespaces and their

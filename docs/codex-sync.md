@@ -99,9 +99,13 @@ bin/install-codex-host-tools
 bin/install-codex-host-tools --check
 ```
 
-On macOS the installer selects only `codex-push`, `codex-pull`, and
-`codex-collab`. Use `--prefix ABSOLUTE_PATH` for a prefix other than
-`~/.local`, or `--dry-run` to inspect the plan without changing the filesystem.
+On macOS the installer selects the generic terminal `run-codex` launcher plus
+`codex-push`, `codex-pull`, and `codex-collab`. The launcher uses Codex's
+Landlock compatibility sandbox because Docker Desktop and OrbStack commonly
+reject nested user namespaces; the Bubblewrap-isolated persistent Clojure
+service and Clojure LSP MCP integration are therefore disabled on this
+backend. Use `--prefix ABSOLUTE_PATH` for a prefix other than `~/.local`, or
+`--dry-run` to inspect the plan without changing the filesystem.
 
 Important package-to-command mappings include:
 

@@ -280,10 +280,14 @@ The host compatibility layer centralizes utility semantics in
 commands support macOS with Bash 4.1 or newer, Docker Desktop, and the Homebrew
 or MacPorts dependencies documented in the
 [Codex state synchronization guide](docs/codex-sync.md#install-required-software).
-The macOS launcher uses the bundled seccomp policy and verifies that Bubblewrap
-starts before launching Codex. Docker Desktop does not expose the native Linux
-AppArmor contract, so this backend is not security-equivalent to GNU/Linux.
-CUDA, IDEA integration, and AppArmor setup remain GNU/Linux-only.
+The macOS launcher uses the bundled seccomp policy and verifies Codex's
+Landlock compatibility sandbox before launching Codex. Docker Desktop and
+OrbStack commonly reject the nested user namespace required by Bubblewrap, so
+the macOS backend disables the Bubblewrap-isolated persistent Clojure service
+and Clojure LSP MCP integration. The Clojure command-line tools remain in the
+generic image. Docker Desktop does not expose the native Linux AppArmor
+contract, so this backend is not security-equivalent to GNU/Linux. CUDA, IDEA
+integration, and AppArmor setup remain GNU/Linux-only.
 
 The synchronization commands run on the host. Installing a utility such as
 `zstd` inside the Docker image does not make it available to those host
@@ -881,10 +885,12 @@ On GNU/Linux, `run-codex` requires the installed `codex-universal` AppArmor
 profile and rejects `unconfined`, `docker-default`, and arbitrary profile
 overrides.
 
-`run-codex` performs a networkless, read-only Bubblewrap preflight with the
-selected image. It stops with a setup error if the applicable host policy is
-absent or rejected; it never silently falls back to running every command
-outside the sandbox. GNU/Linux uses AppArmor plus seccomp; Docker Desktop uses
+On GNU/Linux, `run-codex` performs a networkless, read-only Bubblewrap
+preflight with the selected image. On macOS it instead exercises the pinned
+Codex runtime's Landlock compatibility backend because Docker Desktop and
+OrbStack may reject nested user namespaces. Both paths stop with a setup error
+when their sandbox cannot start; neither silently runs commands outside a
+sandbox. GNU/Linux uses AppArmor plus seccomp; the macOS outer container uses
 the bundled seccomp policy without AppArmor. Re-run
 `bin/setup-codex-host-security` after updating either GNU/Linux policy in this
 repository.
