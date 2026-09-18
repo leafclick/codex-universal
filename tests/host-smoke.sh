@@ -2730,8 +2730,19 @@ rm -- "$cli_managed_path/local-input"
 
 cli_adopted_path="$cli_config/run-codex/worktrees/cli-project/adopted"
 cli_run cli-project --lane adopted --create "$cli_default_divergent" >/dev/null 2>&1
-sed -i "s#^path=.*#path=$cli_repo#" \
-    "$cli_config/run-codex/lanes/cli-project/adopted"
+cli_adopted_config="$cli_config/run-codex/lanes/cli-project/adopted"
+cli_adopted_config_tmp="$cli_adopted_config.tmp"
+cli_adopted_path_replaced=false
+while IFS= read -r cli_adopted_line || [[ -n "$cli_adopted_line" ]]; do
+    if [[ "$cli_adopted_line" == path=* ]]; then
+        printf 'path=%s\n' "$cli_repo"
+        cli_adopted_path_replaced=true
+    else
+        printf '%s\n' "$cli_adopted_line"
+    fi
+done < "$cli_adopted_config" > "$cli_adopted_config_tmp"
+$cli_adopted_path_replaced || fail "adopted lane fixture has no registered path"
+"$HOST_MV" -f -- "$cli_adopted_config_tmp" "$cli_adopted_config"
 if cli_run cli-project --lane adopted --remove >"$cli_root/remove-adopted.log" 2>&1; then
     fail "managed lane removal accepted an adopted checkout path"
 fi
