@@ -59,6 +59,13 @@ Host-tool installer changes must also pass the focused temporary-prefix test:
 ./tests/host-smoke-install.sh
 ```
 
+Changes to portable host commands or the compatibility module must also pass
+the portability-boundary check:
+
+```bash
+./tests/host-smoke-portability-lint.sh
+```
+
 Stop all `codex-*` containers before running the complete suite. This is required because the synchronization commands refuse to operate while a Codex session is active. Use `CODEX_TEST_SKIP_SYNC=1` only for a reduced run that intentionally omits synchronization behavior.
 
 If images use custom names:

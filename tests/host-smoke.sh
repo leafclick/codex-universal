@@ -98,6 +98,7 @@ for script in \
     "$ROOT/tests/host-smoke-sync.sh" \
     "$ROOT/tests/host-smoke-collab.sh" \
     "$ROOT/tests/host-smoke-install.sh" \
+    "$ROOT/tests/host-smoke-portability-lint.sh" \
     "$ROOT/tests/host-smoke-compat.sh" \
     "$ROOT/tests/fixtures/host-smoke-image.sh" \
     "$ROOT/tests/fixtures/host-smoke-image-phase.sh" \
@@ -518,6 +519,8 @@ grep -Fq '"$ROOT/tests/host-smoke-sync.sh"' "$ROOT/tests/host-smoke.sh" ||
     fail "host smoke driver does not invoke the focused snapshot suite"
 grep -Fq '"$ROOT/tests/host-smoke-compat.sh"' "$ROOT/tests/host-smoke.sh" ||
     fail "host smoke driver does not invoke the host compatibility suite"
+grep -Fq '"$ROOT/tests/host-smoke-portability-lint.sh"' "$ROOT/tests/host-smoke.sh" ||
+    fail "host smoke driver does not invoke the portability-boundary suite"
 grep -Fq 'IntelliJ IDEA integration guide](docs/intellij.md)' "$ROOT/README.md" ||
     fail "README does not link to the extracted IntelliJ guide"
 if grep -Eq 'Seafile generation|Wait for Seafile' "$ROOT/bin/codex-push"; then
@@ -2935,6 +2938,8 @@ pass "sanitized Git image source metadata"
 
 activity "host utility compatibility contract"
 "$ROOT/tests/host-smoke-compat.sh"
+activity "host portability boundary"
+"$ROOT/tests/host-smoke-portability-lint.sh"
 activity "host tool installer"
 "$ROOT/tests/host-smoke-install.sh"
 activity "snapshot synchronization state machine"
