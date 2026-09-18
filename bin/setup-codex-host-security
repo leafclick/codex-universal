@@ -2,6 +2,12 @@
 set -Eeuo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=bin/codex-host-compat.bash
+HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || { echo "ERROR: Missing or unreadable host compatibility layer: $HOST_COMPAT" >&2; exit 1; }
+source "$HOST_COMPAT" || { echo "ERROR: Cannot load host compatibility layer: $HOST_COMPAT" >&2; exit 1; }
+
 die() {
     echo "ERROR: $*" >&2
     exit 1
@@ -30,8 +36,8 @@ fi
 
 ((EUID != 0)) || die "Run this command as the regular Docker user; it invokes sudo only for AppArmor installation"
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-SOURCE_ROOT="$(realpath -e -- "$SCRIPT_DIR/..")"
+codex_host_require_capabilities path || exit 1
+SOURCE_ROOT="$(codex_host_path_existing "$SCRIPT_DIR/..")"
 SOURCE_APPARMOR="$SOURCE_ROOT/security/apparmor/codex-universal"
 SOURCE_SECCOMP="$SOURCE_ROOT/security/seccomp/codex-bwrap.json"
 CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/run-codex"
@@ -45,7 +51,6 @@ APPARMOR_PARSER="$(find_apparmor_parser)"
 need cmp
 need install
 need jq
-need realpath
 need sudo
 
 [[ -r "$SOURCE_APPARMOR" ]] || die "Missing AppArmor source profile: $SOURCE_APPARMOR"

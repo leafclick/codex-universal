@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Shared snapshot metadata validation for codex-push and codex-pull.
-# Callers provide the required awk, basename, tr, and sha256sum commands.
+# Callers provide the required awk, basename, and tr commands plus the host
+# compatibility API.
 
 state_value() {
     local file="$1"
@@ -133,7 +134,7 @@ snapshot_archive_is_valid() {
     expected="$(tr -d '[:space:]' < "$checksum_path")"
     valid_hash "$expected" || return 1
 
-    actual="$(sha256sum "$archive_path" | awk '{print $1}')"
+    actual="$(codex_host_sha256_file "$archive_path")"
     [[ "$actual" == "$expected" ]] || return 1
 
     SNAPSHOT_ARCHIVE_PATH="$archive_path"

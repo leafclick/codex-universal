@@ -2,6 +2,13 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+HOST_COMPAT="$SCRIPT_DIR/bin/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || {
+    echo "ERROR: Missing host compatibility module: $HOST_COMPAT" >&2
+    exit 1
+}
+# shellcheck source=bin/codex-host-compat.bash
+source "$HOST_COMPAT"
 
 TARGET="${1:-all}"
 NPM_VERSION="${NPM_VERSION:-12.0.2}"
@@ -145,7 +152,8 @@ resolve_git_metadata() {
     fi
 
     if [[ -n "$(git -C "$SCRIPT_DIR" status --porcelain --untracked-files=normal -- \
-        .dockerignore Dockerfile.generic Dockerfile.cuda docker-build.sh container)" ]]; then
+        .dockerignore Dockerfile.generic Dockerfile.cuda docker-build.sh \
+        bin/codex-host-compat.bash container)" ]]; then
         BUILD_INPUTS_DIRTY=true
         [[ "$IMAGE_VERSION" == *-dirty ]] || IMAGE_VERSION="${IMAGE_VERSION}-dirty"
     fi
@@ -162,6 +170,8 @@ case "$TARGET" in
         exit 2
         ;;
 esac
+
+codex_host_require_gnu_linux || exit 1
 
 case "$TAG_LATEST" in
     0|1) ;;

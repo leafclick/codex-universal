@@ -2,6 +2,12 @@
 set -Eeuo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=bin/codex-host-compat.bash
+HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || { echo "ERROR: Missing or unreadable host compatibility layer: $HOST_COMPAT" >&2; exit 1; }
+source "$HOST_COMPAT" || { echo "ERROR: Cannot load host compatibility layer: $HOST_COMPAT" >&2; exit 1; }
+
 CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/run-codex"
 PROJECTS_DIR="$CONFIG_ROOT/projects"
 LANES_DIR="$CONFIG_ROOT/lanes"
@@ -182,7 +188,7 @@ need() {
 
 run_idea_dispatcher() {
     need jq
-    need realpath
+    codex_host_require_capabilities path || exit 1
     ((HOST_UID > 0 && HOST_GID > 0)) ||
         die "Run this command as a non-root user with a non-root primary group"
 
@@ -277,7 +283,7 @@ run_idea_dispatcher() {
     [[ -n "$request_cwd" ]] ||
         die "IDEA ACP client closed before selecting a project"
 
-    run_codex_self="$(realpath -e -- "${BASH_SOURCE[0]}")"
+    run_codex_self="$(codex_host_path_existing "${BASH_SOURCE[0]}")"
     coproc IDEA_BACKEND {
         exec "$run_codex_self" --internal-idea-backend "$request_cwd"
     }
@@ -421,10 +427,10 @@ run_idea_relay_guard() {
     [[ "$PPID" == "$IDEA_GUARD_LAUNCHER_PID" ]] ||
         die "IntelliJ relay launcher exited before guard startup"
 
-    need stat
+    codex_host_require_capabilities stat || exit 1
     need docker
     need socat
-    runtime_owner_mode="$(stat -c '%u:%a' -- "$IDEA_GUARD_RUNTIME_DIR")"
+    runtime_owner_mode="$(codex_host_file_owner_mode "$IDEA_GUARD_RUNTIME_DIR")"
     [[ "$runtime_owner_mode" == "$EUID:700" ]] ||
         die "Unsafe IntelliJ relay guard runtime directory permissions"
 
@@ -628,7 +634,7 @@ resolve_codex_image_options() {
             candidate="$PROJECT_PATH/$requested"
         fi
 
-        host_image="$(realpath -e -- "$candidate")" ||
+        host_image="$(codex_host_path_existing "$candidate")" ||
             die "Codex image file does not exist: $requested"
         [[ -f "$host_image" && -r "$host_image" ]] ||
             die "Codex image is not a readable file: $requested"
@@ -901,7 +907,7 @@ profile_image() {
 canonical_dir() {
     local path="$1"
     [[ -d "$path" ]] || return 1
-    realpath -e -- "$path"
+    codex_host_path_existing "$path"
 }
 
 git_root_for() {
@@ -923,9 +929,9 @@ inspect_git_layout() {
         die "Cannot resolve Git metadata for: $root"
     raw_common_dir="$(git -C "$root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ||
         die "Cannot resolve common Git metadata for: $root"
-    git_dir="$(realpath -e -- "$raw_git_dir")" ||
+    git_dir="$(codex_host_path_existing "$raw_git_dir")" ||
         die "Git metadata path does not exist: $raw_git_dir"
-    common_dir="$(realpath -e -- "$raw_common_dir")" ||
+    common_dir="$(codex_host_path_existing "$raw_common_dir")" ||
         die "Common Git metadata path does not exist: $raw_common_dir"
 
     if [[ -f "$root/.git" ]]; then
@@ -1133,7 +1139,7 @@ provision_missing_review_lane() {
     profile="$CONFIG_PROFILE"
     clojure_mcp="$CONFIG_CLOJURE_MCP"
     agent="$CONFIG_AGENT"
-    managed_parent="$(realpath -m -- "$CONFIG_ROOT/worktrees/$name")" ||
+    managed_parent="$(codex_host_path_allow_missing "$CONFIG_ROOT/worktrees/$name")" ||
         die "Cannot resolve managed review worktree directory"
     managed_path="$managed_parent/$lane"
     if [[ "$managed_path" == "$default_root" ||
@@ -1144,7 +1150,7 @@ provision_missing_review_lane() {
     provision_lock="$CONFIG_ROOT/locks/$name/$lane.provision.lock"
     mkdir -p -- "$(dirname -- "$provision_lock")"
     exec {provision_lock_fd}>"$provision_lock"
-    flock -x "$provision_lock_fd"
+    codex_host_lock_exclusive "$provision_lock_fd"
 
     # Another launcher may have completed provisioning while this invocation
     # waited for the project/lane provisioning lock.
@@ -1166,7 +1172,7 @@ provision_missing_review_lane() {
 managed_lane_path() {
     local name="$1"
     local lane="$2"
-    realpath -m -- "$CONFIG_ROOT/worktrees/$name/$lane"
+    codex_host_path_allow_missing "$CONFIG_ROOT/worktrees/$name/$lane"
 }
 
 managed_lane_branch() {
@@ -1181,9 +1187,9 @@ lane_handoff_lock() {
     if [[ -n "${CODEX_LOCK_FILE:-}" ]]; then
         [[ "$CODEX_LOCK_FILE" == /* ]] ||
             die "CODEX_LOCK_FILE must be an absolute path"
-        lock_path="$(realpath -m -- "$CODEX_LOCK_FILE")" || return 1
+        lock_path="$(codex_host_path_allow_missing "$CODEX_LOCK_FILE")" || return 1
     else
-        lock_path="$(realpath -m -- "$CONFIG_ROOT/locks/$name/$lane.handoff.lock")" ||
+        lock_path="$(codex_host_path_allow_missing "$CONFIG_ROOT/locks/$name/$lane.handoff.lock")" ||
             return 1
     fi
     [[ "$lock_path" != / ]] || die "CODEX_LOCK_FILE must not be the filesystem root"
@@ -1249,7 +1255,7 @@ create_managed_lane() {
         die "Cannot resolve default lane lock"
     mkdir -p -- "$(dirname -- "$lock_file")"
     exec {lock_fd}>"$lock_file"
-    flock -n -x "$lock_fd" ||
+    codex_host_lock_try_exclusive "$lock_fd" ||
         die "Stop project '$name' default lane before creating lane '$lane'"
     [[ ! -e "$lane_file" && ! -L "$lane_file" ]] ||
         die "Project '$name' lane '$lane' was registered while waiting for its lock"
@@ -1325,7 +1331,7 @@ create_managed_lane() {
                           "$(<"$state_owner_file")" == "$state_owner" ]]; then
                         state_quarantine="$lane_state_path.rollback.$state_owner"
                         if [[ ! -e "$state_quarantine" && ! -L "$state_quarantine" ]] &&
-                           mv -T -- "$lane_state_path" "$state_quarantine"; then
+                           codex_host_atomic_replace "$lane_state_path" "$state_quarantine"; then
                             if [[ -f "$state_quarantine/.run-codex-create-owner" &&
                                   ! -L "$state_quarantine/.run-codex-create-owner" &&
                                   "$(<"$state_quarantine/.run-codex-create-owner")" == "$state_owner" ]]; then
@@ -1376,10 +1382,10 @@ create_managed_lane() {
         git -C "$default_root" worktree add --detach "$temp_path" "$commit" >&2
         temp_worktree_created=true
         mkdir -p -- "$LANE_STATE_ROOT"
-        state_root="$(realpath -e -- "$LANE_STATE_ROOT")" ||
+        state_root="$(codex_host_path_existing "$LANE_STATE_ROOT")" ||
             die "Cannot resolve lane state root: $LANE_STATE_ROOT"
         mkdir -p -- "$state_root/$name"
-        state_project_path="$(realpath -e -- "$state_root/$name")" ||
+        state_project_path="$(codex_host_path_existing "$state_root/$name")" ||
             die "Cannot resolve project lane state root"
         [[ "$state_project_path" == "$state_root/"* ]] ||
             die "Project lane state root escapes its managed root: $state_project_path"
@@ -1388,7 +1394,7 @@ create_managed_lane() {
         state_stage_created=true
         stage_managed_lane_codex_home "$name" "$lane" \
             "$default_state_mode" "$state_stage_path"
-        lane_state_path="$(realpath -m -- "$state_root/$name/$lane")" ||
+        lane_state_path="$(codex_host_path_allow_missing "$state_root/$name/$lane")" ||
             die "Cannot resolve managed lane state path"
         [[ "$lane_state_path" == "$state_root/"* ]] ||
             die "Managed lane state path escapes its root: $lane_state_path"
@@ -1499,11 +1505,11 @@ import_lane_result() {
         die "Cannot resolve source lane lock"
     mkdir -p -- "$(dirname -- "$default_lock")" "$(dirname -- "$lane_lock")"
     exec {default_lock_fd}>"$default_lock"
-    flock -n -x "$default_lock_fd" ||
+    codex_host_lock_try_exclusive "$default_lock_fd" ||
         die "Stop project '$name' default lane before importing"
     if [[ "$lane_lock" != "$default_lock" ]]; then
         exec {lane_lock_fd}>"$lane_lock"
-        flock -n -x "$lane_lock_fd" ||
+        codex_host_lock_try_exclusive "$lane_lock_fd" ||
             die "Stop project '$name' lane '$lane' before importing"
     fi
 
@@ -1568,7 +1574,7 @@ remove_managed_lane() {
         die "Cannot resolve lane lock"
     mkdir -p -- "$(dirname -- "$lock_file")"
     exec {lock_fd}>"$lock_file"
-    flock -n -x "$lock_fd" ||
+    codex_host_lock_try_exclusive "$lock_fd" ||
         die "Stop project '$name' lane '$lane' before removing it"
 
     PROJECT="$name"
@@ -1800,7 +1806,7 @@ init_project() {
     local candidate_git_layout candidate_git_common_dir default_file default_root
 
     need git
-    need realpath
+    codex_host_require_capabilities path || exit 1
     mkdir -p "$PROJECTS_DIR"
 
     path="$(canonical_dir "$requested_path")" ||
@@ -1914,7 +1920,7 @@ rebind_project() {
     [[ -f "$file" ]] || die "Project '$name' is not registered. Use --init instead."
 
     need git
-    need realpath
+    codex_host_require_capabilities path || exit 1
 
     read_project_config "$file"
     profile="$CONFIG_PROFILE"
@@ -2322,24 +2328,24 @@ resolve_lane_codex_home() {
             [[ "$lane" == default ]] ||
                 die "Only a default lane may use legacy global Codex state"
             mkdir -p -- "$HOME/.codex"
-            CODEX_HOST_HOME="$(realpath -e -- "$HOME/.codex")" ||
+            CODEX_HOST_HOME="$(codex_host_path_existing "$HOME/.codex")" ||
                 die "Cannot resolve legacy Codex state directory"
             mkdir -p -- "$HOME/.m2"
-            CODEX_HOST_M2="$(realpath -e -- "$HOME/.m2")" ||
+            CODEX_HOST_M2="$(codex_host_path_existing "$HOME/.m2")" ||
                 die "Cannot resolve legacy Maven cache directory"
             ;;
         isolated)
             mkdir -p -- "$LANE_STATE_ROOT"
-            state_root="$(realpath -e -- "$LANE_STATE_ROOT")" ||
+            state_root="$(codex_host_path_existing "$LANE_STATE_ROOT")" ||
                 die "Cannot resolve lane state root: $LANE_STATE_ROOT"
             mkdir -p -- "$LANE_STATE_ROOT/$project/$lane/codex-home"
-            resolved="$(realpath -e -- "$LANE_STATE_ROOT/$project/$lane/codex-home")" ||
+            resolved="$(codex_host_path_existing "$LANE_STATE_ROOT/$project/$lane/codex-home")" ||
                 die "Cannot resolve Codex state for project '$project' lane '$lane'"
             [[ "$resolved" == "$state_root/"* ]] ||
                 die "Lane Codex state escapes its managed root: $resolved"
             CODEX_HOST_HOME="$resolved"
             mkdir -p -- "$LANE_STATE_ROOT/$project/$lane/m2"
-            resolved="$(realpath -e -- "$LANE_STATE_ROOT/$project/$lane/m2")" ||
+            resolved="$(codex_host_path_existing "$LANE_STATE_ROOT/$project/$lane/m2")" ||
                 die "Cannot resolve Maven cache for project '$project' lane '$lane'"
             [[ "$resolved" == "$state_root/"* ]] ||
                 die "Lane Maven cache escapes its managed root: $resolved"
@@ -2438,7 +2444,7 @@ seed_managed_lane_codex_home() {
     read_project_config "$default_file"
     default_state_mode="$CONFIG_STATE_MODE"
     read_project_config "$lane_file"
-    managed_parent="$(realpath -m -- "$CONFIG_ROOT/worktrees/$project")" ||
+    managed_parent="$(codex_host_path_allow_missing "$CONFIG_ROOT/worktrees/$project")" ||
         die "Cannot resolve managed review worktree directory"
     managed_path="$managed_parent/$lane"
     [[ "$CONFIG_PATH" == "$managed_path" ]] || return 0
@@ -2472,7 +2478,7 @@ run_lane_state_sync() {
     local runtime_version="" runtime_revision=""
     local args=()
 
-    launcher_source="$(realpath -e -- "${BASH_SOURCE[0]}")" ||
+    launcher_source="$(codex_host_path_existing "${BASH_SOURCE[0]}")" ||
         die "Cannot resolve run-codex installation path"
     launcher_dir="$(dirname -- "$launcher_source")"
     lane_sync_dir="$SYNC_ROOT/projects/$PROJECT/lanes/$LANE"
@@ -2505,7 +2511,7 @@ run_lane_state_sync() {
             die "Cannot resolve the lane's required Git commit"
 
         need jq
-        need sha256sum
+        codex_host_require_capabilities checksum || exit 1
         load_onboarding_manifests "$PROJECT" "$LANE"
         if ! check_onboarding true; then
             check_onboarding false || true
@@ -2601,20 +2607,20 @@ load_onboarding_manifests() {
     done
     if ((${#ONBOARDING_MANIFESTS[@]} > 0)); then
         need grep
-        need stat
+        codex_host_require_capabilities stat || exit 1
         need install
     fi
 }
 
 onboarding_contract_hash() {
     if ((${#ONBOARDING_MANIFESTS[@]} == 0)); then
-        printf '' | sha256sum | awk '{print $1}'
+        printf '' | codex_host_sha256_stdin
         return
     fi
 
     for manifest in "${ONBOARDING_MANIFESTS[@]}"; do
         jq -cS . "$manifest"
-    done | LC_ALL=C sort | sha256sum | awk '{print $1}'
+    done | LC_ALL=C sort | codex_host_sha256_stdin
 }
 
 safe_onboarding_file() {
@@ -2625,8 +2631,8 @@ safe_onboarding_file() {
     validate_onboarding_relative_path "$relative" || return 1
     candidate="$root/$relative"
     [[ -f "$candidate" && ! -L "$candidate" ]] || return 1
-    [[ "$(stat -c '%h' -- "$candidate")" == 1 ]] || return 1
-    resolved="$(realpath -e -- "$candidate")" || return 1
+    [[ "$(codex_host_file_link_count "$candidate")" == 1 ]] || return 1
+    resolved="$(codex_host_path_existing "$candidate")" || return 1
     [[ "$resolved" == "$root/"* ]] || return 1
     printf '%s\n' "$resolved"
 }
@@ -2736,7 +2742,7 @@ check_onboarding() {
                 fi
             done < <(jq -r '.placeholders[]?' <<<"$entry")
             if [[ "$secret" == true ]]; then
-                permissions="$(stat -c '%a' -- "$destination")" ||
+                permissions="$(codex_host_file_mode "$destination")" ||
                     die "Cannot inspect onboarding file permissions: $path"
                 if (( (8#$permissions & 077) != 0 )); then
                     ((ONBOARDING_ISSUES += 1))
@@ -2795,7 +2801,7 @@ load_doctor_module() {
     local launcher_dir doctor_module
 
     if command -v realpath >/dev/null 2>&1; then
-        launcher_source="$(realpath -e -- "$launcher_source")" ||
+        launcher_source="$(codex_host_path_existing "$launcher_source")" ||
             die "Cannot resolve run-codex installation path"
     fi
     launcher_dir="$(cd -P -- "$(dirname -- "$launcher_source")" && pwd)" ||
@@ -2827,16 +2833,18 @@ case "${1:-}" in
     --list)
         (($# == 1)) || die "--list takes no arguments"
         need git
-        need realpath
+        codex_host_require_capabilities path || exit 1
         list_projects
         exit 0
         ;;
     --init)
+        codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
         shift
         init_project "$@"
         exit 0
         ;;
     --rebind)
+        codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
         shift
         rebind_args=()
         rebind_lane="default"
@@ -2876,6 +2884,7 @@ case "${1:-}" in
         IDEA_MODE=true
         shift
         if (($# == 0)); then
+            codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
             run_idea_dispatcher
             exit $?
         fi
@@ -2892,12 +2901,14 @@ case "${1:-}" in
         ;;
     *)
         if (($# >= 2)) && [[ "$2" == --set ]]; then
+            codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
             (($# == 4)) ||
                 die "Usage: run-codex PROJECT --set profile|clojure-mcp|model|reasoning VALUE"
             set_project_value "$1" default "$3" "$4"
             exit 0
         fi
         if (($# >= 4)) && [[ "$2" == --lane && "$4" == --set ]]; then
+            codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
             (($# == 6)) ||
                 die "Usage: run-codex PROJECT --lane LANE --set profile|clojure-mcp|model|reasoning VALUE"
             set_project_value "$1" "$3" "$5" "$6"
@@ -2919,8 +2930,7 @@ if [[ -n "$LANE_MANAGEMENT_MODE" ]]; then
         die "Lane management actions cannot be combined with launch, onboarding, or state options"
     fi
     need git
-    need realpath
-    need flock
+    codex_host_require_capabilities path lock || exit 1
     case "$LANE_MANAGEMENT_MODE" in
         create)
             create_managed_lane "$PROJECT" "$LANE" "$LANE_MANAGEMENT_REVISION"
@@ -2998,10 +3008,9 @@ fi
 # Resolve first so an unconfigured project gets useful setup instructions even
 # on a new machine whose Docker setup is not complete yet.
 need git
-need realpath
+codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
 if $REVIEW_REVISION_SET && $LANE_SET && [[ "$LANE" != default ]] &&
    [[ -n "$PROJECT" ]]; then
-    need flock
     provision_missing_review_lane "$PROJECT" "$LANE" "$REVIEW_REVISION"
     seed_managed_lane_codex_home "$PROJECT" "$LANE"
 fi
@@ -3070,12 +3079,11 @@ fi
 # Shared lock: multiple Codex projects may run simultaneously, while
 # codex-push/codex-pull take this same lock exclusively. Acquire it before any
 # session-state read so a pull cannot replace the database during resolution.
-need flock
 mkdir -p -- "$(dirname "$LOCK_FILE")"
 exec 9>"$LOCK_FILE"
-if ! flock -sn 9; then
+if ! codex_host_lock_try_shared 9; then
     echo "Waiting for Codex state handoff lock: $LOCK_FILE" >&2
-    flock -s 9
+    codex_host_lock_shared 9
 fi
 
 if $SESSION_LIST_MODE || $RESUME_QUERY_SET; then
@@ -3119,7 +3127,7 @@ docker info >/dev/null 2>&1 || die "Docker daemon is not available"
     echo "  bin/setup-codex-host-security" >&2
     exit 1
 }
-SECCOMP_PROFILE="$(realpath -e -- "$SECCOMP_PROFILE")"
+SECCOMP_PROFILE="$(codex_host_path_existing "$SECCOMP_PROFILE")"
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || {
     echo "ERROR: Required image is not available locally:" >&2
@@ -3216,9 +3224,9 @@ fi
 # remains mutually exclusive with all IDEA chats for that project.
 exec 8>"$CONFIG_ROOT/runtime/$CONTAINER_IDENTITY.lock"
 if $IDEA_MODE; then
-    flock -sn 8 || die "A terminal agent session is already using project '$PROJECT' lane '$LANE'"
+    codex_host_lock_try_shared 8 || die "A terminal agent session is already using project '$PROJECT' lane '$LANE'"
 else
-    flock -xn 8 || die "An IDEA agent session is already using project '$PROJECT' lane '$LANE'"
+    codex_host_lock_try_exclusive 8 || die "An IDEA agent session is already using project '$PROJECT' lane '$LANE'"
 fi
 
 docker_args=(
@@ -3297,7 +3305,7 @@ if $IDEA_MODE; then
         # IDEA deliberately listens on host loopback. Bridge only that one TCP
         # port into a private per-chat Unix socket; do not publish a host port
         # or give the Codex container the host network namespace.
-        RUN_CODEX_SELF="$(realpath -e -- "${BASH_SOURCE[0]}")"
+        RUN_CODEX_SELF="$(codex_host_path_existing "${BASH_SOURCE[0]}")"
         # The guard gets a parent-death signal even if IDEA kills this launcher
         # with SIGKILL. Closing the lock descriptors here prevents the relay or
         # guard from making a finished chat look permanently active.

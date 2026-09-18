@@ -54,6 +54,8 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     install -m 700 "$ROOT/bin/codex-pull" "$installed_sync_dir/codex-pull"
     install -m 600 "$ROOT/bin/codex-sync-lib" \
         "$installed_sync_dir/codex-sync-lib"
+    install -m 600 "$ROOT/bin/codex-host-compat.bash" \
+        "$installed_sync_dir/codex-host-compat.bash"
     PUSH_COMMAND="$installed_sync_dir/codex-push"
     PULL_COMMAND="$installed_sync_dir/codex-pull"
 
@@ -798,7 +800,8 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     rollback_mv="$rollback_bin/mv"
     printf '%s\n' \
         '#!/usr/bin/env bash' \
-        'if [[ "${2:-}" == */content && "${3:-}" == "'$rollback_root'/live" ]]; then' \
+        'source_path="${@: -2:1}"; destination_path="${@: -1}"' \
+        'if [[ "$source_path" == */content && "$destination_path" == "'$rollback_root'/live" ]]; then' \
         '    exit 1' \
         'fi' \
         'exec /bin/mv "$@"' > "$rollback_mv"
@@ -818,10 +821,11 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     rollback_mv_fail="$rollback_fail_bin/mv"
     printf '%s\n' \
         '#!/usr/bin/env bash' \
-        'if [[ "${2:-}" == */content && "${3:-}" == "'$rollback_root'/live" ]]; then' \
+        'source_path="${@: -2:1}"; destination_path="${@: -1}"' \
+        'if [[ "$source_path" == */content && "$destination_path" == "'$rollback_root'/live" ]]; then' \
         '    exit 1' \
         'fi' \
-        'if [[ "${2:-}" == "'$rollback_root'/live.backup-"* && "${3:-}" == "'$rollback_root'/live" ]]; then' \
+        'if [[ "$source_path" == "'$rollback_root'/live.backup-"* && "$destination_path" == "'$rollback_root'/live" ]]; then' \
         '    exit 1' \
         'fi' \
         'exec /bin/mv "$@"' > "$rollback_mv_fail"

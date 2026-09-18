@@ -280,7 +280,7 @@ doctor_mcp_probe() {
 run_doctor() {
     local requested_project="${1:-}"
     local missing=()
-    local command
+    local command compatibility_error
 
     echo "Codex environment doctor"
     echo
@@ -300,6 +300,18 @@ run_doctor() {
         return 1
     fi
     doctor_pass "Required host commands are available"
+
+    if ! compatibility_error="$(
+        codex_host_require_capabilities path lock 2>&1
+    )"; then
+        doctor_fail "Host utility compatibility check failed"
+        doctor_note "${compatibility_error#ERROR: }"
+        echo
+        printf 'Diagnostics failed: %d failure(s), %d warning(s).\n' \
+            "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
+        return 1
+    fi
+    doctor_pass "GNU/Linux host utility compatibility is available"
 
     if ((HOST_UID == 0 || HOST_GID == 0)); then
         doctor_fail "Host UID/GID must both be non-root ($HOST_UID:$HOST_GID)"
@@ -340,7 +352,7 @@ run_doctor() {
         doctor_fail "Host sandbox policy is not readable: $SECCOMP_PROFILE"
         doctor_note "Run bin/setup-codex-host-security from the codex-universal checkout."
     else
-        SECCOMP_PROFILE="$(realpath -e -- "$SECCOMP_PROFILE")"
+        SECCOMP_PROFILE="$(codex_host_path_existing "$SECCOMP_PROFILE")"
         doctor_pass "Host sandbox policy is readable"
     fi
 

@@ -75,6 +75,7 @@ git -C "$ROOT" diff --cached --check
 
 for script in \
     "$ROOT/docker-build.sh" \
+    "$ROOT/bin/codex-host-compat.bash" \
     "$ROOT/bin/run-codex" \
     "$ROOT/bin/setup-codex-host-security" \
     "$ROOT/bin/setup-codex-idea" \
@@ -95,6 +96,7 @@ for script in \
     "$ROOT/scripts/update-tool-versions" \
     "$ROOT/tests/host-smoke-sync.sh" \
     "$ROOT/tests/host-smoke-collab.sh" \
+    "$ROOT/tests/host-smoke-compat.sh" \
     "$ROOT/tests/fixtures/host-smoke-image.sh" \
     "$ROOT/tests/fixtures/host-smoke-image-phase.sh" \
     "$ROOT/tests/fixtures/host-smoke-clojure-runtime.sh"; do
@@ -512,6 +514,8 @@ grep -Eq '^run_doctor\(\)' "$ROOT/bin/run-codex-doctor.bash" ||
     fail "doctor companion module lacks run_doctor"
 grep -Fq '"$ROOT/tests/host-smoke-sync.sh"' "$ROOT/tests/host-smoke.sh" ||
     fail "host smoke driver does not invoke the focused snapshot suite"
+grep -Fq '"$ROOT/tests/host-smoke-compat.sh"' "$ROOT/tests/host-smoke.sh" ||
+    fail "host smoke driver does not invoke the host compatibility suite"
 grep -Fq 'IntelliJ IDEA integration guide](docs/intellij.md)' "$ROOT/README.md" ||
     fail "README does not link to the extracted IntelliJ guide"
 if grep -Eq 'Seafile generation|Wait for Seafile' "$ROOT/bin/codex-push"; then
@@ -1604,6 +1608,8 @@ assert_contains "$doctor_missing_output" \
 
 doctor_output="$("${launcher_env[@]}" "$ROOT/bin/run-codex" --doctor smoke-project)"
 assert_contains "$doctor_output" "PASS  Required host commands are available"
+assert_contains "$doctor_output" \
+    "PASS  GNU/Linux host utility compatibility is available"
 assert_contains "$doctor_output" "PASS  Host runtime identity is non-root ($(id -u):$(id -g))"
 assert_contains "$doctor_output" "PASS  Docker daemon is available"
 assert_contains "$doctor_output" "PASS  Project 'smoke-project' resolves to $TEST_ROOT/repo (generic)"
@@ -1631,6 +1637,8 @@ mkdir -p "$installed_launcher_dir"
 install -m 755 "$ROOT/bin/run-codex" "$installed_launcher_dir/run-codex"
 install -m 644 "$ROOT/bin/run-codex-doctor.bash" \
     "$installed_launcher_dir/run-codex-doctor.bash"
+install -m 644 "$ROOT/bin/codex-host-compat.bash" \
+    "$installed_launcher_dir/codex-host-compat.bash"
 installed_doctor_output="$(
     "${launcher_env[@]}" "$installed_launcher_dir/run-codex" \
         --doctor smoke-project
@@ -1641,6 +1649,8 @@ assert_contains "$installed_doctor_output" \
 missing_module_dir="$TEST_ROOT/missing-doctor-module"
 mkdir -p "$missing_module_dir"
 install -m 755 "$ROOT/bin/run-codex" "$missing_module_dir/run-codex"
+install -m 644 "$ROOT/bin/codex-host-compat.bash" \
+    "$missing_module_dir/codex-host-compat.bash"
 if "${launcher_env[@]}" "$missing_module_dir/run-codex" \
     --doctor smoke-project >"$missing_module_dir/output" 2>&1; then
     fail "installed launcher accepted a missing doctor companion module"
@@ -2720,8 +2730,10 @@ activity "portable image build policy"
 portable_build_repo="$TEST_ROOT/portable-build"
 mkdir -p -- "$portable_build_repo"
 cp -- "$ROOT/docker-build.sh" "$ROOT/Dockerfile.generic" "$portable_build_repo/"
+mkdir -p -- "$portable_build_repo/bin"
+cp -- "$ROOT/bin/codex-host-compat.bash" "$portable_build_repo/bin/"
 git -C "$portable_build_repo" init -q
-git -C "$portable_build_repo" add docker-build.sh Dockerfile.generic
+git -C "$portable_build_repo" add docker-build.sh Dockerfile.generic bin/codex-host-compat.bash
 git -C "$portable_build_repo" \
     -c user.name=host-smoke \
     -c user.email=host-smoke.invalid \
@@ -2753,6 +2765,8 @@ activity "Git-derived image metadata"
 mkdir -p -- "$TEST_ROOT/non-git-build"
 cp -- "$ROOT/docker-build.sh" "$ROOT/Dockerfile.generic" \
     "$TEST_ROOT/non-git-build/"
+mkdir -p -- "$TEST_ROOT/non-git-build/bin"
+cp -- "$ROOT/bin/codex-host-compat.bash" "$TEST_ROOT/non-git-build/bin/"
 set +e
 non_git_build_output="$(
     env IMAGE_SLUG=codex-host-smoke IMAGE_VERSION=test-version \
@@ -2771,8 +2785,10 @@ pass "explicit image metadata preserves Git provenance requirement"
 # use the documented fallback image slug without tripping Bash nounset mode.
 mkdir -p "$TEST_ROOT/no-origin"
 cp -- "$ROOT/docker-build.sh" "$ROOT/Dockerfile.generic" "$TEST_ROOT/no-origin/"
+mkdir -p -- "$TEST_ROOT/no-origin/bin"
+cp -- "$ROOT/bin/codex-host-compat.bash" "$TEST_ROOT/no-origin/bin/"
 git -C "$TEST_ROOT/no-origin" init -q
-git -C "$TEST_ROOT/no-origin" add docker-build.sh Dockerfile.generic
+git -C "$TEST_ROOT/no-origin" add docker-build.sh Dockerfile.generic bin/codex-host-compat.bash
 git -C "$TEST_ROOT/no-origin" \
     -c user.name=host-smoke \
     -c user.email=host-smoke.invalid \
@@ -2796,10 +2812,12 @@ make_version_repo() {
     local repo="$1"
     mkdir -p -- "$repo"
     cp -- "$ROOT/docker-build.sh" "$ROOT/Dockerfile.generic" "$repo/"
+    mkdir -p -- "$repo/bin"
+    cp -- "$ROOT/bin/codex-host-compat.bash" "$repo/bin/"
     git -C "$repo" init -q
     git -C "$repo" config user.name host-smoke
     git -C "$repo" config user.email host-smoke.invalid
-    git -C "$repo" add docker-build.sh Dockerfile.generic
+    git -C "$repo" add docker-build.sh Dockerfile.generic bin/codex-host-compat.bash
     git -C "$repo" commit -q -m initial
 }
 
@@ -2913,6 +2931,8 @@ assert_contains "$credential_source_output" \
     "--build-arg IMAGE_SOURCE=https://example.com/acme/codex-universal"
 pass "sanitized Git image source metadata"
 
+activity "host utility compatibility contract"
+"$ROOT/tests/host-smoke-compat.sh"
 activity "snapshot synchronization state machine"
 "$ROOT/tests/host-smoke-sync.sh"
 activity "lane collaboration mailbox"

@@ -2,6 +2,12 @@
 set -Eeuo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=bin/codex-host-compat.bash
+HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || { echo "ERROR: Missing or unreadable host compatibility layer: $HOST_COMPAT" >&2; exit 1; }
+source "$HOST_COMPAT" || { echo "ERROR: Cannot load host compatibility layer: $HOST_COMPAT" >&2; exit 1; }
+
 CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/run-codex"
 PROJECTS_DIR="$CONFIG_ROOT/projects"
 LANES_DIR="$CONFIG_ROOT/lanes"
@@ -87,13 +93,13 @@ load_lane() {
     [[ -f "$file" && ! -L "$file" ]] ||
         die "Project '$project' lane '$lane' is not registered"
     if [[ "$lane" == default ]]; then
-        registry_root="$(realpath -e -- "$PROJECTS_DIR")" ||
+        registry_root="$(codex_host_path_existing "$PROJECTS_DIR")" ||
             die "Cannot resolve project registry"
     else
-        registry_root="$(realpath -e -- "$LANES_DIR")" ||
+        registry_root="$(codex_host_path_existing "$LANES_DIR")" ||
             die "Cannot resolve lane registry"
     fi
-    file="$(realpath -e -- "$file")" || die "Cannot resolve lane registration"
+    file="$(codex_host_path_existing "$file")" || die "Cannot resolve lane registration"
     [[ "$file" == "$registry_root/"* ]] ||
         die "Lane registration escapes its managed registry"
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -113,13 +119,13 @@ load_lane() {
         die "Registered checkout is unavailable: $path"
     root="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null)" ||
         die "Registered checkout is not a Git repository: $path"
-    root="$(realpath -e -- "$root")" || die "Cannot resolve checkout: $path"
-    path="$(realpath -e -- "$path")" || die "Cannot resolve checkout: $path"
+    root="$(codex_host_path_existing "$root")" || die "Cannot resolve checkout: $path"
+    path="$(codex_host_path_existing "$path")" || die "Cannot resolve checkout: $path"
     [[ "$root" == "$path" ]] || die "Registered checkout is not its Git root: $path"
     raw_common="$(
         git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
     )" || die "Cannot resolve common Git metadata for: $path"
-    common="$(realpath -e -- "$raw_common")" ||
+    common="$(codex_host_path_existing "$raw_common")" ||
         die "Common Git metadata is unavailable: $raw_common"
     LANE_PATH="$path"
     LANE_COMMON_DIR="$common"
@@ -146,7 +152,7 @@ resolve_collab_dir() {
         COLLAB_DIR=""
         return 0
     fi
-    root="$(realpath -e -- "$STATE_ROOT")" || die "Cannot resolve state root"
+    root="$(codex_host_path_existing "$STATE_ROOT")" || die "Cannot resolve state root"
     project_state="$root/$project"
     if $create; then
         if [[ -e "$project_state" || -L "$project_state" ]]; then
@@ -175,7 +181,7 @@ resolve_collab_dir() {
         COLLAB_DIR=""
         return 0
     fi
-    lane_state="$(realpath -e -- "$lane_state")" || die "Cannot resolve lane state path"
+    lane_state="$(codex_host_path_existing "$lane_state")" || die "Cannot resolve lane state path"
     [[ "$lane_state" == "$root/"* ]] || die "Lane state escapes its managed root"
     collab="$lane_state/collaboration"
     if $create; then
@@ -185,7 +191,7 @@ resolve_collab_dir() {
         else
             mkdir -p -- "$collab"
         fi
-        collab="$(realpath -e -- "$collab")" ||
+        collab="$(codex_host_path_existing "$collab")" ||
             die "Cannot resolve collaboration directory"
         [[ "$collab" == "$lane_state/"* ]] ||
             die "Collaboration directory escapes lane state"
@@ -195,7 +201,7 @@ resolve_collab_dir() {
         COLLAB_DIR=""
         return 0
     fi
-    collab="$(realpath -e -- "$collab")" || die "Cannot resolve collaboration directory"
+    collab="$(codex_host_path_existing "$collab")" || die "Cannot resolve collaboration directory"
     [[ "$collab" == "$lane_state/"* ]] || die "Collaboration directory escapes lane state"
     COLLAB_DIR="$collab"
 }
@@ -214,7 +220,7 @@ ensure_mailbox() {
     else
         mkdir -p -- "$path"
     fi
-    path="$(realpath -e -- "$path")" || die "Cannot resolve mailbox: $path"
+    path="$(codex_host_path_existing "$path")" || die "Cannot resolve mailbox: $path"
     [[ "$path" == "$COLLAB_DIR/"* ]] || die "Mailbox escapes collaboration state"
     printf '%s\n' "$path"
 }
@@ -239,7 +245,7 @@ resolve_existing_mailbox() {
         MAILBOX_DIR=""
         return 0
     fi
-    path="$(realpath -e -- "$path")" || die "Cannot resolve mailbox: $path"
+    path="$(codex_host_path_existing "$path")" || die "Cannot resolve mailbox: $path"
     [[ "$path" == "$COLLAB_DIR/"* ]] || die "Mailbox escapes collaboration state"
     MAILBOX_DIR="$path"
 }
@@ -256,7 +262,7 @@ lock_path_for() {
     else
         mkdir -p -- "$LOCK_ROOT"
     fi
-    root="$(realpath -e -- "$LOCK_ROOT")" || die "Cannot resolve lock root"
+    root="$(codex_host_path_existing "$LOCK_ROOT")" || die "Cannot resolve lock root"
     dir="$root/$project"
     if [[ -e "$dir" || -L "$dir" ]]; then
         [[ -d "$dir" && ! -L "$dir" ]] ||
@@ -290,10 +296,10 @@ lock_lanes() {
         second_lock=""
     fi
     exec {LOCK_FD_ONE}>"$first_lock"
-    flock -n -x "$LOCK_FD_ONE" || die "Collaboration lane is busy: $first_lane"
+    codex_host_lock_try_exclusive "$LOCK_FD_ONE" || die "Collaboration lane is busy: $first_lane"
     if [[ -n "$second_lock" ]]; then
         exec {LOCK_FD_TWO}>"$second_lock"
-        flock -n -x "$LOCK_FD_TWO" || die "Collaboration lane is busy: $second_lane"
+        codex_host_lock_try_exclusive "$LOCK_FD_TWO" || die "Collaboration lane is busy: $second_lane"
     fi
 }
 
@@ -327,8 +333,7 @@ pending_count() {
 message_hash() {
     local file="$1"
     local value
-    value="$(sha256sum -- "$file")" || return 1
-    printf '%s\n' "${value%% *}"
+    codex_host_sha256_file "$file"
 }
 
 validate_message_file() {
@@ -337,7 +342,7 @@ validate_message_file() {
     local id body_hash recorded_hash size
 
     [[ -f "$file" && ! -L "$file" ]] || die "Message is not a regular file: $file"
-    size="$(stat -c %s -- "$file")" || die "Cannot inspect message: $file"
+    size="$(codex_host_file_size "$file")" || die "Cannot inspect message: $file"
     ((size <= MAX_RECORD_BYTES)) || die "Message record is oversized: $file"
     jq -e --argjson max "$MAX_BODY_BYTES" '
         type == "object" and
@@ -359,7 +364,7 @@ validate_message_file() {
     [[ -z "$expected_id" || "$id" == "$expected_id" ]] ||
         die "Message ID does not match its filename: $file"
     recorded_hash="$(jq -r '.body_sha256' "$file")"
-    body_hash="$(jq -j '.body' "$file" | sha256sum)" ||
+    body_hash="$(jq -j '.body' "$file" | codex_host_sha256_stdin)" ||
         die "Cannot hash collaboration message body: $file"
     body_hash="${body_hash%% *}"
     [[ "$body_hash" == "$recorded_hash" ]] ||
@@ -401,7 +406,7 @@ command_send() {
     validate_commit_id "$revision"
     [[ -f "$body_file" && ! -L "$body_file" ]] ||
         die "Body file must be a regular file, not a symlink: $body_file"
-    body_size="$(stat -c %s -- "$body_file")" || die "Cannot inspect body file"
+    body_size="$(codex_host_file_size "$body_file")" || die "Cannot inspect body file"
     ((body_size <= MAX_BODY_BYTES)) ||
         die "Message body exceeds $MAX_BODY_BYTES bytes"
     load_lane "$project" "$from_lane"
@@ -456,7 +461,7 @@ command_send() {
           body_sha256:$body_sha256,body:$body}' > "$tmp"
     chmod 600 -- "$tmp"
     validate_message_file "$tmp" "$id"
-    mv -T -- "$tmp" "$final"
+    codex_host_atomic_replace "$tmp" "$final"
     trap - EXIT HUP INT TERM
     printf '%s\n' "$id"
 }
@@ -530,14 +535,14 @@ command_deliver() {
         else
             quarantine="$(ensure_mailbox "$project" "$to_lane" quarantine)"
             quarantine_final="$quarantine/$id.conflict.$$.json"
-            mv -T -- "$tmp" "$quarantine_final"
+            codex_host_atomic_replace "$tmp" "$quarantine_final"
             tmp=""
             die "DIVERGENCE: recipient already has different message ID $id"
         fi
     else
         (($(pending_count "$inbox" "$acks" acknowledged_at) < MAX_PENDING_MESSAGES)) ||
             die "Recipient inbox message limit reached"
-        mv -T -- "$tmp" "$final"
+        codex_host_atomic_replace "$tmp" "$final"
         tmp=""
     fi
     if [[ ! -e "$receipt" && ! -L "$receipt" ]]; then
@@ -547,7 +552,7 @@ command_deliver() {
             '{version:1,message_id:$id,message_sha256:$hash,delivered_at:$delivered_at}' \
             > "$receipt_tmp"
         chmod 600 -- "$receipt_tmp"
-        mv -T -- "$receipt_tmp" "$receipt"
+        codex_host_atomic_replace "$receipt_tmp" "$receipt"
         receipt_tmp=""
     fi
     trap - EXIT HUP INT TERM
@@ -568,7 +573,7 @@ command_list() {
     acks="$MAILBOX_DIR"
     exec {list_fd}< <(
         find "$inbox" -mindepth 1 -maxdepth 1 -type f -name '*.json' -print0 |
-            sort -z
+            codex_host_sort_null
     )
     find_pid=$!
     while IFS= read -r -d '' file; do
@@ -665,7 +670,7 @@ command_ack() {
         '{version:1,message_id:$id,message_sha256:$hash,acknowledged_at:$acknowledged_at}' \
         > "$tmp"
     chmod 600 -- "$tmp"
-    mv -T -- "$tmp" "$final"
+    codex_host_atomic_replace "$tmp" "$final"
     tmp=""
     trap - EXIT HUP INT TERM
     echo "Acknowledged $id."
@@ -725,11 +730,11 @@ quarantine_prune_hold() {
         return 1
     fi
     if [[ -e "$PRUNE_HELD_RECORD" || -L "$PRUNE_HELD_RECORD" ]]; then
-        mv -T -- "$PRUNE_HELD_RECORD" "$record_target"
+        codex_host_atomic_replace "$PRUNE_HELD_RECORD" "$record_target"
         preserved="$record_target"
     fi
     if [[ -e "$PRUNE_HELD_MARKER" || -L "$PRUNE_HELD_MARKER" ]]; then
-        mv -T -- "$PRUNE_HELD_MARKER" "$marker_target"
+        codex_host_atomic_replace "$PRUNE_HELD_MARKER" "$marker_target"
         [[ "$preserved" != "$PRUNE_HOLD_DIR" ]] || preserved="$marker_target"
     fi
     rmdir -- "$PRUNE_HOLD_DIR" 2>/dev/null || true
@@ -758,11 +763,11 @@ restore_prune_hold() {
            $marker_valid &&
            [[ ! -e "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" &&
               ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]]; then
-            mv -T -- "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
-            mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
+            codex_host_atomic_replace "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
+            codex_host_atomic_replace "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
         elif $held_valid &&
              [[ ! -e "$PRUNE_RECORD" && ! -L "$PRUNE_RECORD" ]]; then
-            mv -T -- "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
+            codex_host_atomic_replace "$PRUNE_HELD_RECORD" "$PRUNE_RECORD"
             quarantine_prune_hold
             return 1
         else
@@ -775,7 +780,7 @@ restore_prune_hold() {
               ! -e "$PRUNE_ORIGINAL_MARKER" && ! -L "$PRUNE_ORIGINAL_MARKER" ]] &&
            (validate_marker_file "$PRUNE_HELD_MARKER" "$PRUNE_ID" \
                "$PRUNE_EXPECTED_HASH" "$PRUNE_TIMESTAMP_KEY") >/dev/null 2>&1; then
-            mv -T -- "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
+            codex_host_atomic_replace "$PRUNE_HELD_MARKER" "$PRUNE_ORIGINAL_MARKER"
         else
             quarantine_prune_hold
             return 1
@@ -829,8 +834,8 @@ prune_completed_mailbox() {
         PRUNE_BINDING_VALUE="$binding_value"
         PRUNE_TIMESTAMP_KEY="$timestamp_key"
         PRUNE_QUARANTINE="$quarantine"
-        mv -T -- "$marker" "$PRUNE_HELD_MARKER"
-        mv -T -- "$file" "$PRUNE_HELD_RECORD"
+        codex_host_atomic_replace "$marker" "$PRUNE_HELD_MARKER"
+        codex_host_atomic_replace "$file" "$PRUNE_HELD_RECORD"
         if ! (validate_message_file "$PRUNE_HELD_RECORD" "$id" &&
               [[ "$(message_hash "$PRUNE_HELD_RECORD")" == "$digest" ]] &&
               validate_marker_file "$PRUNE_HELD_MARKER" "$id" "$digest" \
@@ -894,10 +899,11 @@ command_prune() {
     ! $invalid
 }
 
-for command in git realpath jq flock find stat sha256sum mktemp date od tr sort \
+for command in git jq find mktemp date od tr sort \
     install cmp basename mkdir rmdir mv chmod rm; do
     need "$command"
 done
+codex_host_require_capabilities path stat checksum lock atomic-replace null-sort || exit 1
 
 ACTION="${1:-}"
 [[ -n "$ACTION" ]] || { usage >&2; exit 2; }

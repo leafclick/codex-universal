@@ -2,6 +2,15 @@
 set -Eeuo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+HOST_COMPAT="$ROOT/bin/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || {
+    echo "ERROR: Missing host compatibility module: $HOST_COMPAT" >&2
+    exit 1
+}
+# shellcheck source=bin/codex-host-compat.bash
+source "$HOST_COMPAT"
+codex_host_require_capabilities checksum || exit 1
+
 CONFIG_FILE="$ROOT/container/clojure-tool-versions.conf"
 SYSTEM_CONFIG_FILE="$ROOT/container/system-tool-versions.conf"
 update_root="$(mktemp -d)"
@@ -9,7 +18,7 @@ trap 'rm -rf -- "$update_root"' EXIT
 install -d -m 0700 "$update_root/gnupg"
 export GNUPGHOME="$update_root/gnupg"
 
-for command_name in curl gpg jq sha256sum; do
+for command_name in curl gpg jq; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "Missing required command: $command_name" >&2
         exit 1
@@ -79,8 +88,8 @@ curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
 curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
     --output "$update_root/adoptium.key" \
     https://packages.adoptium.net/artifactory/api/gpg/key/public
-nodesource_key_sha256="$(sha256sum "$update_root/nodesource.key" | awk '{print $1}')"
-adoptium_key_sha256="$(sha256sum "$update_root/adoptium.key" | awk '{print $1}')"
+nodesource_key_sha256="$(codex_host_sha256_file "$update_root/nodesource.key")"
+adoptium_key_sha256="$(codex_host_sha256_file "$update_root/adoptium.key")"
 nodesource_key_fingerprint="$(gpg --batch --show-keys --with-colons \
     "$update_root/nodesource.key" | awk -F: '$1 == "fpr" {print $10; exit}')"
 adoptium_key_fingerprint="$(gpg --batch --show-keys --with-colons \
@@ -149,7 +158,7 @@ clojure_lsp_jvm_sha256="$(
 curl -4 -fsSL --connect-timeout 10 --retry 3 --retry-all-errors \
     --output "$update_root/lein" \
     "https://raw.githubusercontent.com/technomancy/leiningen/${lein_version}/bin/lein"
-lein_launcher_sha256="$(sha256sum "$update_root/lein" | awk '{print $1}')"
+lein_launcher_sha256="$(codex_host_sha256_file "$update_root/lein")"
 
 new_config="$update_root/clojure-tool-versions.conf"
 {

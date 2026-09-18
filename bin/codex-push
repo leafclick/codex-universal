@@ -47,11 +47,17 @@ case "${1:-}" in
         ;;
 esac
 
-for cmd in tar zstd sha256sum sqlite3 lsof flock awk find grep head cp hostname realpath dirname basename tr; do
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=bin/codex-host-compat.bash
+HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || die "Missing or unreadable host compatibility layer: $HOST_COMPAT"
+source "$HOST_COMPAT" || die "Cannot load host compatibility layer: $HOST_COMPAT"
+codex_host_require_capabilities path checksum lock canonical-tar atomic-replace || exit 1
+
+for cmd in zstd sqlite3 lsof awk find grep head cp hostname dirname basename tr; do
     command -v "$cmd" >/dev/null || die "Missing command: $cmd"
 done
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=bin/codex-sync-lib
 source "$SCRIPT_DIR/codex-sync-lib"
 
@@ -101,7 +107,7 @@ normalize_path() {
     local normalized
 
     [[ "$value" == /* ]] || die "$variable must be an absolute path: $value"
-    normalized="$(realpath -m -- "$value")" || die "Cannot resolve $variable: $value"
+    normalized="$(codex_host_path_allow_missing "$value")" || die "Cannot resolve $variable: $value"
     [[ "$normalized" != / ]] || die "$variable must not be the filesystem root"
     printf -v "$variable" '%s' "$normalized"
 }
@@ -139,16 +145,8 @@ mkdir -p "$SYNC_DIR" "$STATE_DIR" "$(dirname "$LOCK_FILE")"
 state_hash_dir() {
     local dir="$1"
 
-    LC_ALL=C tar \
-        --sort=name \
-        --format=gnu \
-        --mtime='@0' \
-        --owner=0 \
-        --group=0 \
-        --numeric-owner \
-        -C "$dir" \
-        -cf - . |
-        sha256sum |
+    codex_host_canonical_tar "$dir" |
+        codex_host_sha256_stdin |
         awk '{print $1}'
 }
 
@@ -334,7 +332,7 @@ publish_file() {
 
     cp -- "$source" "$partial"
     sync "$partial"
-    mv -- "$partial" "$SYNC_DIR/$destination_name"
+    codex_host_atomic_replace "$partial" "$SYNC_DIR/$destination_name"
 }
 
 running_codex_containers() {
@@ -375,7 +373,7 @@ fi
 
 exec 9>"$LOCK_FILE"
 
-if ! flock -n -x 9; then
+if ! codex_host_lock_try_exclusive 9; then
     report_running_codex_containers || true
     die "Codex is running, starting, or another push/pull is active"
 fi
@@ -540,7 +538,7 @@ tar \
         -q \
         -o "$archive"
 
-archive_hash="$(sha256sum "$archive" | awk '{print $1}')"
+archive_hash="$(codex_host_sha256_file "$archive")"
 
 printf '%s\n' "$archive_hash" \
     > "$tmpdir/$archive_name.sha256"

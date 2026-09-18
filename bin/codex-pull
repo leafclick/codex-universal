@@ -72,11 +72,16 @@ case "${1:-}" in
         ;;
 esac
 
-for cmd in sha256sum awk sort tr basename realpath dirname; do
+for cmd in awk tr basename dirname; do
     need "$cmd"
 done
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=bin/codex-host-compat.bash
+HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || die "Missing or unreadable host compatibility layer: $HOST_COMPAT"
+source "$HOST_COMPAT" || die "Cannot load host compatibility layer: $HOST_COMPAT"
+codex_host_require_capabilities path checksum || exit 1
 # shellcheck source=bin/codex-sync-lib
 source "$SCRIPT_DIR/codex-sync-lib"
 
@@ -128,7 +133,7 @@ normalize_path() {
     local normalized
 
     [[ "$value" == /* ]] || die "$variable must be an absolute path: $value"
-    normalized="$(realpath -m -- "$value")" || die "Cannot resolve $variable: $value"
+    normalized="$(codex_host_path_allow_missing "$value")" || die "Cannot resolve $variable: $value"
     [[ "$normalized" != / ]] || die "$variable must not be the filesystem root"
     printf -v "$variable" '%s' "$normalized"
 }
@@ -164,16 +169,8 @@ mkdir -p "$SYNC_DIR" "$STATE_DIR" "$(dirname "$LOCK_FILE")"
 state_hash_dir() {
     local dir="$1"
 
-    LC_ALL=C tar \
-        --sort=name \
-        --format=gnu \
-        --mtime='@0' \
-        --owner=0 \
-        --group=0 \
-        --numeric-owner \
-        -C "$dir" \
-        -cf - . |
-        sha256sum |
+    codex_host_canonical_tar "$dir" |
+        codex_host_sha256_stdin |
         awk '{print $1}'
 }
 
@@ -461,13 +458,15 @@ list_snapshots() {
         printf '%-12s %-17s %-20s %-10s %-42s %s\n' \
             "${generation:--}" "${created:--}" "${host:--}" "$status" \
             "$requirements" "${archive:--}"
-    done < <(printf '%s\n' "${files[@]}" | LC_ALL=C sort)
+    done < <(printf '%s\n' "${files[@]}" | sort)
 }
 
 if [[ "$MODE" == list ]]; then
     list_snapshots
     exit 0
 fi
+
+codex_host_require_capabilities lock canonical-tar atomic-replace || exit 1
 
 running_codex_containers() {
     command -v docker >/dev/null 2>&1 || return 0
@@ -498,7 +497,7 @@ report_running_codex_containers() {
     return 0
 }
 
-for cmd in tar zstd find grep head cp sqlite3 lsof flock hostname; do
+for cmd in tar zstd find grep head cp sqlite3 lsof hostname; do
     need "$cmd"
 done
 
@@ -510,7 +509,7 @@ if report_running_codex_containers; then
 fi
 
 exec 9>"$LOCK_FILE"
-if ! flock -n -x 9; then
+if ! codex_host_lock_try_exclusive 9; then
     report_running_codex_containers || true
     die "Codex is running, starting, or another push/pull is active"
 fi
@@ -621,9 +620,9 @@ timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
 nonce="$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
 BACKUP_DIR="$CODEX_PARENT/${CODEX_NAME}.backup-${timestamp}-${nonce}"
 
-mv -- "$CODEX_DIR" "$BACKUP_DIR"
-if ! mv -- "$RESTORE_TMP/content" "$CODEX_DIR"; then
-    if mv -- "$BACKUP_DIR" "$CODEX_DIR"; then
+codex_host_atomic_replace "$CODEX_DIR" "$BACKUP_DIR"
+if ! codex_host_atomic_replace "$RESTORE_TMP/content" "$CODEX_DIR"; then
+    if codex_host_atomic_replace "$BACKUP_DIR" "$CODEX_DIR"; then
         die "Could not install restored state; original directory restored from $BACKUP_DIR"
     fi
 

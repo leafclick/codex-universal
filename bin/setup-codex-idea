@@ -3,6 +3,10 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=bin/codex-host-compat.bash
+HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || { echo "ERROR: Missing or unreadable host compatibility layer: $HOST_COMPAT" >&2; exit 1; }
+source "$HOST_COMPAT" || { echo "ERROR: Cannot load host compatibility layer: $HOST_COMPAT" >&2; exit 1; }
 ACP_FILE="${CODEX_IDEA_ACP_FILE:-$HOME/.jetbrains/acp.json}"
 
 usage() {
@@ -41,7 +45,7 @@ esac
 }
 
 need jq
-need realpath
+codex_host_require_capabilities path atomic-replace || exit 1
 
 RUN_CODEX="${CODEX_RUN_CODEX:-}"
 if [[ -z "$RUN_CODEX" ]]; then
@@ -52,7 +56,7 @@ if [[ -z "$RUN_CODEX" && -x "$SCRIPT_DIR/run-codex" ]]; then
 fi
 [[ -n "$RUN_CODEX" ]] || die "run-codex is not installed or beside this script"
 
-RUN_CODEX="$(realpath -e -- "$RUN_CODEX")" ||
+RUN_CODEX="$(codex_host_path_existing "$RUN_CODEX")" ||
     die "Cannot resolve run-codex executable: $RUN_CODEX"
 [[ -x "$RUN_CODEX" ]] || die "run-codex is not executable: $RUN_CODEX"
 [[ "$ACP_FILE" == /* ]] || die "CODEX_IDEA_ACP_FILE must be an absolute path"
@@ -124,7 +128,7 @@ else
 fi
 
 chmod 600 "$TMP_FILE"
-mv -- "$TMP_FILE" "$ACP_FILE"
+codex_host_atomic_replace "$TMP_FILE" "$ACP_FILE"
 trap - EXIT
 
 echo "Configured JetBrains ACP agent '$AGENT_NAME':"
