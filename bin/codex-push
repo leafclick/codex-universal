@@ -47,7 +47,7 @@ case "${1:-}" in
         ;;
 esac
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=bin/codex-host-compat.bash
 HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
 [[ -r "$HOST_COMPAT" ]] || die "Missing or unreadable host compatibility layer: $HOST_COMPAT"
@@ -166,26 +166,26 @@ check_sqlite() {
         check_dir="$(mktemp -d "$STATE_DIR/.sqlite-check.XXXXXX")" ||
             die "Could not create SQLite validation directory"
         db_copy="$check_dir/$(basename "$db")"
-        if ! cp -- "$db" "$db_copy"; then
-            rm -rf -- "$check_dir"
+        if ! cp "$db" "$db_copy"; then
+            rm -rf "$check_dir"
             die "Could not copy SQLite database for validation: $db"
         fi
 
         for sidecar in "$db-journal" "$db-wal" "$db-shm"; do
             [[ -e "$sidecar" || -L "$sidecar" ]] || continue
             if [[ ! -f "$sidecar" || -L "$sidecar" ]] ||
-               ! cp -- "$sidecar" "$check_dir/$(basename "$sidecar")"; then
-                rm -rf -- "$check_dir"
+               ! cp "$sidecar" "$check_dir/$(basename "$sidecar")"; then
+                rm -rf "$check_dir"
                 die "Could not safely copy SQLite sidecar for validation: $sidecar"
             fi
         done
 
         if ! result="$(sqlite3 "$db_copy" 'PRAGMA integrity_check;')"; then
-            rm -rf -- "$check_dir"
+            rm -rf "$check_dir"
             die "SQLite check failed: $db"
         fi
 
-        rm -rf -- "$check_dir" ||
+        rm -rf "$check_dir" ||
             die "Could not remove SQLite validation directory: $check_dir"
 
         [[ "$result" == "ok" ]] ||
@@ -330,7 +330,7 @@ publish_file() {
 
     partial="$SYNC_DIR/.${destination_name}.partial.$$.$RANDOM"
 
-    cp -- "$source" "$partial"
+    cp "$source" "$partial"
     sync "$partial"
     codex_host_atomic_replace "$partial" "$SYNC_DIR/$destination_name"
 }

@@ -3,8 +3,9 @@
 # Host utility compatibility boundary for codex-universal commands.
 #
 # Callers use the semantic operations below instead of depending directly on
-# platform command names.  The Darwin backend deliberately uses Homebrew GNU
-# tools where their exact behavior is part of the state or locking protocol.
+# platform command names. The Darwin backend deliberately uses prefixed GNU
+# tools, available from Homebrew or MacPorts, where their exact behavior is
+# part of the state or locking protocol.
 
 [[ -z "${CODEX_HOST_COMPAT_API_LOADED:-}" ]] || return 0
 readonly CODEX_HOST_COMPAT_API_LOADED=1
@@ -59,7 +60,7 @@ codex_host_select_backend() {
             CODEX_HOST_TAR=tar
             ;;
         Darwin)
-            CODEX_HOST_BACKEND=darwin-homebrew
+            CODEX_HOST_BACKEND=darwin-gnu
             CODEX_HOST_REALPATH=grealpath
             CODEX_HOST_STAT=gstat
             CODEX_HOST_SHA256SUM=gsha256sum
