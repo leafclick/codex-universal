@@ -2819,6 +2819,7 @@ run_sandbox_probe() {
             "$image" \
             --enable use_legacy_landlock \
             sandbox \
+            -P :workspace \
             -C /tmp \
             /bin/true
         return

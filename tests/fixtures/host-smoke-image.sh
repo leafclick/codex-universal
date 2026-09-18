@@ -156,7 +156,8 @@ case "$check_phase" in
         ;;
     cli-smoke)
         if [[ "${CODEX_TEST_RESTRICTED_USERNS:-0}" == 1 ]]; then
-            codex --enable use_legacy_landlock sandbox -C /tmp /bin/true
+            codex --enable use_legacy_landlock sandbox \
+                -P :workspace -C /tmp /bin/true
             java --version
             clojure -Sdescribe
             deps -Sdescribe

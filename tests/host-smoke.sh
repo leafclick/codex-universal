@@ -519,6 +519,9 @@ grep -Fq -- '--tmpfs /proc \' "$ROOT/bin/run-codex" ||
 sed -n '/^run_sandbox_probe()/,/^}/p' "$ROOT/bin/run-codex" |
     grep -Fq -- '--tmpfs "$TMP_TMPFS_SPEC"' ||
     fail "Bubblewrap preflight does not provide writable temporary storage"
+sed -n '/^run_sandbox_probe()/,/^}/p' "$ROOT/bin/run-codex" |
+    grep -Fq -- '-P :workspace' ||
+    fail "Darwin Landlock preflight does not select the workspace permission profile"
 grep -Fq -- '--unshare-net' "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge is not network-isolated"
 grep -Fq -- '--unshare-pid' "$ROOT/container/codex-clojure-lsp-mcp" ||
