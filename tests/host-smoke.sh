@@ -849,7 +849,7 @@ grep -Fq '/usr/local/bin/codex-no-nested-userns' \
 grep -Fq '/usr/local/bin/codex-no-nested-userns' \
     "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP bridge can create a nested user namespace"
-if command -v gcc >/dev/null 2>&1; then
+if [[ "$HOST_KERNEL" == Linux ]] && command -v gcc >/dev/null 2>&1; then
     nested_userns_filter="$TEST_ROOT/codex-no-nested-userns"
     gcc -std=c11 -O2 -Wall -Wextra -Werror \
         -o "$nested_userns_filter" \
@@ -868,6 +868,8 @@ if command -v gcc >/dev/null 2>&1; then
             'import ctypes, errno; libc=ctypes.CDLL(None, use_errno=True); result=libc.setns(-1, 0); assert result == -1 and ctypes.get_errno() == errno.EPERM' ||
             fail "nested-userns filter did not deny setns"
     fi
+else
+    printf 'skip - nested user-namespace seccomp runtime check (requires Linux and gcc)\n'
 fi
 grep -Fq '127.0.0.1' "$workflow_skill/scripts/clojure-development" ||
     fail "Clojure development helper does not constrain nREPL to loopback"
