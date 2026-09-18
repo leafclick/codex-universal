@@ -39,8 +39,12 @@ bash -n "$INSTALLER"
 
 help_output="$($INSTALLER --help)"
 [[ "$help_output" == *"Usage:"* ]] || fail "installer help is missing"
+[[ "$help_output" == *"--list"* && "$help_output" == *"--rollback"* ]] ||
+    fail "installer lifecycle help is missing"
 run_fail "unknown installer argument" "$INSTALLER" --unknown
 run_fail "missing prefix argument" "$INSTALLER" --prefix
+run_fail "missing rollback argument" "$INSTALLER" --rollback
+run_fail "conflicting lifecycle actions" "$INSTALLER" --list --check
 run_fail "relative prefix" "$INSTALLER" --prefix relative
 run_fail "root prefix" "$INSTALLER" --prefix /
 run_fail "source-overlap prefix" "$INSTALLER" --prefix "$ROOT/.codex-install"
@@ -56,6 +60,12 @@ dry_output="$($INSTALLER --prefix "$dry_prefix" --dry-run)"
 missing_check="$TEST_ROOT/missing-check"
 run_fail "missing installation check" "$INSTALLER" --prefix "$missing_check" --check
 [[ ! -e "$missing_check" ]] || fail "missing --check created its prefix"
+missing_list="$TEST_ROOT/missing-list"
+run_fail "missing installation list" "$INSTALLER" --prefix "$missing_list" --list
+[[ ! -e "$missing_list" ]] || fail "missing --list created its prefix"
+missing_rollback="$TEST_ROOT/missing-rollback"
+run_fail "missing installation rollback" "$INSTALLER" --prefix "$missing_rollback" --rollback absent
+[[ ! -e "$missing_rollback" ]] || fail "missing --rollback created its prefix"
 
 collision_prefix="$TEST_ROOT/collision"
 mkdir -p "$collision_prefix/bin"
@@ -66,6 +76,14 @@ run_fail "unmanaged command collision" "$INSTALLER" --prefix "$collision_prefix"
 [[ "$(codex_host_sha256_file "$collision_prefix/bin/codex-push")" == "$collision_hash" ]] ||
     fail "collision check modified an unmanaged command"
 [[ ! -e "$collision_prefix/libexec" ]] || fail "collision check modified the installation root"
+
+lock_prefix="$TEST_ROOT/unsafe-lock"
+lock_root="$lock_prefix/libexec/codex-universal"
+mkdir -p "$lock_root"
+printf 'lock victim\n' >"$TEST_ROOT/lock-victim"
+ln "$TEST_ROOT/lock-victim" "$lock_root/.install.lock"
+run_fail "multiply linked install lock" "$INSTALLER" --prefix "$lock_prefix"
+[[ "$(<"$TEST_ROOT/lock-victim")" == 'lock victim' ]] || fail "unsafe install lock damaged its target"
 pass "argument validation, collision protection, and non-mutating dry-run"
 
 prefix="$TEST_ROOT/install"
@@ -123,6 +141,64 @@ touch "$bundle_dir/unexpected"
 run_fail "unexpected bundle entry check" "$INSTALLER" --prefix "$prefix" --check
 rm -f "$bundle_dir/unexpected"
 pass "bundle integrity checks"
+
+rollback_source="$TEST_ROOT/rollback-source"
+mkdir -p "$rollback_source/bin"
+cp "$ROOT"/bin/* "$rollback_source/bin/"
+git -C "$rollback_source" init -q
+git -C "$rollback_source" config user.email smoke@example.invalid
+git -C "$rollback_source" config user.name host-smoke
+git -C "$rollback_source" add -A
+git -C "$rollback_source" -c commit.gpgSign=false commit -qm 'host smoke rollback baseline'
+rollback_prefix="$TEST_ROOT/rollback-install"
+rollback_installer="$rollback_source/bin/install-codex-host-tools"
+"$rollback_installer" --prefix "$rollback_prefix" >/dev/null
+rollback_root="$rollback_prefix/libexec/codex-universal"
+first_id="$(readlink "$rollback_root/current")"
+first_list="$($rollback_installer --prefix "$rollback_prefix" --list)"
+[[ "$first_list" == *$'CURRENT\tBUNDLE\tVERSION\tREVISION\tBACKEND'* ]] || fail "bundle list header is missing"
+[[ "$first_list" == *$'*	'"$first_id"$'\t'* ]] || fail "bundle list current marker is wrong"
+first_current="$first_id"
+first_list_again="$($rollback_installer --prefix "$rollback_prefix" --list)"
+[[ "$first_list" == "$first_list_again" ]] || fail "bundle list is not deterministic"
+[[ "$(readlink "$rollback_root/current")" == "$first_current" ]] || fail "bundle list changed current"
+
+printf '\nrollback version two\n' >>"$rollback_source/bin/codex-push"
+git -C "$rollback_source" add bin/codex-push
+git -C "$rollback_source" -c commit.gpgSign=false commit -qm 'host smoke rollback second bundle'
+"$rollback_installer" --prefix "$rollback_prefix" >/dev/null
+second_id="$(readlink "$rollback_root/current")"
+[[ "$second_id" != "$first_id" ]] || fail "second source revision did not create a new bundle"
+list_two="$($rollback_installer --prefix "$rollback_prefix" --list)"
+[[ "$list_two" == *$'\t'"$first_id"$'\t'* && "$list_two" == *$'*\t'"$second_id"$'\t'* ]] || fail "bundle list omitted retained versions"
+cp "$rollback_source/bin/codex-push" "$TEST_ROOT/second-codex-push"
+rm "$rollback_source/bin/codex-push"
+"$rollback_installer" --prefix "$rollback_prefix" --rollback "$first_id" >/dev/null
+[[ "$(readlink "$rollback_root/current")" == "$first_id" ]] || fail "rollback did not switch current bundle"
+"$rollback_prefix/bin/codex-push" --help >/dev/null || fail "rolled-back wrapper failed"
+run_fail "current checkout mismatch after rollback" "$rollback_installer" --prefix "$rollback_prefix" --check
+
+run_fail "traversal rollback ID" "$rollback_installer" --prefix "$rollback_prefix" --rollback ../"$first_id"
+run_fail "invalid rollback ID" "$rollback_installer" --prefix "$rollback_prefix" --rollback bad/id
+ln -s "$first_id" "$rollback_root/symlink-id"
+run_fail "symlink rollback ID" "$rollback_installer" --prefix "$rollback_prefix" --rollback symlink-id
+rm -f "$rollback_root/symlink-id"
+
+printf 'tampered retained bundle\n' >>"$rollback_root/$second_id/codex-push"
+run_fail "tampered retained rollback" "$rollback_installer" --prefix "$rollback_prefix" --rollback "$second_id"
+[[ "$(readlink "$rollback_root/current")" == "$first_id" ]] || fail "failed rollback changed current"
+cp "$TEST_ROOT/second-codex-push" "$rollback_root/$second_id/codex-push"
+
+exec 8>"$rollback_root/.install.lock"
+codex_host_lock_exclusive 8 || fail "could not acquire installer lock for serialization test"
+list_pid=""
+(exec 8>&-; "$rollback_installer" --prefix "$rollback_prefix" --list) >"$TEST_ROOT/locked-list.out" 2>&1 &
+list_pid=$!
+sleep 1
+kill -0 "$list_pid" 2>/dev/null || fail "list did not wait for installer lock"
+exec 8>&-
+wait "$list_pid" || fail "locked list did not complete after lock release"
+pass "bundle list, rollback validation, tamper protection, and lock serialization"
 
 [[ "$CODEX_HOST_BACKEND" == gnu-linux ]] || exit 0
 darwin_bin="$TEST_ROOT/darwin-bin"

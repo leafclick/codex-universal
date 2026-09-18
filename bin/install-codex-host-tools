@@ -12,16 +12,28 @@ usage() {
 Usage:
   install-codex-host-tools [--prefix PATH] [--dry-run]
   install-codex-host-tools [--prefix PATH] --check
+  install-codex-host-tools [--prefix PATH] --list
+  install-codex-host-tools [--prefix PATH] --rollback BUNDLE_ID
   install-codex-host-tools --help
 
 Install the codex-universal host commands beneath PATH (default: $HOME/.local).
 --dry-run validates and describes an installation without writing anything.
 --check verifies that the current installation exactly matches this checkout.
+--list verifies and lists all retained bundles without modifying the installation.
+--rollback verifies and activates a retained bundle without deleting newer bundles.
 USAGE
 }
 
 PREFIX="${HOME:?HOME must be set}/.local"
 MODE=install
+MODE_SELECTED=false
+ROLLBACK_ID=""
+
+select_mode() {
+    $MODE_SELECTED && die "only one of --check, --dry-run, --list, or --rollback may be used"
+    MODE="$1"
+    MODE_SELECTED=true
+}
 
 while (($#)); do
     case "$1" in
@@ -31,14 +43,22 @@ while (($#)); do
             shift 2
             ;;
         --check)
-            [[ "$MODE" == install ]] || die "--check and --dry-run are mutually exclusive"
-            MODE=check
+            select_mode check
             shift
             ;;
         --dry-run)
-            [[ "$MODE" == install ]] || die "--check and --dry-run are mutually exclusive"
-            MODE=dry-run
+            select_mode dry-run
             shift
+            ;;
+        --list)
+            select_mode list
+            shift
+            ;;
+        --rollback)
+            (($# >= 2)) || die "--rollback requires a bundle ID"
+            select_mode rollback
+            ROLLBACK_ID="$2"
+            shift 2
             ;;
         -h|--help)
             (($# == 1)) || die "--help takes no other arguments"
@@ -61,11 +81,36 @@ HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
 [[ -r "$HOST_COMPAT" ]] || die "missing host compatibility layer: $HOST_COMPAT"
 # shellcheck source=bin/codex-host-compat.bash
 source "$HOST_COMPAT" || die "cannot load host compatibility layer: $HOST_COMPAT"
-codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+case "$MODE" in
+    rollback|install|dry-run)
+        codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+        ;;
+    check|list)
+        codex_host_require_capabilities path stat checksum lock || exit 1
+        ;;
+esac
 
-for command_name in git mkdir install ln readlink cat dirname mktemp chmod rm rmdir; do
+for command_name in readlink cat dirname; do
     command -v "$command_name" >/dev/null 2>&1 || die "missing command: $command_name"
 done
+case "$MODE" in
+    install|dry-run|check)
+        for command_name in git; do
+            command -v "$command_name" >/dev/null 2>&1 || die "missing command: $command_name"
+        done
+        ;;
+    list)
+        command -v sort >/dev/null 2>&1 || die "missing command: sort"
+        ;;
+esac
+if [[ "$MODE" == install || "$MODE" == rollback ]]; then
+    for command_name in mkdir ln mktemp chmod rm rmdir; do
+        command -v "$command_name" >/dev/null 2>&1 || die "missing command: $command_name"
+    done
+fi
+if [[ "$MODE" == install ]]; then
+    command -v install >/dev/null 2>&1 || die "missing command: install"
+fi
 
 [[ "$PREFIX" == /* ]] || die "installation prefix must be an absolute path: $PREFIX"
 reject_symlink_components() {
@@ -96,15 +141,10 @@ case "$SOURCE_ROOT/" in
     "$PREFIX/"* ) die "installation prefix contains the source checkout: $PREFIX" ;;
 esac
 
-git_root="$(git -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null)" ||
-    die "source directory is not a Git checkout: $SOURCE_ROOT"
-git_root="$(codex_host_path_existing "$git_root")" || die "cannot resolve Git checkout root"
-[[ "$git_root" == "$SOURCE_ROOT" ]] ||
-    die "installer must be run from the codex-universal Git checkout root"
-REVISION="$(git -C "$SOURCE_ROOT" rev-parse HEAD 2>/dev/null)" || die "cannot read Git revision"
-VERSION="$(git -C "$SOURCE_ROOT" describe --always --tags 2>/dev/null)" ||
-    die "cannot derive Git version"
-[[ "$REVISION" =~ ^[0-9a-fA-F]{40}$ ]] || die "Git returned an invalid full revision"
+INSTALL_ROOT="$PREFIX/libexec/codex-universal"
+CURRENT_LINK="$INSTALL_ROOT/current"
+BIN_DIR="$PREFIX/bin"
+LOCK_FILE="$INSTALL_ROOT/.install.lock"
 
 case "$CODEX_HOST_BACKEND" in
     gnu-linux)
@@ -161,14 +201,23 @@ bundle_rows() {
     done
 }
 
-BUNDLE_HASH="$(bundle_rows | codex_host_sha256_stdin)" || die "cannot compute bundle hash"
-SAFE_VERSION="${VERSION//[^A-Za-z0-9._-]/-}"
-SAFE_VERSION="${SAFE_VERSION:0:80}"
-BUNDLE_ID="${SAFE_VERSION}-${CODEX_HOST_BACKEND}-${BUNDLE_HASH:0:16}"
-INSTALL_ROOT="$PREFIX/libexec/codex-universal"
-BUNDLE_DIR="$INSTALL_ROOT/$BUNDLE_ID"
-CURRENT_LINK="$INSTALL_ROOT/current"
-BIN_DIR="$PREFIX/bin"
+if [[ "$MODE" == install || "$MODE" == dry-run || "$MODE" == check ]]; then
+    git_root="$(git -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null)" ||
+        die "source directory is not a Git checkout: $SOURCE_ROOT"
+    git_root="$(codex_host_path_existing "$git_root")" || die "cannot resolve Git checkout root"
+    [[ "$git_root" == "$SOURCE_ROOT" ]] ||
+        die "installer must be run from the codex-universal Git checkout root"
+    REVISION="$(git -C "$SOURCE_ROOT" rev-parse HEAD 2>/dev/null)" || die "cannot read Git revision"
+    VERSION="$(git -C "$SOURCE_ROOT" describe --always --tags 2>/dev/null)" ||
+        die "cannot derive Git version"
+    [[ "$REVISION" =~ ^[0-9a-fA-F]{40}$ ]] || die "Git returned an invalid full revision"
+
+    BUNDLE_HASH="$(bundle_rows | codex_host_sha256_stdin)" || die "cannot compute bundle hash"
+    SAFE_VERSION="${VERSION//[^A-Za-z0-9._-]/-}"
+    SAFE_VERSION="${SAFE_VERSION:0:80}"
+    BUNDLE_ID="${SAFE_VERSION}-${CODEX_HOST_BACKEND}-${BUNDLE_HASH:0:16}"
+    BUNDLE_DIR="$INSTALL_ROOT/$BUNDLE_ID"
+fi
 
 manifest_content() {
     printf 'format\t1\n'
@@ -193,7 +242,7 @@ exec "\$BUNDLE_DIR/$name" "\$@"
 EOF
 }
 
-verify_bundle() {
+verify_bundle_against_checkout() {
     local directory="$1"
     local name expected_mode actual_mode expected_hash actual_hash
     local expected_manifest actual_manifest entries expected_entries
@@ -223,6 +272,89 @@ verify_bundle() {
     )"
     expected_entries=$((${#FILES[@]} + 1))
     [[ "$entries" == "$expected_entries" ]] || die "bundle contains unexpected entries: $directory"
+}
+
+valid_bundle_id() {
+    local bundle_id="$1"
+
+    [[ -n "$bundle_id" && ${#bundle_id} -le 128 &&
+       "$bundle_id" != . && "$bundle_id" != .. &&
+       "$bundle_id" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+verify_retained_bundle() {
+    local directory="$1"
+    local directory_id key value extra backend safe_version expected_id
+    local name mode digest actual_mode actual_digest rows bundle_hash entries
+    local -a lines=() expected_files=() paths=()
+    local index
+
+    [[ -d "$directory" && ! -L "$directory" ]] || die "missing or unsafe retained bundle: $directory"
+    directory_id="${directory##*/}"
+    valid_bundle_id "$directory_id" || die "invalid retained bundle ID: $directory_id"
+    [[ -f "$directory/MANIFEST" && ! -L "$directory/MANIFEST" ]] ||
+        die "missing or unsafe retained bundle manifest: $directory/MANIFEST"
+    [[ "$(codex_host_file_mode "$directory/MANIFEST")" == 644 ]] ||
+        die "incorrect mode for retained bundle manifest: $directory_id"
+    mapfile -t lines <"$directory/MANIFEST" || die "cannot read retained bundle manifest: $directory_id"
+    ((${#lines[@]} >= 6)) || die "incomplete retained bundle manifest: $directory_id"
+
+    IFS=$'\t' read -r key value extra <<<"${lines[0]}"
+    [[ "$key" == format && "$value" == 1 && -z "$extra" ]] ||
+        die "unsupported retained bundle manifest format: $directory_id"
+    IFS=$'\t' read -r key RETAINED_BUNDLE extra <<<"${lines[1]}"
+    [[ "$key" == bundle && "$RETAINED_BUNDLE" == "$directory_id" && -z "$extra" ]] ||
+        die "retained bundle manifest ID mismatch: $directory_id"
+    IFS=$'\t' read -r key RETAINED_VERSION extra <<<"${lines[2]}"
+    [[ "$key" == version && -n "$RETAINED_VERSION" && -z "$extra" ]] ||
+        die "invalid retained bundle version: $directory_id"
+    IFS=$'\t' read -r key RETAINED_REVISION extra <<<"${lines[3]}"
+    [[ "$key" == revision && "$RETAINED_REVISION" =~ ^[0-9a-fA-F]{40}$ && -z "$extra" ]] ||
+        die "invalid retained bundle revision: $directory_id"
+    IFS=$'\t' read -r key backend extra <<<"${lines[4]}"
+    [[ "$key" == backend && -z "$extra" ]] || die "invalid retained bundle backend: $directory_id"
+    RETAINED_BACKEND="$backend"
+
+    case "$backend" in
+        gnu-linux)
+            expected_files=(run-codex setup-codex-idea codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib run-codex-doctor.bash)
+            ;;
+        darwin-gnu)
+            expected_files=(codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib)
+            ;;
+        *)
+            die "unsupported retained bundle backend '$backend': $directory_id"
+            ;;
+    esac
+    ((${#lines[@]} == ${#expected_files[@]} + 5)) ||
+        die "incorrect retained bundle manifest entry count: $directory_id"
+
+    rows="$(printf 'backend\t%s\n' "$backend")"
+    for ((index = 0; index < ${#expected_files[@]}; index++)); do
+        IFS=$'\t' read -r key mode digest name extra <<<"${lines[index + 5]}"
+        [[ "$key" == file && -z "$extra" && "$name" == "${expected_files[index]}" ]] ||
+            die "invalid retained bundle file row: $directory_id"
+        [[ "$mode" == "$(file_mode "$name")" && "$digest" =~ ^[0-9a-fA-F]{64}$ ]] ||
+            die "invalid retained bundle file metadata: $directory_id/$name"
+        [[ -f "$directory/$name" && ! -L "$directory/$name" ]] ||
+            die "missing or unsafe retained bundle file: $directory_id/$name"
+        actual_mode="$(codex_host_file_mode "$directory/$name")"
+        [[ "$actual_mode" == "$mode" ]] || die "incorrect retained bundle file mode: $directory_id/$name"
+        actual_digest="$(codex_host_sha256_file "$directory/$name")"
+        [[ "$actual_digest" == "$digest" ]] || die "retained bundle content mismatch: $directory_id/$name"
+        rows+=$'\n'"file"$'\t'"$mode"$'\t'"$digest"$'\t'"$name"
+    done
+
+    entries="$({ shopt -s nullglob dotglob; paths=("$directory"/*); printf '%s\n' "${#paths[@]}"; })"
+    [[ "$entries" == "$((${#expected_files[@]} + 1))" ]] ||
+        die "retained bundle contains unexpected entries: $directory_id"
+
+    bundle_hash="$(printf '%s\n' "$rows" | codex_host_sha256_stdin)" ||
+        die "cannot hash retained bundle manifest rows: $directory_id"
+    safe_version="${RETAINED_VERSION//[^A-Za-z0-9._-]/-}"
+    safe_version="${safe_version:0:80}"
+    expected_id="${safe_version}-${backend}-${bundle_hash:0:16}"
+    [[ "$directory_id" == "$expected_id" ]] || die "retained bundle ID does not match its manifest: $directory_id"
 }
 
 verify_wrappers() {
@@ -281,39 +413,23 @@ preflight_wrappers() {
     done
 }
 
-if [[ "$MODE" == dry-run ]]; then
-    printf 'Would install codex-universal %s (%s)\n' "$VERSION" "$REVISION"
-    printf 'Backend: %s\nPrefix: %s\nBundle: %s\n' "$CODEX_HOST_BACKEND" "$PREFIX" "$BUNDLE_DIR"
-    printf 'Commands:'
-    printf ' %s' "${WRAPPERS[@]}"
-    printf '\n'
-    exit 0
-fi
-
-if [[ "$MODE" == check ]]; then
+lock_existing_installation() {
     reject_symlink_components "$INSTALL_ROOT"
-    reject_symlink_components "$BIN_DIR"
+    [[ -d "$INSTALL_ROOT" && ! -L "$INSTALL_ROOT" ]] ||
+        die "host-tool installation is missing or unsafe: $INSTALL_ROOT"
+    [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] ||
+        die "installation lock is missing or unsafe: $LOCK_FILE"
+    [[ "$(codex_host_file_link_count "$LOCK_FILE")" == 1 ]] ||
+        die "installation lock has an unsafe link count: $LOCK_FILE"
+    exec 9<>"$LOCK_FILE"
+    codex_host_lock_exclusive 9 || die "cannot lock host-tool installation: $LOCK_FILE"
+}
+
+read_current_bundle_id() {
     [[ -L "$CURRENT_LINK" ]] || die "current bundle link is missing or is not a symlink: $CURRENT_LINK"
-    [[ "$(readlink "$CURRENT_LINK")" == "$BUNDLE_ID" ]] || die "current bundle does not match this checkout"
-    verify_bundle "$BUNDLE_DIR"
-    verify_wrappers
-    printf 'codex-universal host tools are valid: %s\n' "$BUNDLE_ID"
-    exit 0
-fi
-
-reject_symlink_components "$INSTALL_ROOT"
-reject_symlink_components "$BIN_DIR"
-[[ ! -e "$CURRENT_LINK" || -L "$CURRENT_LINK" ]] || die "refusing to replace non-symlink current path: $CURRENT_LINK"
-preflight_wrappers
-mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
-reject_symlink_components "$INSTALL_ROOT"
-reject_symlink_components "$BIN_DIR"
-
-LOCK_FILE="$INSTALL_ROOT/.install.lock"
-[[ ! -L "$LOCK_FILE" ]] || die "refusing to use symlink as install lock: $LOCK_FILE"
-exec 9>"$LOCK_FILE"
-codex_host_lock_exclusive 9 || die "cannot lock host-tool installation: $LOCK_FILE"
-preflight_wrappers
+    CURRENT_ID="$(readlink "$CURRENT_LINK")" || die "cannot read current bundle link: $CURRENT_LINK"
+    valid_bundle_id "$CURRENT_ID" || die "current bundle link has an unsafe target: $CURRENT_ID"
+}
 
 TEMP_BUNDLE=""
 TEMP_LINK_DIR=""
@@ -326,10 +442,102 @@ cleanup() {
     fi
     [[ -z "$TEMP_BUNDLE" || ! -d "$TEMP_BUNDLE" ]] || rm -rf "$TEMP_BUNDLE"
 }
+
+switch_current_bundle() {
+    local bundle_id="$1"
+
+    TEMP_LINK_DIR="$(mktemp -d "$INSTALL_ROOT/.current.XXXXXXXX")"
+    ln -s "$bundle_id" "$TEMP_LINK_DIR/current"
+    codex_host_atomic_replace "$TEMP_LINK_DIR/current" "$CURRENT_LINK" || die "cannot switch current bundle"
+    rmdir "$TEMP_LINK_DIR"
+    TEMP_LINK_DIR=""
+}
+
+if [[ "$MODE" == dry-run ]]; then
+    printf 'Would install codex-universal %s (%s)\n' "$VERSION" "$REVISION"
+    printf 'Backend: %s\nPrefix: %s\nBundle: %s\n' "$CODEX_HOST_BACKEND" "$PREFIX" "$BUNDLE_DIR"
+    printf 'Commands:'
+    printf ' %s' "${WRAPPERS[@]}"
+    printf '\n'
+    exit 0
+fi
+
+if [[ "$MODE" == check ]]; then
+    reject_symlink_components "$BIN_DIR"
+    lock_existing_installation
+    read_current_bundle_id
+    [[ "$CURRENT_ID" == "$BUNDLE_ID" ]] || die "current bundle does not match this checkout"
+    verify_bundle_against_checkout "$BUNDLE_DIR"
+    verify_wrappers
+    printf 'codex-universal host tools are valid: %s\n' "$BUNDLE_ID"
+    exit 0
+fi
+
+if [[ "$MODE" == list ]]; then
+    local_bundle_ids=()
+    lock_existing_installation
+    read_current_bundle_id
+    [[ -d "$INSTALL_ROOT/$CURRENT_ID" && ! -L "$INSTALL_ROOT/$CURRENT_ID" ]] ||
+        die "current bundle target is missing or unsafe: $CURRENT_ID"
+    shopt -s nullglob
+    for directory in "$INSTALL_ROOT"/*; do
+        [[ -d "$directory" && ! -L "$directory" ]] || continue
+        local_bundle_ids+=("${directory##*/}")
+    done
+    shopt -u nullglob
+    ((${#local_bundle_ids[@]} > 0)) || die "no retained bundles found in $INSTALL_ROOT"
+    printf 'CURRENT\tBUNDLE\tVERSION\tREVISION\tBACKEND\n'
+    while IFS= read -r bundle_id; do
+        verify_retained_bundle "$INSTALL_ROOT/$bundle_id"
+        marker=-
+        [[ "$bundle_id" == "$CURRENT_ID" ]] && marker='*'
+        printf '%s\t%s\t%s\t%s\t%s\n' "$marker" "$RETAINED_BUNDLE" \
+            "$RETAINED_VERSION" "$RETAINED_REVISION" "$RETAINED_BACKEND"
+    done < <(printf '%s\n' "${local_bundle_ids[@]}" | LC_ALL=C sort)
+    exit 0
+fi
+
+if [[ "$MODE" == rollback ]]; then
+    valid_bundle_id "$ROLLBACK_ID" || die "invalid rollback bundle ID: $ROLLBACK_ID"
+    reject_symlink_components "$BIN_DIR"
+    lock_existing_installation
+    read_current_bundle_id
+    verify_retained_bundle "$INSTALL_ROOT/$ROLLBACK_ID"
+    [[ "$RETAINED_BACKEND" == "$CODEX_HOST_BACKEND" ]] ||
+        die "retained bundle backend '$RETAINED_BACKEND' is incompatible with '$CODEX_HOST_BACKEND'"
+    verify_wrappers
+    if [[ "$CURRENT_ID" == "$ROLLBACK_ID" ]]; then
+        printf 'Bundle is already current: %s\n' "$ROLLBACK_ID"
+        exit 0
+    fi
+    trap cleanup EXIT
+    switch_current_bundle "$ROLLBACK_ID"
+    printf 'Rolled back codex-universal host tools to %s\n' "$ROLLBACK_ID"
+    exit 0
+fi
+
+reject_symlink_components "$INSTALL_ROOT"
+reject_symlink_components "$BIN_DIR"
+[[ ! -e "$CURRENT_LINK" || -L "$CURRENT_LINK" ]] || die "refusing to replace non-symlink current path: $CURRENT_LINK"
+preflight_wrappers
+mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
+reject_symlink_components "$INSTALL_ROOT"
+reject_symlink_components "$BIN_DIR"
+
+if [[ -e "$LOCK_FILE" || -L "$LOCK_FILE" ]]; then
+    [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" ]] ||
+        die "refusing to use unsafe install lock: $LOCK_FILE"
+    [[ "$(codex_host_file_link_count "$LOCK_FILE")" == 1 ]] ||
+        die "refusing to use multiply linked install lock: $LOCK_FILE"
+fi
+exec 9>>"$LOCK_FILE"
+codex_host_lock_exclusive 9 || die "cannot lock host-tool installation: $LOCK_FILE"
+preflight_wrappers
+
 trap cleanup EXIT
 
 if [[ -e "$BUNDLE_DIR" || -L "$BUNDLE_DIR" ]]; then
-    verify_bundle "$BUNDLE_DIR"
+    verify_bundle_against_checkout "$BUNDLE_DIR"
 else
     TEMP_BUNDLE="$(mktemp -d "$INSTALL_ROOT/.bundle.XXXXXXXX")"
     chmod 755 "$TEMP_BUNDLE"
@@ -338,7 +546,7 @@ else
     done
     manifest_content >"$TEMP_BUNDLE/MANIFEST"
     chmod 644 "$TEMP_BUNDLE/MANIFEST"
-    verify_bundle "$TEMP_BUNDLE"
+    verify_bundle_against_checkout "$TEMP_BUNDLE"
     codex_host_atomic_replace "$TEMP_BUNDLE" "$BUNDLE_DIR" || die "cannot publish bundle: $BUNDLE_DIR"
     TEMP_BUNDLE=""
 fi
@@ -353,13 +561,9 @@ for name in "${WRAPPERS[@]}"; do
     TEMP_WRAPPER=""
 done
 
-TEMP_LINK_DIR="$(mktemp -d "$INSTALL_ROOT/.current.XXXXXXXX")"
-ln -s "$BUNDLE_ID" "$TEMP_LINK_DIR/current"
-codex_host_atomic_replace "$TEMP_LINK_DIR/current" "$CURRENT_LINK" || die "cannot switch current bundle"
-rmdir "$TEMP_LINK_DIR"
-TEMP_LINK_DIR=""
+switch_current_bundle "$BUNDLE_ID"
 
-verify_bundle "$BUNDLE_DIR"
+verify_bundle_against_checkout "$BUNDLE_DIR"
 verify_wrappers
 printf 'Installed codex-universal %s (%s)\n' "$VERSION" "$REVISION"
 printf 'Commands: %s\n' "$BIN_DIR"
