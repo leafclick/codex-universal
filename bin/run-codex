@@ -2804,6 +2804,27 @@ run_sandbox_probe() {
     docker_args+=(
         --security-opt "seccomp=$SECCOMP_PROFILE"
         --user "$HOST_UID:$HOST_GID"
+    )
+
+    if [[ "$CODEX_HOST_BACKEND" == darwin-gnu ]]; then
+        # Docker Desktop and OrbStack may forbid a second user namespace even
+        # though the outer container remains hardened. Codex's pinned Linux
+        # runtime provides a Landlock compatibility backend for this case.
+        # Exercise that backend itself rather than weakening the outer Docker
+        # policy or accepting an unsandboxed command path.
+        docker "${docker_args[@]}" \
+            --entrypoint /usr/local/bin/codex \
+            -e HOME=/tmp \
+            -e CODEX_HOME=/tmp/.codex \
+            "$image" \
+            --enable use_legacy_landlock \
+            sandbox \
+            -C /tmp \
+            /bin/true
+        return
+    fi
+
+    docker_args+=(
         --entrypoint /bin/sh
         "$image"
     )
@@ -3090,6 +3111,10 @@ if ! $SETUP_SESSION && ! check_onboarding true; then
 fi
 resolve_lane_codex_home "$PROJECT" "$LANE" "$RESOLVED_STATE_MODE"
 resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
+if [[ "$CODEX_HOST_BACKEND" == darwin-gnu ]]; then
+    EFFECTIVE_CLOJURE_LSP_MCP=0
+    EFFECTIVE_CLOJURE_LSP_MCP_REASON="nested user namespaces unavailable in the macOS container backend"
+fi
 if [[ "$RESOLVED_GIT_LAYOUT" == linked-worktree ]]; then
     CONTAINER_PROJECT_DEFAULT="$PROJECT_PATH"
 elif [[ "$LANE" == default ]]; then
@@ -3426,6 +3451,9 @@ docker_args+=(
     -e "CODEX_HOME=$CONTAINER_HOME/.codex"
     -e "CODEX_UNIVERSAL_WORKFLOW=$WORKFLOW_ENABLED"
 )
+if [[ "$CODEX_HOST_BACKEND" == darwin-gnu ]]; then
+    docker_args+=(-e CODEX_CLOJURE_SERVICE=0)
+fi
 
 if $IDEA_MODE; then
     if [[ "$IDEA_MCP" == 1 ]]; then
@@ -3569,6 +3597,9 @@ codex_args=(
     # external network access remains disabled above.
     -c 'network.allow_local_binding=true'
 )
+if [[ "$CODEX_HOST_BACKEND" == darwin-gnu ]]; then
+    codex_args+=(--enable use_legacy_landlock)
+fi
 
 if ! $IDEA_MODE && [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
     codex_args+=(

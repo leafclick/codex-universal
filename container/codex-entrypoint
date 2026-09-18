@@ -74,6 +74,14 @@ else
 fi
 chmod 0700 -- "$CODEX_CLOJURE_STATE_DIR"
 
+case "${CODEX_CLOJURE_SERVICE:-1}" in
+    0|1) ;;
+    *)
+        echo "CODEX_CLOJURE_SERVICE must be 0 or 1" >&2
+        exit 1
+        ;;
+esac
+
 start_clojure_repl_service() {
     local project_root state_root home_root control_path service_log supervisor
     local java_command java_binary java_home java_lib java_server_lib jvm_library_path
@@ -180,7 +188,8 @@ start_clojure_repl_service() {
     exit 1
 }
 
-if [[ "${CODEX_UNIVERSAL_WORKFLOW:-1}" == 1 ]]; then
+if [[ "${CODEX_UNIVERSAL_WORKFLOW:-1}" == 1 &&
+      "${CODEX_CLOJURE_SERVICE:-1}" == 1 ]]; then
     start_clojure_repl_service
 fi
 
