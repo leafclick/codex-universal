@@ -116,6 +116,8 @@ print_log_summary() {
     local line_count byte_count
     line_count="$(wc -l < "$log_path")"
     byte_count="$(wc -c < "$log_path")"
+    line_count="${line_count//[[:space:]]/}"
+    byte_count="${byte_count//[[:space:]]/}"
     printf '%-12s %s lines, %s bytes\n' "$stream:" "$line_count" "$byte_count"
     printf '%s-tail (last 20 lines, max 4096 bytes):\n' "$stream"
     if [[ -s "$log_path" ]]; then
