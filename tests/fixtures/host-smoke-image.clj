@@ -48,10 +48,14 @@
   [{:id "identity"               :name "runtime identity"          :timeout 10}
    {:id "filesystem-policy"      :name "filesystem policy"         :timeout 15}
    {:id "toolchain-availability" :name "installed toolchain"       :timeout 15}
-   {:id "clojure-runtime"        :name "Clojure runtime lifecycle" :timeout 180}
-   {:id "bubblewrap"             :name "nested Bubblewrap sandbox" :timeout 30}
-   {:id "clojure-lsp-runtime"    :name "sandboxed Clojure LSP"     :timeout 30}
-   {:id "clojure-lsp"            :name "Clojure MCP/LSP workflow"  :timeout 270}
+   {:id "clojure-runtime"        :name "Clojure runtime lifecycle" :timeout 180
+    :requires-nested-userns true}
+   {:id "bubblewrap"             :name "nested Bubblewrap sandbox" :timeout 30
+    :requires-nested-userns true}
+   {:id "clojure-lsp-runtime"    :name "sandboxed Clojure LSP"     :timeout 30
+    :requires-nested-userns true}
+   {:id "clojure-lsp"            :name "Clojure MCP/LSP workflow"  :timeout 270
+    :requires-nested-userns true}
    {:id "cli-smoke"              :name "installed CLI smoke"       :timeout 60}
    {:id "cuda-runtime"           :name "CUDA runtime"              :timeout 60
     :profile "cuda"}])
@@ -68,8 +72,11 @@
                           "/tmp/host-smoke-image-phase.sh")
         heartbeat-seconds (positive-long "CODEX_TEST_IMAGE_HEARTBEAT_SECONDS" 10)
         kill-after-seconds (positive-long "CODEX_TEST_IMAGE_KILL_AFTER_SECONDS" 5)
-        phases (vec (filter #(or (nil? (:profile %))
-                                 (= profile (:profile %)))
+        restricted-userns (= "1" (System/getenv "CODEX_TEST_RESTRICTED_USERNS"))
+        phases (vec (filter #(and (or (nil? (:profile %))
+                                      (= profile (:profile %)))
+                                  (or (not restricted-userns)
+                                      (not (:requires-nested-userns %))))
                             phase-specs))
         maximum-seconds (reduce + (map :timeout phases))
         log-directory (doto (io/file (or (System/getenv "CODEX_IMAGE_SMOKE_LOG_DIR")

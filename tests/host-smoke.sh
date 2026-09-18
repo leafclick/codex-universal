@@ -1796,6 +1796,7 @@ for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "--ask-for-approval on-request"
     assert_contains "$output" 'approvals_reviewer="user"'
     assert_contains "$output" "sandbox_workspace_write.network_access=false"
+    assert_not_contains "$output" "use_legacy_landlock"
     assert_contains "$output" 'mcp_servers.clojure_lsp.command="/usr/local/bin/codex-clojure-lsp-mcp"'
     assert_contains "$output" 'mcp_servers.clojure_lsp.args=["clojure:clojure-lsp"]'
     assert_contains "$output" 'mcp_servers.clojure_lsp.enabled_tools=['
@@ -2842,6 +2843,11 @@ assert_contains "$darwin_launch_output" \
 assert_contains "$darwin_launch_output" "example/codex-universal-generic:test-version"
 assert_not_contains "$darwin_launch_output" "apparmor="
 assert_not_contains "$darwin_launch_output" "--gpus"
+assert_contains "$darwin_launch_output" "--enable use_legacy_landlock"
+assert_contains "$darwin_launch_output" "CODEX_CLOJURE_SERVICE=0"
+assert_not_contains "$darwin_launch_output" "mcp_servers.clojure_lsp"
+assert_contains "$darwin_launch_output" \
+    "Clojure MCP: disabled (nested user namespaces unavailable in the macOS container backend)"
 
 darwin_doctor_output="$(
     "${darwin_launcher_env[@]}" "$ROOT/bin/run-codex" --doctor smoke-project
@@ -2851,7 +2857,7 @@ assert_contains "$darwin_doctor_output" \
 assert_contains "$darwin_doctor_output" \
     "WARN  Docker Desktop does not expose the GNU/Linux AppArmor host-policy contract"
 assert_contains "$darwin_doctor_output" \
-    "PASS  Docker Desktop seccomp and Bubblewrap sandbox probe"
+    "PASS  Docker Desktop seccomp and Codex Landlock sandbox probe"
 assert_contains "$darwin_doctor_output" \
     "PASS  Portable runtime identity, read-only image, tools, and managed Codex policy"
 assert_contains "$darwin_doctor_output" "Diagnostics passed with 1 warning(s)."
@@ -3215,6 +3221,13 @@ smoke_image() {
         -w /workspace
         --entrypoint /usr/local/bin/codex-entrypoint
     )
+
+    if [[ "$HOST_KERNEL" == Darwin ]]; then
+        docker_args+=(
+            -e CODEX_CLOJURE_SERVICE=0
+            -e CODEX_TEST_RESTRICTED_USERNS=1
+        )
+    fi
 
     if [[ "$profile" == cuda ]]; then
         docker_args+=(--gpus all)

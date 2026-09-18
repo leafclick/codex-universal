@@ -155,7 +155,15 @@ case "$check_phase" in
             "$fixture_dir" "$mcp_stderr"
         ;;
     cli-smoke)
-        codex-clojure-lsp-mcp --check-java >/dev/null
+        if [[ "${CODEX_TEST_RESTRICTED_USERNS:-0}" == 1 ]]; then
+            codex --enable use_legacy_landlock sandbox -C /tmp /bin/true
+            java --version
+            clojure -Sdescribe
+            deps -Sdescribe
+            lein version
+        else
+            codex-clojure-lsp-mcp --check-java >/dev/null
+        fi
         codex --version
         bb --version
         cljfmt --version
