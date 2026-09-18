@@ -61,7 +61,8 @@ state_root="${CODEX_WORKER_OBSERVE_DIR:-/tmp/codex-worker-observe}"
 }
 mkdir -p -- "$state_root"
 state_root="$(realpath -e -- "$state_root")"
-[[ "$state_root" == /tmp/?* ]] || {
+test_tmp_root="$(realpath -e -- /tmp)"
+[[ "$state_root" == "$test_tmp_root/"?* ]] || {
     echo "CODEX_WORKER_OBSERVE_DIR must resolve below /tmp" >&2
     exit 2
 }
