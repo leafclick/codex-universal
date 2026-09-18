@@ -151,8 +151,10 @@ rm -f "$bundle_dir/unexpected"
 pass "bundle integrity checks"
 
 rollback_source="$TEST_ROOT/rollback-source"
-mkdir -p "$rollback_source/bin"
+mkdir -p "$rollback_source/bin" "$rollback_source/security/seccomp"
 cp "$ROOT"/bin/* "$rollback_source/bin/"
+cp "$ROOT/security/seccomp/codex-bwrap.json" \
+    "$rollback_source/security/seccomp/codex-bwrap.json"
 git -C "$rollback_source" init -q
 git -C "$rollback_source" config user.email smoke@example.invalid
 git -C "$rollback_source" config user.name host-smoke
