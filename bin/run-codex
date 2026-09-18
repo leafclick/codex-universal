@@ -187,13 +187,33 @@ need() {
 }
 
 run_codex_require_capabilities() {
-    codex_host_require_linux_security || return 1
+    if [[ -z "$CODEX_HOST_BACKEND" ]]; then
+        codex_host_select_backend || return 1
+    fi
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        codex_host_require_linux_security || return 1
+    elif [[ -z "${CODEX_SECCOMP_PROFILE:-}" ]]; then
+        if [[ -r "$SCRIPT_DIR/codex-bwrap-seccomp.json" ]]; then
+            SECCOMP_PROFILE="$SCRIPT_DIR/codex-bwrap-seccomp.json"
+        elif [[ -r "$SCRIPT_DIR/../security/seccomp/codex-bwrap.json" ]]; then
+            SECCOMP_PROFILE="$SCRIPT_DIR/../security/seccomp/codex-bwrap.json"
+        fi
+    fi
     codex_host_require_capabilities "$@"
+}
+
+require_linux_idea_backend() {
+    if [[ -z "$CODEX_HOST_BACKEND" ]]; then
+        codex_host_select_backend || exit 1
+    fi
+    [[ "$CODEX_HOST_BACKEND" == gnu-linux ]] ||
+        die "IntelliJ integration is not supported by the macOS generic backend"
 }
 
 run_idea_dispatcher() {
     need jq
     run_codex_require_capabilities path || exit 1
+    require_linux_idea_backend
     ((HOST_UID > 0 && HOST_GID > 0)) ||
         die "Run this command as a non-root user with a non-root primary group"
 
@@ -2768,22 +2788,31 @@ check_onboarding() {
 
 run_sandbox_probe() {
     local image="$1"
+    local docker_args=(
+        run
+        --rm
+        --pull=never
+        --network none
+        --read-only
+        --tmpfs "$TMP_TMPFS_SPEC"
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+    )
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        docker_args+=(--security-opt "apparmor=$APPARMOR_PROFILE")
+    fi
+    docker_args+=(
+        --security-opt "seccomp=$SECCOMP_PROFILE"
+        --user "$HOST_UID:$HOST_GID"
+        --entrypoint /bin/sh
+        "$image"
+    )
 
-    # Exercise the actual host kernel, Docker seccomp policy, AppArmor
-    # transition, image Bubblewrap binary, and non-root identity together. The
-    # probe has no network, host mounts, or writable image root; only disposable
-    # tmpfs runtime storage is writable.
-    docker run --rm --pull=never \
-        --network none \
-        --read-only \
-        --tmpfs "$TMP_TMPFS_SPEC" \
-        --cap-drop=ALL \
-        --security-opt=no-new-privileges \
-        --security-opt "apparmor=$APPARMOR_PROFILE" \
-        --security-opt "seccomp=$SECCOMP_PROFILE" \
-        --user "$HOST_UID:$HOST_GID" \
-        --entrypoint /bin/sh \
-        "$image" \
+    # Exercise the actual host kernel, Docker seccomp policy, optional Linux
+    # AppArmor transition, image Bubblewrap binary, and non-root identity
+    # together. The probe has no network, host mounts, or writable image root;
+    # only disposable tmpfs runtime storage is writable.
+    docker "${docker_args[@]}" \
         -c 'exec /usr/bin/bwrap "$@"' \
         codex-sandbox-probe \
         --unshare-user \
@@ -2805,7 +2834,7 @@ load_doctor_module() {
     local launcher_source="${BASH_SOURCE[0]}"
     local launcher_dir doctor_module
 
-    if command -v realpath >/dev/null 2>&1; then
+    if [[ -z "$CODEX_HOST_BACKEND" ]] && command -v uname >/dev/null 2>&1; then
         codex_host_select_backend || exit 1
     fi
     if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
@@ -3001,6 +3030,7 @@ fi
 
 if $IDEA_MODE; then
     need jq
+    require_linux_idea_backend
     if [[ "$IDEA_MCP" == 1 ]]; then
         need socat
         need setpriv
@@ -3029,6 +3059,9 @@ PROJECT_PATH="$RESOLVED_PATH"
 LANE="$RESOLVED_LANE"
 PROFILE="$RESOLVED_PROFILE"
 IMAGE="$(profile_image "$PROFILE")"
+if [[ "$CODEX_HOST_BACKEND" == darwin-gnu && "$PROFILE" != generic ]]; then
+    die "The macOS backend supports only the generic profile; CUDA requires a GNU/Linux host"
+fi
 if [[ -z "${CODEX_LOCK_FILE:-}" && "$RESOLVED_STATE_MODE" == isolated ]]; then
     LOCK_FILE="$CONFIG_ROOT/locks/$PROJECT/$LANE.handoff.lock"
 fi
@@ -3125,14 +3158,20 @@ need docker
 
 docker info >/dev/null 2>&1 || die "Docker daemon is not available"
 
-[[ "$APPARMOR_PROFILE" == codex-universal ]] ||
-    die "Unsupported CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE (expected codex-universal)"
+if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+    [[ "$APPARMOR_PROFILE" == codex-universal ]] ||
+        die "Unsupported CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE (expected codex-universal)"
+fi
 [[ -f "$SECCOMP_PROFILE" && -r "$SECCOMP_PROFILE" ]] || {
     echo "ERROR: Codex host sandbox policy is not installed:" >&2
     echo "  $SECCOMP_PROFILE" >&2
     echo >&2
-    echo "From the codex-universal checkout, run:" >&2
-    echo "  bin/setup-codex-host-security" >&2
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        echo "From the codex-universal checkout, run:" >&2
+        echo "  bin/setup-codex-host-security" >&2
+    else
+        echo "Reinstall the codex-universal host tools." >&2
+    fi
     exit 1
 }
 SECCOMP_PROFILE="$(codex_host_path_existing "$SECCOMP_PROFILE")"
@@ -3149,7 +3188,11 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 if ! sandbox_probe_output="$(run_sandbox_probe "$IMAGE" 2>&1)"; then
     [[ -z "$sandbox_probe_output" ]] || printf '%s\n' "$sandbox_probe_output" >&2
     echo "ERROR: Bubblewrap cannot start with the installed host sandbox policy." >&2
-    echo "Re-run bin/setup-codex-host-security from the codex-universal checkout." >&2
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        echo "Re-run bin/setup-codex-host-security from the codex-universal checkout." >&2
+    else
+        echo "Confirm Docker Desktop accepts the bundled seccomp policy, then reinstall the host tools." >&2
+    fi
     exit 1
 fi
 
@@ -3247,10 +3290,12 @@ docker_args=(
     --tmpfs "$TMP_TMPFS_SPEC"
     --cap-drop=ALL
     --security-opt=no-new-privileges
-    --security-opt "apparmor=$APPARMOR_PROFILE"
-    --security-opt "seccomp=$SECCOMP_PROFILE"
-    --entrypoint /usr/local/bin/codex-entrypoint
 )
+if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+    docker_args+=(--security-opt "apparmor=$APPARMOR_PROFILE")
+fi
+docker_args+=(--security-opt "seccomp=$SECCOMP_PROFILE")
+docker_args+=(--entrypoint /usr/local/bin/codex-entrypoint)
 
 if $IDEA_MODE; then
     # IDEA may terminate its ACP subprocess without giving the attached Docker

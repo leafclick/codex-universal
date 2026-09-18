@@ -171,7 +171,19 @@ case "$TARGET" in
         ;;
 esac
 
-codex_host_require_linux_security || exit 1
+codex_host_select_backend || exit 1
+case "$CODEX_HOST_BACKEND" in
+    gnu-linux)
+        codex_host_require_linux_security || exit 1
+        ;;
+    darwin-gnu)
+        [[ "$TARGET" == generic ]] ||
+            die "The macOS backend can build only the generic image; CUDA requires a GNU/Linux host"
+        ;;
+    *)
+        die "unsupported compatibility backend: $CODEX_HOST_BACKEND"
+        ;;
+esac
 
 case "$TAG_LATEST" in
     0|1) ;;

@@ -37,8 +37,12 @@ doctor_runtime_probe() {
         --network none
         --cap-drop=ALL
         --security-opt=no-new-privileges
-        --security-opt "apparmor=$APPARMOR_PROFILE"
-        --security-opt "seccomp=$SECCOMP_PROFILE"
+    )
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        docker_args+=(--security-opt "apparmor=$APPARMOR_PROFILE")
+    fi
+    docker_args+=(--security-opt "seccomp=$SECCOMP_PROFILE")
+    docker_args+=(
         --read-only
         --tmpfs "$HOME_TMPFS_SPEC"
         --tmpfs "$TMP_TMPFS_SPEC"
@@ -149,24 +153,33 @@ doctor_runtime_probe() {
 doctor_mcp_probe() {
     local image="$1"
     local required_tools="$2"
+    local docker_args=(
+        run
+        --rm
+        --pull=never
+        --network none
+        --cap-drop=ALL
+        --security-opt=no-new-privileges
+    )
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        docker_args+=(--security-opt "apparmor=$APPARMOR_PROFILE")
+    fi
+    docker_args+=(--security-opt "seccomp=$SECCOMP_PROFILE")
+    docker_args+=(
+        --read-only
+        --tmpfs "$HOME_TMPFS_SPEC"
+        --tmpfs "$TMP_TMPFS_SPEC"
+        --tmpfs "$DOCTOR_WORKSPACE_TMPFS_SPEC"
+        --user "$HOST_UID:$HOST_GID"
+        -e "HOME=$CONTAINER_HOME"
+        --entrypoint /usr/local/bin/codex-entrypoint
+        "$image"
+    )
 
     # Keep this separate from the tool/policy probe so a failed MCP startup or
     # semantic query has a precise diagnosis. Like the runtime probe, it has no
     # host mounts.
-    docker run --rm --pull=never \
-        --network none \
-        --cap-drop=ALL \
-        --security-opt=no-new-privileges \
-        --security-opt "apparmor=$APPARMOR_PROFILE" \
-        --security-opt "seccomp=$SECCOMP_PROFILE" \
-        --read-only \
-        --tmpfs "$HOME_TMPFS_SPEC" \
-        --tmpfs "$TMP_TMPFS_SPEC" \
-        --tmpfs "$DOCTOR_WORKSPACE_TMPFS_SPEC" \
-        --user "$HOST_UID:$HOST_GID" \
-        -e "HOME=$CONTAINER_HOME" \
-        --entrypoint /usr/local/bin/codex-entrypoint \
-        "$image" /bin/bash -c '
+    docker "${docker_args[@]}" /bin/bash -c '
             set -Eeuo pipefail
 
             fixture_dir=/workspace/clojure-lsp-doctor
@@ -285,7 +298,17 @@ run_doctor() {
     echo "Codex environment doctor"
     echo
 
-    for command in git realpath docker flock; do
+    # Preserve the complete missing-command diagnostic even when the fixture
+    # (or a damaged host PATH) cannot identify its kernel at all.
+    if [[ -z "$CODEX_HOST_BACKEND" ]]; then
+        CODEX_HOST_BACKEND=gnu-linux
+    fi
+
+    local required_commands=(git docker)
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        required_commands=(git realpath docker flock)
+    fi
+    for command in "${required_commands[@]}"; do
         if ! command -v "$command" >/dev/null 2>&1; then
             missing+=("$command")
         fi
@@ -301,15 +324,17 @@ run_doctor() {
     fi
     doctor_pass "Required host commands are available"
 
-    if ! compatibility_error="$(
-        codex_host_require_linux_security 2>&1
-    )"; then
-        doctor_fail "Hardened launcher host check failed"
-        doctor_note "${compatibility_error#ERROR: }"
-        echo
-        printf 'Diagnostics failed: %d failure(s), %d warning(s).\n' \
-            "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
-        return 1
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        if ! compatibility_error="$(
+            codex_host_require_linux_security 2>&1
+        )"; then
+            doctor_fail "Hardened launcher host check failed"
+            doctor_note "${compatibility_error#ERROR: }"
+            echo
+            printf 'Diagnostics failed: %d failure(s), %d warning(s).\n' \
+                "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
+            return 1
+        fi
     fi
 
     if ! compatibility_error="$(
@@ -322,7 +347,11 @@ run_doctor() {
             "$DOCTOR_FAILURES" "$DOCTOR_WARNINGS"
         return 1
     fi
-    doctor_pass "GNU/Linux host utility compatibility is available"
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        doctor_pass "GNU/Linux host utility compatibility is available"
+    else
+        doctor_pass "macOS GNU host utility compatibility is available"
+    fi
 
     if ((HOST_UID == 0 || HOST_GID == 0)); then
         doctor_fail "Host UID/GID must both be non-root ($HOST_UID:$HOST_GID)"
@@ -350,6 +379,10 @@ run_doctor() {
     PROFILE="$RESOLVED_PROFILE"
     IMAGE="$(profile_image "$PROFILE")"
     doctor_pass "Project '$PROJECT' resolves to $PROJECT_PATH ($PROFILE)"
+    if [[ "$CODEX_HOST_BACKEND" == darwin-gnu && "$PROFILE" != generic ]]; then
+        doctor_fail "The macOS backend supports only the generic profile"
+        doctor_note "CUDA requires a GNU/Linux host; select the generic profile for Docker Desktop."
+    fi
     resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
     if [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then
         doctor_pass "Clojure LSP MCP selected ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
@@ -357,11 +390,21 @@ run_doctor() {
         doctor_skip "Clojure LSP MCP not selected ($EFFECTIVE_CLOJURE_LSP_MCP_REASON)"
     fi
 
-    if [[ "$APPARMOR_PROFILE" != codex-universal ]]; then
-        doctor_fail "Unsupported CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE (expected codex-universal)"
-    elif [[ ! -f "$SECCOMP_PROFILE" || ! -r "$SECCOMP_PROFILE" ]]; then
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        if [[ "$APPARMOR_PROFILE" != codex-universal ]]; then
+            doctor_fail "Unsupported CODEX_APPARMOR_PROFILE: $APPARMOR_PROFILE (expected codex-universal)"
+        fi
+    else
+        doctor_warn "Docker Desktop does not expose the GNU/Linux AppArmor host-policy contract"
+        doctor_note "The container still uses a read-only root, tmpfs runtime storage, dropped capabilities, and no-new-privileges."
+    fi
+    if [[ ! -f "$SECCOMP_PROFILE" || ! -r "$SECCOMP_PROFILE" ]]; then
         doctor_fail "Host sandbox policy is not readable: $SECCOMP_PROFILE"
-        doctor_note "Run bin/setup-codex-host-security from the codex-universal checkout."
+        if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+            doctor_note "Run bin/setup-codex-host-security from the codex-universal checkout."
+        else
+            doctor_note "Reinstall the codex-universal host tools."
+        fi
     else
         SECCOMP_PROFILE="$(codex_host_path_existing "$SECCOMP_PROFILE")"
         doctor_pass "Host sandbox policy is readable"
@@ -392,9 +435,17 @@ run_doctor() {
         if ((DOCTOR_FAILURES == 0)); then
             local probe_output=""
             if probe_output="$(run_sandbox_probe "$IMAGE" 2>&1)"; then
-                doctor_pass "AppArmor, seccomp, and Bubblewrap sandbox probe"
+                if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+                    doctor_pass "AppArmor, seccomp, and Bubblewrap sandbox probe"
+                else
+                    doctor_pass "Docker Desktop seccomp and Bubblewrap sandbox probe"
+                fi
             else
-                doctor_fail "AppArmor, seccomp, or Bubblewrap sandbox probe failed"
+                if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+                    doctor_fail "AppArmor, seccomp, or Bubblewrap sandbox probe failed"
+                else
+                    doctor_fail "Docker Desktop seccomp or Bubblewrap sandbox probe failed"
+                fi
                 [[ -z "$probe_output" ]] || printf '      %s\n' "$probe_output"
                 doctor_note "Reinstall the host policy, then rerun the doctor."
             fi
@@ -428,17 +479,21 @@ run_doctor() {
         fi
     fi
 
-    local optional_missing=()
-    for command in jq socat setpriv; do
-        if ! command -v "$command" >/dev/null 2>&1; then
-            optional_missing+=("$command")
+    if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        local optional_missing=()
+        for command in jq socat setpriv; do
+            if ! command -v "$command" >/dev/null 2>&1; then
+                optional_missing+=("$command")
+            fi
+        done
+        if ((${#optional_missing[@]})); then
+            doctor_warn "Optional IntelliJ host commands missing: ${optional_missing[*]}"
+            doctor_note "Install jq, socat, and util-linux (setpriv) before using IDEA integration."
+        else
+            doctor_pass "Optional IntelliJ host commands are available"
         fi
-    done
-    if ((${#optional_missing[@]})); then
-        doctor_warn "Optional IntelliJ host commands missing: ${optional_missing[*]}"
-        doctor_note "Install jq, socat, and util-linux (setpriv) before using IDEA integration."
     else
-        doctor_pass "Optional IntelliJ host commands are available"
+        doctor_skip "IntelliJ integration is not supported by the macOS generic backend"
     fi
 
     echo

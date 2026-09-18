@@ -478,7 +478,8 @@ grep -Fq -- '--unshare-pid \' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not exercise the private PID namespace"
 grep -Fq -- '--tmpfs /proc \' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not exercise the private procfs overlay"
-grep -Fq -- '--tmpfs "$TMP_TMPFS_SPEC" \' "$ROOT/bin/run-codex" ||
+sed -n '/^run_sandbox_probe()/,/^}/p' "$ROOT/bin/run-codex" |
+    grep -Fq -- '--tmpfs "$TMP_TMPFS_SPEC"' ||
     fail "Bubblewrap preflight does not provide writable temporary storage"
 grep -Fq -- '--unshare-net' "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge is not network-isolated"
@@ -1099,6 +1100,11 @@ printf '%s\n' \
     'esac' \
     > "$TEST_ROOT/fake-bin/docker"
 chmod 755 "$TEST_ROOT/fake-bin/docker"
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "%s\n" Linux' \
+    > "$TEST_ROOT/fake-bin/uname"
+chmod 755 "$TEST_ROOT/fake-bin/uname"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'exit 0' \
@@ -2727,6 +2733,70 @@ jq -e \
     "$ACP_FILE" >/dev/null ||
     fail "IDEA setup was not idempotent or replaced an unrelated custom agent"
 pass "JetBrains ACP configuration"
+
+darwin_launcher_bin="$TEST_ROOT/darwin-launcher-bin"
+mkdir -p "$darwin_launcher_bin"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "%s\n" Darwin' \
+    > "$darwin_launcher_bin/uname"
+chmod 755 "$darwin_launcher_bin/uname"
+for tool_mapping in \
+    "grealpath:$(command -v realpath)" \
+    "gstat:$(command -v stat)" \
+    "gsha256sum:$(command -v sha256sum)" \
+    "flock:$(command -v flock)" \
+    "gmv:$(command -v mv)" \
+    "gsort:$(command -v sort)" \
+    "gtar:$(command -v tar)"; do
+    ln -s "${tool_mapping#*:}" "$darwin_launcher_bin/${tool_mapping%%:*}"
+done
+darwin_launcher_env=(
+    "${launcher_env[@]}"
+    "PATH=$darwin_launcher_bin:$TEST_ROOT/fake-bin:$PATH"
+)
+darwin_launch_output="$(
+    "${darwin_launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new
+)"
+assert_contains "$darwin_launch_output" "--read-only"
+assert_contains "$darwin_launch_output" "--cap-drop=ALL"
+assert_contains "$darwin_launch_output" "--security-opt=no-new-privileges"
+assert_contains "$darwin_launch_output" \
+    "--security-opt seccomp=$ROOT/security/seccomp/codex-bwrap.json"
+assert_contains "$darwin_launch_output" "example/codex-universal-generic:test-version"
+assert_not_contains "$darwin_launch_output" "apparmor="
+assert_not_contains "$darwin_launch_output" "--gpus"
+
+darwin_doctor_output="$(
+    "${darwin_launcher_env[@]}" "$ROOT/bin/run-codex" --doctor smoke-project
+)"
+assert_contains "$darwin_doctor_output" \
+    "PASS  macOS GNU host utility compatibility is available"
+assert_contains "$darwin_doctor_output" \
+    "WARN  Docker Desktop does not expose the GNU/Linux AppArmor host-policy contract"
+assert_contains "$darwin_doctor_output" \
+    "PASS  Docker Desktop seccomp and Bubblewrap sandbox probe"
+assert_contains "$darwin_doctor_output" \
+    "PASS  Portable runtime identity, read-only image, tools, and managed Codex policy"
+assert_contains "$darwin_doctor_output" "Diagnostics passed with 1 warning(s)."
+assert_not_contains "$darwin_doctor_output" "apparmor="
+
+if "${darwin_launcher_env[@]}" "$ROOT/bin/run-codex" --idea smoke-project \
+    >"$TEST_ROOT/darwin-idea.out" 2>&1; then
+    fail "Darwin launcher accepted IntelliJ integration"
+fi
+assert_contains "$(<"$TEST_ROOT/darwin-idea.out")" \
+    "IntelliJ integration is not supported by the macOS generic backend"
+
+"${darwin_launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --set profile cuda >/dev/null
+if "${darwin_launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --new \
+    >"$TEST_ROOT/darwin-cuda.out" 2>&1; then
+    fail "Darwin launcher accepted the CUDA profile"
+fi
+assert_contains "$(<"$TEST_ROOT/darwin-cuda.out")" \
+    "The macOS backend supports only the generic profile"
+"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project \
+    --set profile generic >/dev/null
+pass "Darwin generic launcher boundary and Docker arguments"
 activity "portable image build policy"
 
 # Verify that one build is portable instead of capturing the builder's UID/GID.
@@ -2762,6 +2832,26 @@ assert_contains "$build_output" "--build-arg IMAGE_VERSION=test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:test-version"
 assert_contains "$build_output" "-t codex-host-smoke-generic:latest"
 pass "portable non-root image build policy"
+
+darwin_build_output="$(
+    env \
+        "PATH=$darwin_launcher_bin:$TEST_ROOT/fake-bin:$PATH" \
+        IMAGE_SLUG=codex-host-smoke \
+        IMAGE_VERSION=test-version \
+        TAG_LATEST=0 \
+        PULL=0 \
+        "$portable_build_repo/docker-build.sh" generic
+)"
+assert_contains "$darwin_build_output" \
+    "-t codex-host-smoke-generic:test-version"
+if env "PATH=$darwin_launcher_bin:$TEST_ROOT/fake-bin:$PATH" \
+    "$portable_build_repo/docker-build.sh" cuda \
+    >"$TEST_ROOT/darwin-cuda-build.out" 2>&1; then
+    fail "Darwin image builder accepted the CUDA profile"
+fi
+assert_contains "$(<"$TEST_ROOT/darwin-cuda-build.out")" \
+    "The macOS backend can build only the generic image"
+pass "Darwin generic-only image build boundary"
 activity "Git-derived image metadata"
 
 # Explicit image names do not waive the repository's immutable Git-provenance
