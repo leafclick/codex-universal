@@ -256,10 +256,10 @@ Support is split by host capability:
 | Host | Supported commands | Requirements |
 | --- | --- | --- |
 | GNU/Linux | `run-codex`, `codex-push`, `codex-pull`, `codex-collab`, IDEA integration, and AppArmor setup | Docker and the Linux security stack below |
-| macOS | Standalone `codex-push`, `codex-pull`, and `codex-collab` | Bash 4.1+, GNU utilities from Homebrew or MacPorts, `flock`, and the synchronization dependencies in the [sync guide](docs/codex-sync.md#install-required-software) |
+| macOS | Generic terminal `run-codex`, `codex-push`, `codex-pull`, and `codex-collab` | Docker Desktop, Git, Bash 4.1+, GNU utilities from Homebrew or MacPorts, `flock`, and the dependencies in the [sync guide](docs/codex-sync.md#install-required-software) |
 
-Building and running the containers, the full launcher, IDEA integration, and
-AppArmor setup require:
+The complete GNU/Linux launcher, IDEA integration, CUDA profile, and AppArmor
+setup require:
 
 - GNU/Linux host with Bash 4.1 or newer
 - Docker Engine with an available Docker daemon
@@ -276,18 +276,20 @@ AppArmor setup require:
 The CUDA profile additionally requires the NVIDIA driver and NVIDIA Container Toolkit. The optional `codex-push` and `codex-pull` commands require more host utilities; see the [Codex state synchronization guide](docs/codex-sync.md#install-required-software).
 
 The host compatibility layer centralizes utility semantics in
-`bin/codex-host-compat.bash`. Standalone `codex-push`, `codex-pull`, and
-`codex-collab` support macOS with Bash 4.1 or newer and the Homebrew or MacPorts
-dependencies documented in the [Codex state synchronization guide](docs/codex-sync.md#install-required-software).
-The full `run-codex` launcher, IDEA integration, and AppArmor setup remain
-GNU/Linux-only; macOS does not provide the required security and container
-runtime contract.
+`bin/codex-host-compat.bash`. The generic terminal launcher and the standalone
+commands support macOS with Bash 4.1 or newer, Docker Desktop, and the Homebrew
+or MacPorts dependencies documented in the
+[Codex state synchronization guide](docs/codex-sync.md#install-required-software).
+The macOS launcher uses the bundled seccomp policy and verifies that Bubblewrap
+starts before launching Codex. Docker Desktop does not expose the native Linux
+AppArmor contract, so this backend is not security-equivalent to GNU/Linux.
+CUDA, IDEA integration, and AppArmor setup remain GNU/Linux-only.
 
 The synchronization commands run on the host. Installing a utility such as
 `zstd` inside the Docker image does not make it available to those host
-commands. The macOS support above covers the host synchronization and
-collaboration contract; it does not claim Docker runtime or full-launcher
-validation on macOS.
+commands. The macOS generic launcher requires an actual Docker Desktop runtime;
+the host smoke tests validate its command contract but cannot substitute for
+that runtime check.
 
 ## Building
 
@@ -306,6 +308,9 @@ Build only the generic image:
 ```bash
 ./docker-build.sh generic
 ```
+
+On macOS, `generic` is the only supported build target; `cuda` and `all` are
+rejected before Docker is invoked.
 
 Build only CUDA:
 
@@ -872,14 +877,17 @@ set and `no-new-privileges`, so these permissions cannot mount in the initial
 container namespace. Bubblewrap drops its namespaced capabilities before the
 sandboxed command starts. The seccomp policy is Docker-default-derived and
 admits the small set of namespace and mount syscalls required for setup.
-`run-codex` requires the installed `codex-universal` AppArmor profile and
-rejects `unconfined`, `docker-default`, and arbitrary profile overrides.
+On GNU/Linux, `run-codex` requires the installed `codex-universal` AppArmor
+profile and rejects `unconfined`, `docker-default`, and arbitrary profile
+overrides.
 
 `run-codex` performs a networkless, read-only Bubblewrap preflight with the
-selected image. It stops with a setup error if either host policy is absent or
-rejected; it never silently falls back to running every command outside the
-sandbox. Re-run `bin/setup-codex-host-security` after updating either policy in
-this repository.
+selected image. It stops with a setup error if the applicable host policy is
+absent or rejected; it never silently falls back to running every command
+outside the sandbox. GNU/Linux uses AppArmor plus seccomp; Docker Desktop uses
+the bundled seccomp policy without AppArmor. Re-run
+`bin/setup-codex-host-security` after updating either GNU/Linux policy in this
+repository.
 
 Do not work around a failed preflight with `--privileged`, `--cap-add
 SYS_ADMIN`, or unconfined seccomp/AppArmor modes. See
@@ -1138,10 +1146,11 @@ tombstone if filesystem deletion fails so the same command can retry cleanup
 or report the exact path requiring manual recovery.
 
 On GNU/Linux the bundle includes `run-codex`, `setup-codex-idea`, and the
-standalone synchronization and collaboration commands. On macOS it installs
-only the supported standalone `codex-push`, `codex-pull`, and `codex-collab`
-commands. Host security setup remains a repository-local GNU/Linux operation
-because it installs policy files from `security/`.
+standalone synchronization and collaboration commands. On macOS it includes
+the generic terminal `run-codex`, its bundled seccomp policy, and the standalone
+commands; `setup-codex-idea` is excluded. Host security setup remains a
+repository-local GNU/Linux operation because it installs native AppArmor policy
+files from `security/`.
 
 Use `--prefix "$HOME"` to install wrappers into `~/bin` when that is already
 the user's preferred executable directory.

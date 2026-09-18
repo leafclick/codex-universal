@@ -46,9 +46,9 @@ Only one machine should actively modify the shared Codex state at a time.
 The standalone synchronization and collaboration commands support GNU/Linux
 and macOS hosts. They require Bash 4.1 or newer, the existing synchronization
 dependencies below, and the GNU semantics provided by the host compatibility
-module. The full `run-codex` launcher, IDEA integration, and AppArmor setup
-remain GNU/Linux-only because of their security and container-runtime
-requirements.
+module. The generic terminal `run-codex` launcher also supports macOS with
+Docker Desktop. CUDA, IDEA integration, and AppArmor setup remain
+GNU/Linux-only.
 The complete host tool set below also includes `jq` and `sqlite3`, which are
 used by `run-codex` session listing and selection. `jq` is also used by the
 optional `setup-codex-idea` command. On Debian, Ubuntu, and related
