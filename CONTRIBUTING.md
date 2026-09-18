@@ -53,6 +53,12 @@ Real-image coverage applies only to profiles that are already local. Use
 `CODEX_TEST_SKIP_IMAGE=1` when intentionally making the no-image boundary
 explicit.
 
+Host-tool installer changes must also pass the focused temporary-prefix test:
+
+```bash
+./tests/host-smoke-install.sh
+```
+
 Stop all `codex-*` containers before running the complete suite. This is required because the synchronization commands refuse to operate while a Codex session is active. Use `CODEX_TEST_SKIP_SYNC=1` only for a reduced run that intentionally omits synchronization behavior.
 
 If images use custom names:

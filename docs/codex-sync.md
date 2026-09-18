@@ -91,16 +91,17 @@ Both package managers install the required GNU utilities with prefixes such as
 compatibility module selects those names automatically. The remaining commands
 used here, including `find`, `awk`, `grep`, `hostname`, `lsof`, and `sqlite3`,
 are supplied by macOS.
-Keep `codex-sync-lib` and
-`codex-host-compat.bash` beside `codex-push`, `codex-pull`, and
-`codex-collab` when installing them:
+Install the portable commands and their companion modules as one versioned
+bundle:
 
 ```bash
-mkdir -p ~/.local/bin
-install -m 700 bin/codex-push bin/codex-pull bin/codex-collab ~/.local/bin/
-install -m 600 bin/codex-sync-lib ~/.local/bin/codex-sync-lib
-install -m 644 bin/codex-host-compat.bash ~/.local/bin/codex-host-compat.bash
+bin/install-codex-host-tools
+bin/install-codex-host-tools --check
 ```
+
+On macOS the installer selects only `codex-push`, `codex-pull`, and
+`codex-collab`. Use `--prefix ABSOLUTE_PATH` for a prefix other than
+`~/.local`, or `--dry-run` to inspect the plan without changing the filesystem.
 
 Important package-to-command mappings include:
 

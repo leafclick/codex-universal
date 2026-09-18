@@ -67,12 +67,8 @@ step fails or needs customization.
 
    ```bash
    bin/setup-codex-host-security
-   mkdir -p ~/.local/bin
-   install -m 755 bin/run-codex bin/setup-codex-idea ~/.local/bin/
-   install -m 644 bin/run-codex-doctor.bash ~/.local/bin/
-   install -m 700 bin/codex-push bin/codex-pull bin/codex-collab ~/.local/bin/
-   install -m 600 bin/codex-sync-lib ~/.local/bin/
-   install -m 644 bin/codex-host-compat.bash ~/.local/bin/
+   bin/install-codex-host-tools
+   bin/install-codex-host-tools --check
    ```
 
 4. Register a Git checkout and start Codex. On a machine without existing Codex
@@ -1117,33 +1113,29 @@ The conventional per-user location on modern Linux systems is:
 ~/.local/bin
 ```
 
-Install them with:
+Install them as a version-coherent bundle with:
 
 ```bash
-mkdir -p ~/.local/bin
-
-install -m 755 bin/run-codex ~/.local/bin/run-codex
-install -m 644 bin/run-codex-doctor.bash ~/.local/bin/run-codex-doctor.bash
-install -m 755 bin/setup-codex-idea ~/.local/bin/setup-codex-idea
-install -m 700 bin/codex-push ~/.local/bin/codex-push
-install -m 700 bin/codex-pull ~/.local/bin/codex-pull
-install -m 700 bin/codex-collab ~/.local/bin/codex-collab
-install -m 600 bin/codex-sync-lib ~/.local/bin/codex-sync-lib
-install -m 644 bin/codex-host-compat.bash ~/.local/bin/codex-host-compat.bash
+bin/install-codex-host-tools
+bin/install-codex-host-tools --check
 ```
 
-Keep `run-codex-doctor.bash` beside `run-codex`; it is a sourced companion
-module, not a standalone command. When `run-codex` is installed as a symbolic
-link, it resolves the link target and loads the module from that directory.
-Likewise, keep `codex-sync-lib` beside `codex-push` and `codex-pull`; both
-snapshot commands source the shared validation module.
-Keep `codex-host-compat.bash` beside every installed host command that uses
-the compatibility boundary (`run-codex`, `setup-codex-idea`, `codex-push`,
-`codex-pull`, and `codex-collab`); it is a sourced companion module, not a
-standalone command. Repository-local maintenance commands load it directly
-from `bin/`.
+The default prefix is `~/.local`. Use `--prefix ABSOLUTE_PATH` to select a
+different location and `--dry-run` to inspect the planned installation without
+writing anything. The installer records the Git revision and content hashes,
+keeps commands and sourced companion modules in one content-addressed,
+versioned bundle, and atomically switches the `current` bundle. Small launchers in
+`PREFIX/bin` resolve that bundle before execution. Previous bundles are
+retained for recovery.
 
-Alternatively, `~/bin` can be used if that is already the user's preferred executable directory.
+On GNU/Linux the bundle includes `run-codex`, `setup-codex-idea`, and the
+standalone synchronization and collaboration commands. On macOS it installs
+only the supported standalone `codex-push`, `codex-pull`, and `codex-collab`
+commands. Host security setup remains a repository-local GNU/Linux operation
+because it installs policy files from `security/`.
+
+Use `--prefix "$HOME"` to install wrappers into `~/bin` when that is already
+the user's preferred executable directory.
 
 ## Project configuration
 
