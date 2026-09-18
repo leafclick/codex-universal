@@ -16,6 +16,8 @@ assert_contains() {
 }
 
 REAL_PATH="$PATH"
+REAL_BASH="$(command -v bash)"
+SYSTEM_PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # shellcheck source=/dev/null
 source "$ROOT/bin/codex-host-compat.bash"
 
@@ -159,7 +161,7 @@ missing_root="$TEST_ROOT/missing-darwin"
 mkdir -p "$missing_root"
 cp "$fake_root/uname" "$missing_root/uname"
 set +e
-missing_output="$(PATH="$missing_root:$REAL_PATH" bash -c \
+missing_output="$(PATH="$missing_root:$SYSTEM_PATH" "$REAL_BASH" -c \
     'source "$1/bin/codex-host-compat.bash"; codex_host_require_capabilities path' \
     bash "$ROOT" 2>&1)"
 missing_status=$?
@@ -185,8 +187,8 @@ exit 1
 EOF
 chmod 755 "$incompatible_root/grealpath"
 set +e
-missing_capability_output="$(PATH="$incompatible_root:$REAL_PATH" \
-    bash -c 'source "$1/bin/codex-host-compat.bash"; codex_host_require_capabilities path' \
+missing_capability_output="$(PATH="$incompatible_root:$SYSTEM_PATH" \
+    "$REAL_BASH" -c 'source "$1/bin/codex-host-compat.bash"; codex_host_require_capabilities path' \
     bash "$ROOT" 2>&1)"
 missing_capability_status=$?
 set -e
