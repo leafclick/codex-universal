@@ -4,16 +4,15 @@ Contributions should preserve the project's non-root runtime, explicit approval 
 
 ## Development setup
 
-Use a Debian, Ubuntu, or comparable GNU/Linux host with Bash 4.1 or newer.
+Use a Debian, Ubuntu, or comparable GNU/Linux host with Bash 4.1 or newer, or
+macOS with Homebrew for standalone synchronization and collaboration work.
 Install the base requirements from the [README](README.md#host-requirements)
 and the synchronization dependencies from [docs/codex-sync.md](docs/codex-sync.md#install-required-software).
 
-The first host compatibility-layer milestone is `bin/codex-host-compat.bash`.
-It defines the semantic boundary for host utilities such as path resolution,
-metadata, checksums, locks, and atomic publication, while retaining a
-GNU/Linux-only backend for now. Future macOS and BSD backends must preserve
-the same behavior and must not weaken the Linux security contract; those hosts
-are not supported by the full launcher yet.
+The host compatibility layer is `bin/codex-host-compat.bash`. Its macOS
+backend uses Homebrew GNU utilities for path resolution, metadata, checksums,
+locks, atomic publication, NUL sorting, and canonical tar output. macOS does
+not support the full launcher, IDEA integration, or AppArmor setup.
 
 Install the host sandbox policy and commands, then build the relevant image as
 described in the README. Images use a fixed non-root identity and must remain

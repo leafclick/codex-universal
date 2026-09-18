@@ -43,12 +43,12 @@ Only one machine should actively modify the shared Codex state at a time.
 
 ## Install required software
 
-The synchronization commands require Bash 4.1 or newer and standard
-GNU/Linux utilities. The first host compatibility-layer milestone is
-centralized in `bin/codex-host-compat.bash`, but its only backend currently
-supports GNU/Linux. Synchronization and collaboration are the planned
-portability boundary; macOS and BSD hosts are not supported yet, and the full
-launcher remains Linux-only because of its security requirements.
+The standalone synchronization and collaboration commands support GNU/Linux
+and macOS hosts. They require Bash 4.1 or newer, the existing synchronization
+dependencies below, and the GNU semantics provided by the host compatibility
+module. The full `run-codex` launcher, IDEA integration, and AppArmor setup
+remain GNU/Linux-only because of their security and container-runtime
+requirements.
 The complete host tool set below also includes `jq` and `sqlite3`, which are
 used by `run-codex` session listing and selection. `jq` is also used by the
 optional `setup-codex-idea` command. On Debian, Ubuntu, and related
@@ -71,6 +71,30 @@ sudo apt-get install \
   zstd
 ```
 
+On macOS, install Bash and the synchronization dependencies with Homebrew.
+The GNU-prefixed tools, `gnu-tar`, and `flock` are required because snapshot
+locking, atomic replacement, NUL-delimited sorting, and canonical tar output
+depend on those GNU semantics:
+
+```bash
+brew install bash coreutils gnu-tar flock jq zstd
+```
+
+Homebrew installs the GNU utilities with prefixes such as `grealpath`,
+`gstat`, `gsha256sum`, `gmv`, `gsort`, and `gtar`; the compatibility module
+selects those names automatically. The remaining commands used here, including
+`find`, `awk`, `grep`, `hostname`, `lsof`, and `sqlite3`, are supplied by macOS.
+Keep `codex-sync-lib` and
+`codex-host-compat.bash` beside `codex-push`, `codex-pull`, and
+`codex-collab` when installing them:
+
+```bash
+mkdir -p ~/.local/bin
+install -m 700 bin/codex-push bin/codex-pull bin/codex-collab ~/.local/bin/
+install -m 600 bin/codex-sync-lib ~/.local/bin/codex-sync-lib
+install -m 644 bin/codex-host-compat.bash ~/.local/bin/codex-host-compat.bash
+```
+
 Important package-to-command mappings include:
 
 | Package | Commands used |
@@ -82,7 +106,7 @@ Important package-to-command mappings include:
 | `lsof` | `lsof` |
 | `sqlite3` | `sqlite3` for Codex session selection and snapshot validation |
 | `tar` | GNU `tar` |
-| `util-linux` | `flock` |
+| `util-linux` or `flock` | `flock` |
 | `zstd` | `zstd` |
 
 Docker is optional for the synchronization scripts themselves. When Docker is installed, the scripts also check for running containers whose names begin with `codex-`.

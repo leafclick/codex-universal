@@ -255,7 +255,15 @@ The CUDA variant additionally contains the NVIDIA CUDA development environment.
 
 ## Host requirements
 
-Building and running the containers requires:
+Support is split by host capability:
+
+| Host | Supported commands | Requirements |
+| --- | --- | --- |
+| GNU/Linux | `run-codex`, `codex-push`, `codex-pull`, `codex-collab`, IDEA integration, and AppArmor setup | Docker and the Linux security stack below |
+| macOS | Standalone `codex-push`, `codex-pull`, and `codex-collab` | Bash 4.1+, Homebrew GNU utilities, `flock`, and the synchronization dependencies in the [sync guide](docs/codex-sync.md#install-required-software) |
+
+Building and running the containers, the full launcher, IDEA integration, and
+AppArmor setup require:
 
 - GNU/Linux host with Bash 4.1 or newer
 - Docker Engine with an available Docker daemon
@@ -271,13 +279,19 @@ Building and running the containers requires:
 
 The CUDA profile additionally requires the NVIDIA driver and NVIDIA Container Toolkit. The optional `codex-push` and `codex-pull` commands require more host utilities; see the [Codex state synchronization guide](docs/codex-sync.md#install-required-software).
 
-The first compatibility-layer milestone centralizes host utility semantics in
-`bin/codex-host-compat.bash`, but its only backend currently supports
-GNU/Linux. The synchronization and collaboration commands are the intended
-future portability boundary; the full launcher still requires the Linux
-security stack above. Do not treat macOS or BSD as supported hosts yet.
+The host compatibility layer centralizes utility semantics in
+`bin/codex-host-compat.bash`. Standalone `codex-push`, `codex-pull`, and
+`codex-collab` support macOS with Bash 4.1 or newer and the Homebrew
+dependencies documented in the [Codex state synchronization guide](docs/codex-sync.md#install-required-software).
+The full `run-codex` launcher, IDEA integration, and AppArmor setup remain
+GNU/Linux-only; macOS does not provide the required security and container
+runtime contract.
 
-The synchronization commands run on the host. Installing a utility such as `zstd` inside the Docker image does not make it available to those host commands.
+The synchronization commands run on the host. Installing a utility such as
+`zstd` inside the Docker image does not make it available to those host
+commands. The macOS support above covers the host synchronization and
+collaboration contract; it does not claim Docker runtime or full-launcher
+validation on macOS.
 
 ## Building
 
