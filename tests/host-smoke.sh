@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
+export GIT_PAGER=cat
+export PAGER=cat
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEST_ROOT="$(mktemp -d)"
@@ -74,7 +76,7 @@ case "$HOST_KERNEL" in
         ;;
     Darwin)
         HOST_REALPATH=grealpath
-        host_commands=(bash git grep jq grealpath flock)
+        host_commands=(bash git grep jq grealpath gstat gsha256sum flock gmv gsort gtar)
         ;;
     *)
         fail "unsupported host kernel '$HOST_KERNEL'"
@@ -83,6 +85,22 @@ esac
 for command in "${host_commands[@]}"; do
     need "$command"
 done
+if [[ "$HOST_KERNEL" == Darwin ]]; then
+    TEST_HOST_BIN="$TEST_ROOT/host-bin"
+    mkdir -p "$TEST_HOST_BIN"
+    for host_tool_mapping in \
+        "realpath:$(command -v grealpath)" \
+        "stat:$(command -v gstat)" \
+        "sha256sum:$(command -v gsha256sum)" \
+        "mv:$(command -v gmv)" \
+        "sort:$(command -v gsort)" \
+        "tar:$(command -v gtar)"; do
+        ln -s "${host_tool_mapping#*:}" \
+            "$TEST_HOST_BIN/${host_tool_mapping%%:*}"
+    done
+    PATH="$TEST_HOST_BIN:$PATH"
+    export PATH
+fi
 
 git -C "$ROOT" diff --check
 git -C "$ROOT" diff --cached --check
