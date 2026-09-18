@@ -437,7 +437,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         'PRAGMA wal_autocheckpoint=0;' \
         'CREATE TABLE smoke (value TEXT);' \
         'BEGIN IMMEDIATE;' \
-        'INSERT INTO smoke VALUES ("committed in WAL");' \
+        "INSERT INTO smoke VALUES ('committed in WAL');" \
         'COMMIT;' >&7
     for attempt in {1..20}; do
         [[ -f "$sidecar_db-wal" && -f "$sidecar_db-shm" ]] && break
