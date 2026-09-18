@@ -55,13 +55,18 @@ case "${1:-}" in
 esac
 
 state_root="${CODEX_WORKER_OBSERVE_DIR:-/tmp/codex-worker-observe}"
-[[ "$state_root" == /tmp/?* && "$state_root" != *$'\n'* ]] || {
+[[ -n "$state_root" && "$state_root" != *$'\n'* ]] || {
     echo "CODEX_WORKER_OBSERVE_DIR must be a path below /tmp" >&2
+    exit 2
+}
+test_tmp_root="$(realpath -e -- /tmp)"
+state_root="$(realpath -m -- "$state_root")"
+[[ "$state_root" == "$test_tmp_root/"?* ]] || {
+    echo "CODEX_WORKER_OBSERVE_DIR must resolve below /tmp" >&2
     exit 2
 }
 mkdir -p -- "$state_root"
 state_root="$(realpath -e -- "$state_root")"
-test_tmp_root="$(realpath -e -- /tmp)"
 [[ "$state_root" == "$test_tmp_root/"?* ]] || {
     echo "CODEX_WORKER_OBSERVE_DIR must resolve below /tmp" >&2
     exit 2
