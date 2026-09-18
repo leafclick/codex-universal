@@ -2773,6 +2773,7 @@ env \
     "XDG_CONFIG_HOME=$TEST_ROOT/launcher-config" \
     "CODEX_IDEA_ACP_FILE=$ACP_FILE" \
     "CODEX_RUN_CODEX=$ROOT/bin/run-codex" \
+    "PATH=$TEST_ROOT/fake-bin:$PATH" \
     "$ROOT/bin/setup-codex-idea" >/dev/null
 
 jq -e '.theme == "dark"' "$ACP_FILE" >/dev/null ||
@@ -2799,6 +2800,7 @@ env \
     "XDG_CONFIG_HOME=$TEST_ROOT/launcher-config" \
     "CODEX_IDEA_ACP_FILE=$ACP_FILE" \
     "CODEX_RUN_CODEX=$ROOT/bin/run-codex" \
+    "PATH=$TEST_ROOT/fake-bin:$PATH" \
     "$ROOT/bin/setup-codex-idea" >/dev/null
 jq -e \
     '.agent_servers.Existing.command == "existing-agent" and
