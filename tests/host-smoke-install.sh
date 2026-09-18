@@ -110,8 +110,8 @@ if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
     expected_files=(MANIFEST codex-collab codex-host-compat.bash codex-pull codex-push codex-sync-lib run-codex run-codex-doctor.bash setup-codex-idea)
     expected_wrappers=(codex-collab codex-pull codex-push run-codex setup-codex-idea)
 else
-    expected_files=(MANIFEST codex-collab codex-host-compat.bash codex-pull codex-push codex-sync-lib)
-    expected_wrappers=(codex-collab codex-pull codex-push)
+    expected_files=(MANIFEST codex-bwrap-seccomp.json codex-collab codex-host-compat.bash codex-pull codex-push codex-sync-lib run-codex run-codex-doctor.bash)
+    expected_wrappers=(codex-collab codex-pull codex-push run-codex)
 fi
 assert_exact_bundle_files "$bundle_dir" "${expected_files[@]}"
 for file in "${expected_wrappers[@]}"; do
@@ -121,7 +121,7 @@ for file in "${expected_wrappers[@]}"; do
     [[ "$(codex_host_file_mode "$prefix/bin/$file")" == "$expected_mode" ]] || fail "wrong wrapper mode for $file"
 done
 [[ "$(codex_host_file_mode "$bundle_dir/codex-sync-lib")" == 600 ]] || fail "wrong mode for sync library"
-for file in codex-host-compat.bash run-codex-doctor.bash MANIFEST; do
+for file in codex-bwrap-seccomp.json codex-host-compat.bash run-codex-doctor.bash MANIFEST; do
     [[ ! -e "$bundle_dir/$file" || "$(codex_host_file_mode "$bundle_dir/$file")" == 644 ]] || fail "wrong mode for $file"
 done
 for file in "${expected_wrappers[@]}"; do
@@ -287,8 +287,9 @@ ln -s "$(command -v "$CODEX_HOST_TAR")" "$darwin_bin/gtar"
 darwin_prefix="$TEST_ROOT/darwin-install"
 PATH="$darwin_bin:$PATH" "$INSTALLER" --prefix "$darwin_prefix" >/dev/null
 darwin_bundle="$darwin_prefix/libexec/codex-universal/$(readlink "$darwin_prefix/libexec/codex-universal/current")"
-darwin_expected=(MANIFEST codex-collab codex-host-compat.bash codex-pull codex-push codex-sync-lib)
+darwin_expected=(MANIFEST codex-bwrap-seccomp.json codex-collab codex-host-compat.bash codex-pull codex-push codex-sync-lib run-codex run-codex-doctor.bash)
 assert_exact_bundle_files "$darwin_bundle" "${darwin_expected[@]}"
-for file in run-codex setup-codex-idea; do [[ ! -e "$darwin_prefix/bin/$file" ]] || fail "Darwin installed Linux-only command $file"; done
+[[ -x "$darwin_prefix/bin/run-codex" ]] || fail "Darwin did not install run-codex"
+[[ ! -e "$darwin_prefix/bin/setup-codex-idea" ]] || fail "Darwin installed Linux-only setup-codex-idea"
 PATH="$darwin_bin:$PATH" "$INSTALLER" --prefix "$darwin_prefix" --check >/dev/null || fail "Darwin installation check failed"
-pass "Darwin portable command set"
+pass "Darwin generic launcher and portable command set"

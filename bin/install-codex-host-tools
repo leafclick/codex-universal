@@ -180,8 +180,8 @@ case "$CODEX_HOST_BACKEND" in
         WRAPPERS=(run-codex setup-codex-idea codex-push codex-pull codex-collab)
         ;;
     darwin-gnu)
-        FILES=(codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib)
-        WRAPPERS=(codex-push codex-pull codex-collab)
+        FILES=(run-codex codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib run-codex-doctor.bash codex-bwrap-seccomp.json)
+        WRAPPERS=(run-codex codex-push codex-pull codex-collab)
         ;;
     *)
         die "unsupported compatibility backend: $CODEX_HOST_BACKEND"
@@ -194,7 +194,7 @@ file_mode() {
         run-codex|setup-codex-idea) printf '755\n' ;;
         codex-push|codex-pull|codex-collab) printf '700\n' ;;
         codex-sync-lib) printf '600\n' ;;
-        codex-host-compat.bash|run-codex-doctor.bash) printf '644\n' ;;
+        codex-host-compat.bash|run-codex-doctor.bash|codex-bwrap-seccomp.json) printf '644\n' ;;
         *) die "no installation mode is defined for $1" ;;
     esac
 }
@@ -208,16 +208,28 @@ wrapper_mode() {
 }
 
 bundle_rows() {
-    local name mode digest
+    local name mode digest source
 
     printf 'backend\t%s\n' "$CODEX_HOST_BACKEND"
     for name in "${FILES[@]}"; do
-        [[ -f "$SCRIPT_DIR/$name" && ! -L "$SCRIPT_DIR/$name" ]] ||
-            die "missing or unsafe source file: $SCRIPT_DIR/$name"
+        source="$(bundle_source_file "$name")"
+        [[ -f "$source" && ! -L "$source" ]] ||
+            die "missing or unsafe source file: $source"
         mode="$(file_mode "$name")"
-        digest="$(codex_host_sha256_file "$SCRIPT_DIR/$name")" || die "cannot hash source file: $name"
+        digest="$(codex_host_sha256_file "$source")" || die "cannot hash source file: $name"
         printf 'file\t%s\t%s\t%s\n' "$mode" "$digest" "$name"
     done
+}
+
+bundle_source_file() {
+    case "$1" in
+        codex-bwrap-seccomp.json)
+            printf '%s\n' "$SOURCE_ROOT/security/seccomp/codex-bwrap.json"
+            ;;
+        *)
+            printf '%s\n' "$SCRIPT_DIR/$1"
+            ;;
+    esac
 }
 
 if [[ "$MODE" == install || "$MODE" == dry-run || "$MODE" == check ]]; then
@@ -279,7 +291,7 @@ verify_bundle_against_checkout() {
         expected_mode="$(file_mode "$name")"
         actual_mode="$(codex_host_file_mode "$directory/$name")"
         [[ "$actual_mode" == "$expected_mode" ]] || die "incorrect mode for bundle file $name: $actual_mode"
-        expected_hash="$(codex_host_sha256_file "$SCRIPT_DIR/$name")"
+        expected_hash="$(codex_host_sha256_file "$(bundle_source_file "$name")")"
         actual_hash="$(codex_host_sha256_file "$directory/$name")"
         [[ "$actual_hash" == "$expected_hash" ]] || die "content mismatch for bundle file: $name"
     done
@@ -339,7 +351,13 @@ verify_retained_bundle() {
             expected_files=(run-codex setup-codex-idea codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib run-codex-doctor.bash)
             ;;
         darwin-gnu)
-            expected_files=(codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib)
+            # Retain verification and rollback support for sync-only bundles
+            # installed before the generic Docker Desktop launcher shipped.
+            if ((${#lines[@]} == 10)); then
+                expected_files=(codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib)
+            else
+                expected_files=(run-codex codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib run-codex-doctor.bash codex-bwrap-seccomp.json)
+            fi
             ;;
         *)
             die "unsupported retained bundle backend '$backend': $directory_id"
@@ -671,7 +689,7 @@ else
     TEMP_BUNDLE="$(mktemp -d "$INSTALL_ROOT/.bundle.XXXXXXXX")"
     chmod 755 "$TEMP_BUNDLE"
     for name in "${FILES[@]}"; do
-        install -m "$(file_mode "$name")" "$SCRIPT_DIR/$name" "$TEMP_BUNDLE/$name"
+        install -m "$(file_mode "$name")" "$(bundle_source_file "$name")" "$TEMP_BUNDLE/$name"
     done
     manifest_content >"$TEMP_BUNDLE/MANIFEST"
     chmod 644 "$TEMP_BUNDLE/MANIFEST"
