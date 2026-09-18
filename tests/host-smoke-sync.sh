@@ -4,6 +4,8 @@ umask 077
 
 ROOT="$(cd -- "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TEST_ROOT="$(mktemp -d)"
+# shellcheck source=/dev/null
+source "$ROOT/bin/codex-host-compat.bash"
 
 cleanup() {
     rm -rf "$TEST_ROOT"
@@ -33,7 +35,12 @@ assert_contains() {
 }
 
 if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
-    for command in awk cp find flock grep head hostname lsof sha256sum sqlite3 tar zstd; do
+    codex_host_require_capabilities path stat checksum lock atomic-replace null-sort canonical-tar
+    TEST_ROOT="$(codex_host_path_existing "$TEST_ROOT")"
+    CODEX_TEST_MV_NAME="$CODEX_HOST_MV"
+    CODEX_TEST_REAL_MV="$(command -v "$CODEX_HOST_MV")"
+    export CODEX_TEST_REAL_MV
+    for command in awk cp find grep head hostname lsof sqlite3 zstd; do
         need "$command"
     done
 
@@ -147,32 +154,18 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     fixture_state_hash() {
         local dir="$1"
 
-        LC_ALL=C tar \
-            --sort=name \
-            --format=gnu \
-            --mtime='@0' \
-            --owner=0 \
-            --group=0 \
-            --numeric-owner \
-            -C "$dir" \
-            -cf - . |
-            sha256sum |
-            awk '{print $1}'
+        codex_host_canonical_tar "$dir" | codex_host_sha256_stdin
+    }
+
+    codex_host_sort_lines() {
+        LC_ALL=C "$CODEX_HOST_SORT"
     }
 
     make_fixture_archive() {
         local source_dir="$1"
         local archive_path="$2"
 
-        LC_ALL=C tar \
-            --sort=name \
-            --format=gnu \
-            --mtime='@0' \
-            --owner=0 \
-            --group=0 \
-            --numeric-owner \
-            -C "$source_dir" \
-            -cf - . |
+        codex_host_canonical_tar "$source_dir" |
             zstd -q -T0 -o "$archive_path"
     }
 
@@ -188,7 +181,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
 
         make_fixture_archive "$source_dir" "$archive_path"
         state_hash="$(fixture_state_hash "$source_dir")"
-        archive_hash="$(sha256sum "$archive_path" | awk '{print $1}')"
+        archive_hash="$(codex_host_sha256_file "$archive_path")"
         printf '%s\n' "$archive_hash" > "$archive_path.sha256"
         {
             printf 'format=1\ngeneration=%s\nsha256=%s\n' \
@@ -207,7 +200,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
 
     mkdir -p "$TEST_ROOT/a/live" "$TEST_ROOT/a/home"
     printf 'generation one\n' > "$TEST_ROOT/a/live/payload"
-    generation_one_hash="$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')"
+    generation_one_hash="$(codex_host_sha256_file "$TEST_ROOT/a/live/payload")"
     sqlite3 "$TEST_ROOT/a/live/state.sqlite" \
         "CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ('ok');"
 
@@ -254,7 +247,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     lock_snapshot_count="$(find "$SYNC_ROOT" -path "$SYNC_ROOT/*/*" -prune -o -type f -print | wc -l)"
     lock_live_hash="$(fixture_state_hash "$TEST_ROOT/a/live")"
     exec 8>"$LOCK_FILE"
-    flock -n -x 8 || fail "could not acquire snapshot contention lock"
+    codex_host_lock_try_exclusive 8 || fail "could not acquire snapshot contention lock"
     if run_machine a "$PUSH_COMMAND" >"$TEST_ROOT/lock-push.log" 2>&1; then
         fail "snapshot push ignored an active handoff lock"
     fi
@@ -279,15 +272,15 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     mkdir -p "$TEST_ROOT/b/live" "$TEST_ROOT/b/home"
     printf 'replace me\n' > "$TEST_ROOT/b/live/payload"
     run_machine b "$PULL_COMMAND" --force 1 >/dev/null
-    [[ "$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')" == \
-       "$(sha256sum "$TEST_ROOT/b/live/payload" | awk '{print $1}')" ]] ||
+    [[ "$(codex_host_sha256_file "$TEST_ROOT/a/live/payload")" == \
+       "$(codex_host_sha256_file "$TEST_ROOT/b/live/payload")" ]] ||
         fail "forced pull did not restore generation 1"
 
     printf 'generation two\n' > "$TEST_ROOT/a/live/payload"
     run_machine a "$PUSH_COMMAND" >/dev/null
     run_machine b "$PULL_COMMAND" >/dev/null
-    [[ "$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')" == \
-       "$(sha256sum "$TEST_ROOT/b/live/payload" | awk '{print $1}')" ]] ||
+    [[ "$(codex_host_sha256_file "$TEST_ROOT/a/live/payload")" == \
+       "$(codex_host_sha256_file "$TEST_ROOT/b/live/payload")" ]] ||
         fail "forward pull did not restore generation 2"
 
     printf 'local divergence\n' > "$TEST_ROOT/b/live/payload"
@@ -321,7 +314,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     assert_contains "$(<"$TEST_ROOT/incomplete-normal.log")" \
         "Generation 4 is incomplete"
     run_machine c "$PULL_COMMAND" --force 1 >/dev/null
-    [[ "$(sha256sum "$TEST_ROOT/c/live/payload" | awk '{print $1}')" == \
+    [[ "$(codex_host_sha256_file "$TEST_ROOT/c/live/payload")" == \
        "$generation_one_hash" ]] ||
         fail "older forced pull did not bypass an incomplete newest generation"
     grep -Fxq 'generation=4' "$TEST_ROOT/c/state/codex-handoff/base.state" ||
@@ -347,8 +340,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     printf 'validator live state\n' > "$validator_root/live/payload"
     printf 'not a compressed archive\n' \
         > "$validator_root/sync/$validator_archive"
-    sha256sum "$validator_root/sync/$validator_archive" |
-        awk '{print $1}' \
+    codex_host_sha256_file "$validator_root/sync/$validator_archive" \
         > "$validator_root/sync/$validator_archive.sha256"
     {
         printf 'format=2\n'
@@ -391,7 +383,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         "CREATE TABLE smoke (value TEXT); INSERT INTO smoke VALUES ('ok');"
     corrupt_archive="$corrupt_live_root/sync/codex-g0000000001-corrupt.tar.zst"
     make_fixture_archive "$corrupt_source" "$corrupt_archive"
-    corrupt_archive_hash="$(sha256sum "$corrupt_archive" | awk '{print $1}')"
+    corrupt_archive_hash="$(codex_host_sha256_file "$corrupt_archive")"
     corrupt_state_hash="$(fixture_state_hash "$corrupt_source")"
     printf '%s\n' "$corrupt_archive_hash" > "$corrupt_archive.sha256"
     {
@@ -415,7 +407,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         bs=1 count=100 seek=4096 conv=notrunc status=none
     suffix_archive="$suffix_root/sync/codex-g0000000001-suffix.tar.zst"
     make_fixture_archive "$suffix_root/live" "$suffix_archive"
-    suffix_archive_hash="$(sha256sum "$suffix_archive" | awk '{print $1}')"
+    suffix_archive_hash="$(codex_host_sha256_file "$suffix_archive")"
     suffix_state_hash="$(fixture_state_hash "$suffix_root/live")"
     printf '%s\n' "$suffix_archive_hash" > "$suffix_archive.sha256"
     {
@@ -455,11 +447,11 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         fail "SQLite writer did not create WAL/SHM sidecars"
     sidecar_archive="$sidecar_root/sync/codex-g0000000001-sidecars.tar.zst"
     make_fixture_archive "$sidecar_root/live" "$sidecar_archive"
-    sidecar_archive_hash="$(sha256sum "$sidecar_archive" | awk '{print $1}')"
+    sidecar_archive_hash="$(codex_host_sha256_file "$sidecar_archive")"
     sidecar_state_hash="$(fixture_state_hash "$sidecar_root/live")"
-    sidecar_main_hash="$(sha256sum "$sidecar_db" | awk '{print $1}')"
-    sidecar_wal_hash="$(sha256sum "$sidecar_db-wal" | awk '{print $1}')"
-    sidecar_shm_hash="$(sha256sum "$sidecar_db-shm" | awk '{print $1}')"
+    sidecar_main_hash="$(codex_host_sha256_file "$sidecar_db")"
+    sidecar_wal_hash="$(codex_host_sha256_file "$sidecar_db-wal")"
+    sidecar_shm_hash="$(codex_host_sha256_file "$sidecar_db-shm")"
     exec 7>&-
     wait "$sidecar_writer"
     rm -f "$sidecar_fifo"
@@ -473,11 +465,11 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     [[ -f "$sidecar_root/live/codex-state.db-wal" &&
        -f "$sidecar_root/live/codex-state.db-shm" ]] ||
         fail "SQLite WAL/SHM sidecars did not survive restore"
-    [[ "$(sha256sum "$sidecar_root/live/codex-state.db" | awk '{print $1}')" == \
+    [[ "$(codex_host_sha256_file "$sidecar_root/live/codex-state.db")" == \
        "$sidecar_main_hash" &&
-       "$(sha256sum "$sidecar_root/live/codex-state.db-wal" | awk '{print $1}')" == \
+       "$(codex_host_sha256_file "$sidecar_root/live/codex-state.db-wal")" == \
        "$sidecar_wal_hash" &&
-       "$(sha256sum "$sidecar_root/live/codex-state.db-shm" | awk '{print $1}')" == \
+       "$(codex_host_sha256_file "$sidecar_root/live/codex-state.db-shm")" == \
        "$sidecar_shm_hash" ]] ||
         fail "SQLite main/WAL/SHM bytes changed during restore"
     sidecar_no_change="$(run_isolated "$sidecar_root" "$PULL_COMMAND")"
@@ -501,8 +493,8 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     nonmutating_archive='codex-g0000000001-invalid.tar.zst'
     printf 'not a compressed archive\n' > \
         "$nonmutating_root/sync/$nonmutating_archive"
-    nonmutating_archive_hash="$(sha256sum \
-        "$nonmutating_root/sync/$nonmutating_archive" | awk '{print $1}')"
+    nonmutating_archive_hash="$(codex_host_sha256_file \
+        "$nonmutating_root/sync/$nonmutating_archive")"
     printf '%s\n' "$nonmutating_archive_hash" > \
         "$nonmutating_root/sync/$nonmutating_archive.sha256"
     {
@@ -521,7 +513,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     make_fixture_archive "$nonmutating_root/live" \
         "$nonmutating_root/sync/codex-g0000000002-hash.tar.zst"
     hash_archive="$nonmutating_root/sync/codex-g0000000002-hash.tar.zst"
-    sha256sum "$hash_archive" | awk '{print $1}' > "$hash_archive.sha256"
+    codex_host_sha256_file "$hash_archive" > "$hash_archive.sha256"
     {
         printf 'format=1\ngeneration=2\nsha256=%s\n' "$incomplete_hash"
         printf 'created=20260911T000000Z\nhost=host-smoke\narchive=%s\n' \
@@ -703,7 +695,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         "$metadata_pull_source" 8 head "$handoff_commit"
     metadata_pull_before="$(fixture_state_hash "$metadata_pull_root/live")"
     metadata_pull_files_before="$(find "$metadata_pull_root/sync" -path "$metadata_pull_root/sync/*/*" -prune -o \
-        -type f -print | LC_ALL=C sort)"
+        -type f -print | codex_host_sort_lines)"
     if run_metadata_handoff "$metadata_pull_root" "$PULL_COMMAND" --force 7 \
         >"$metadata_pull_root/divergence.log" 2>&1; then
         fail "pull accepted conflicting handoff metadata for one generation"
@@ -713,7 +705,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
        "$metadata_pull_before" ]] ||
         fail "metadata-divergent pull mutated live state"
     [[ "$(find "$metadata_pull_root/sync" -path "$metadata_pull_root/sync/*/*" -prune -o -type f -print | \
-        LC_ALL=C sort)" == "$metadata_pull_files_before" ]] ||
+        codex_host_sort_lines)" == "$metadata_pull_files_before" ]] ||
         fail "metadata-divergent pull mutated synchronization state"
     pass "pull rejects conflicting handoff metadata before mutation"
 
@@ -729,7 +721,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         "$metadata_push_source" 9 zeta \
         'cccccccccccccccccccccccccccccccccccccccc'
     metadata_push_files_before="$(find "$metadata_push_root/sync" -path "$metadata_push_root/sync/*/*" -prune -o \
-        -type f -print | LC_ALL=C sort)"
+        -type f -print | codex_host_sort_lines)"
     metadata_push_live_before="$(fixture_state_hash "$metadata_push_root/live")"
     if run_metadata_handoff "$metadata_push_root" "$PUSH_COMMAND" \
         >"$metadata_push_root/divergence.log" 2>&1; then
@@ -737,7 +729,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     fi
     assert_contains "$(<"$metadata_push_root/divergence.log")" "DIVERGENCE"
     [[ "$(find "$metadata_push_root/sync" -path "$metadata_push_root/sync/*/*" -prune -o -type f -print | \
-        LC_ALL=C sort)" == "$metadata_push_files_before" ]] ||
+        codex_host_sort_lines)" == "$metadata_push_files_before" ]] ||
         fail "metadata-divergent push published or removed synchronization files"
     [[ "$(fixture_state_hash "$metadata_push_root/live")" == \
        "$metadata_push_live_before" ]] ||
@@ -757,8 +749,8 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         legacy_archive="codex-g0000000001-$legacy_suffix.tar.zst"
         make_fixture_archive "$legacy_duplicate_source" \
             "$legacy_duplicate_root/sync/$legacy_archive"
-        legacy_archive_hash="$(sha256sum \
-            "$legacy_duplicate_root/sync/$legacy_archive" | awk '{print $1}')"
+        legacy_archive_hash="$(codex_host_sha256_file \
+            "$legacy_duplicate_root/sync/$legacy_archive")"
         printf '%s\n' "$legacy_archive_hash" > \
             "$legacy_duplicate_root/sync/$legacy_archive.sha256"
         {
@@ -786,7 +778,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     printf 'rollback restored\n' > "$rollback_source/payload"
     rollback_archive="$rollback_root/sync/codex-g0000000001-rollback.tar.zst"
     make_fixture_archive "$rollback_source" "$rollback_archive"
-    rollback_archive_hash="$(sha256sum "$rollback_archive" | awk '{print $1}')"
+    rollback_archive_hash="$(codex_host_sha256_file "$rollback_archive")"
     rollback_state_hash="$(fixture_state_hash "$rollback_source")"
     printf '%s\n' "$rollback_archive_hash" > "$rollback_archive.sha256"
     {
@@ -797,14 +789,14 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
 
     rollback_bin="$TEST_ROOT/rollback-bin"
     mkdir -p "$rollback_bin"
-    rollback_mv="$rollback_bin/mv"
+    rollback_mv="$rollback_bin/$CODEX_TEST_MV_NAME"
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         'source_path="${@: -2:1}"; destination_path="${@: -1}"' \
         'if [[ "$source_path" == */content && "$destination_path" == "'$rollback_root'/live" ]]; then' \
         '    exit 1' \
         'fi' \
-        'exec /bin/mv "$@"' > "$rollback_mv"
+        'exec "$CODEX_TEST_REAL_MV" "$@"' > "$rollback_mv"
     chmod 755 "$rollback_mv"
     if PATH="$rollback_bin:$PATH" run_isolated "$rollback_root" "$PULL_COMMAND" --force 1 \
         >"$rollback_root/success.log" 2>&1; then
@@ -818,7 +810,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
 
     rollback_fail_bin="$TEST_ROOT/rollback-fail-bin"
     mkdir -p "$rollback_fail_bin"
-    rollback_mv_fail="$rollback_fail_bin/mv"
+    rollback_mv_fail="$rollback_fail_bin/$CODEX_TEST_MV_NAME"
     printf '%s\n' \
         '#!/usr/bin/env bash' \
         'source_path="${@: -2:1}"; destination_path="${@: -1}"' \
@@ -828,7 +820,7 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         'if [[ "$source_path" == "'$rollback_root'/live.backup-"* && "$destination_path" == "'$rollback_root'/live" ]]; then' \
         '    exit 1' \
         'fi' \
-        'exec /bin/mv "$@"' > "$rollback_mv_fail"
+        'exec "$CODEX_TEST_REAL_MV" "$@"' > "$rollback_mv_fail"
     chmod 755 "$rollback_mv_fail"
     # A fresh live directory is required because the previous case restored it.
     printf 'rollback original 2\n' > "$rollback_root/live/payload"

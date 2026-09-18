@@ -21,6 +21,7 @@ source "$ROOT/bin/codex-host-compat.bash"
 
 codex_host_require_capabilities \
     path stat checksum lock atomic-replace null-sort canonical-tar
+TEST_ROOT="$(codex_host_path_existing "$TEST_ROOT")"
 pass "native host capability checks"
 
 fixture="$TEST_ROOT/fixture"
@@ -42,7 +43,7 @@ assert_eq "$(codex_host_sha256_file "$fixture/z file")" \
     "c865f6c5ab8d1b0bcd383a5e1e3879d22681c96bf462c269b7581d523fbe70ab" \
     "file checksum"
 assert_eq "$(printf 'compat\n' | codex_host_sha256_stdin)" \
-    "$(printf 'compat\n' | sha256sum | awk '{print $1}')" "stdin checksum"
+    7506474ede71264dcb3fdd617ee2389b92343d76bbaae0c1db384a8bac44812c "stdin checksum"
 assert_eq "$(printf '%s\0' z a 'with space' | codex_host_sort_null | tr '\0' '\n')" \
     $'a\nwith space\nz' "NUL-delimited sorting"
 pass "path, metadata, checksum, and NUL-sort operations"
@@ -69,7 +70,7 @@ codex_host_canonical_tar "$fixture" >"$tar_one"
 sleep 1
 codex_host_canonical_tar "$fixture" >"$tar_two"
 cmp -s "$tar_one" "$tar_two" || fail "canonical tar output changed between runs"
-tar_listing="$(tar -tf "$tar_one")"
+tar_listing="$("$CODEX_HOST_TAR" -tf "$tar_one")"
 assert_contains "$tar_listing" $'./sub/a' "canonical tar listing"
 assert_contains "$tar_listing" $'./z file' "canonical tar listing"
 pass "canonical deterministic tar"
@@ -81,9 +82,13 @@ cat >"$fake_root/uname" <<'EOF'
 printf '%s\n' Darwin
 EOF
 chmod 755 "$fake_root/uname"
-for tool in realpath stat sha256sum flock mv sort tar; do
-    ln -s "$(command -v "$tool")" "$fake_root/g$tool"
-done
+ln -s "$(command -v "$CODEX_HOST_REALPATH")" "$fake_root/grealpath"
+ln -s "$(command -v "$CODEX_HOST_STAT")" "$fake_root/gstat"
+ln -s "$(command -v "$CODEX_HOST_SHA256SUM")" "$fake_root/gsha256sum"
+ln -s "$(command -v "$CODEX_HOST_FLOCK")" "$fake_root/flock"
+ln -s "$(command -v "$CODEX_HOST_MV")" "$fake_root/gmv"
+ln -s "$(command -v "$CODEX_HOST_SORT")" "$fake_root/gsort"
+ln -s "$(command -v "$CODEX_HOST_TAR")" "$fake_root/gtar"
 
 darwin_output="$(
     PATH="$fake_root:$REAL_PATH" \
@@ -168,9 +173,12 @@ pass "missing Darwin tool diagnostic"
 incompatible_root="$TEST_ROOT/fake-incompatible"
 mkdir -p "$incompatible_root"
 cp "$fake_root/uname" "$incompatible_root/uname"
-for tool in stat sha256sum flock mv sort tar; do
-    ln -s "$(command -v "$tool")" "$incompatible_root/g$tool"
-done
+ln -s "$(command -v "$CODEX_HOST_STAT")" "$incompatible_root/gstat"
+ln -s "$(command -v "$CODEX_HOST_SHA256SUM")" "$incompatible_root/gsha256sum"
+ln -s "$(command -v "$CODEX_HOST_FLOCK")" "$incompatible_root/flock"
+ln -s "$(command -v "$CODEX_HOST_MV")" "$incompatible_root/gmv"
+ln -s "$(command -v "$CODEX_HOST_SORT")" "$incompatible_root/gsort"
+ln -s "$(command -v "$CODEX_HOST_TAR")" "$incompatible_root/gtar"
 cat >"$incompatible_root/grealpath" <<'EOF'
 #!/usr/bin/env bash
 exit 1
