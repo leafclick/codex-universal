@@ -39,12 +39,17 @@ bash -n "$INSTALLER"
 
 help_output="$($INSTALLER --help)"
 [[ "$help_output" == *"Usage:"* ]] || fail "installer help is missing"
-[[ "$help_output" == *"--list"* && "$help_output" == *"--rollback"* ]] ||
+[[ "$help_output" == *"--list"* && "$help_output" == *"--rollback"* &&
+   "$help_output" == *"--remove"* ]] ||
     fail "installer lifecycle help is missing"
 run_fail "unknown installer argument" "$INSTALLER" --unknown
 run_fail "missing prefix argument" "$INSTALLER" --prefix
 run_fail "missing rollback argument" "$INSTALLER" --rollback
+run_fail "missing remove argument" "$INSTALLER" --remove
 run_fail "conflicting lifecycle actions" "$INSTALLER" --list --check
+run_fail "conflicting remove action" "$INSTALLER" --remove absent --list
+run_fail "invalid check dry-run" "$INSTALLER" --check --dry-run
+run_fail "duplicate dry-run" "$INSTALLER" --dry-run --dry-run
 run_fail "relative prefix" "$INSTALLER" --prefix relative
 run_fail "root prefix" "$INSTALLER" --prefix /
 run_fail "source-overlap prefix" "$INSTALLER" --prefix "$ROOT/.codex-install"
@@ -66,6 +71,9 @@ run_fail "missing installation list" "$INSTALLER" --prefix "$missing_list" --lis
 missing_rollback="$TEST_ROOT/missing-rollback"
 run_fail "missing installation rollback" "$INSTALLER" --prefix "$missing_rollback" --rollback absent
 [[ ! -e "$missing_rollback" ]] || fail "missing --rollback created its prefix"
+missing_remove="$TEST_ROOT/missing-remove"
+run_fail "missing installation removal" "$INSTALLER" --prefix "$missing_remove" --remove absent
+[[ ! -e "$missing_remove" ]] || fail "missing --remove created its prefix"
 
 collision_prefix="$TEST_ROOT/collision"
 mkdir -p "$collision_prefix/bin"
@@ -199,6 +207,67 @@ kill -0 "$list_pid" 2>/dev/null || fail "list did not wait for installer lock"
 exec 8>&-
 wait "$list_pid" || fail "locked list did not complete after lock release"
 pass "bundle list, rollback validation, tamper protection, and lock serialization"
+
+hidden_dir="$rollback_root/.unrelated-hidden"
+mkdir "$hidden_dir"
+printf 'keep me\n' >"$hidden_dir/marker"
+remove_before_list="$($rollback_installer --prefix "$rollback_prefix" --list)"
+remove_before_current="$(readlink "$rollback_root/current")"
+run_fail "active bundle removal" "$rollback_installer" --prefix "$rollback_prefix" --remove "$first_id" --dry-run
+for dry_order in '--dry-run --remove' '--remove --dry-run'; do
+    if [[ "$dry_order" == '--dry-run --remove' ]]; then
+        dry_output="$($rollback_installer --prefix "$rollback_prefix" --dry-run --remove "$second_id")"
+    else
+        dry_output="$($rollback_installer --prefix "$rollback_prefix" --remove "$second_id" --dry-run)"
+    fi
+    [[ "$dry_output" == *"Would remove inactive"* ]] || fail "remove dry-run output is missing"
+done
+[[ "$($rollback_installer --prefix "$rollback_prefix" --list)" == "$remove_before_list" ]] || fail "remove dry-run changed the bundle tree"
+[[ "$(readlink "$rollback_root/current")" == "$remove_before_current" ]] || fail "remove dry-run changed current"
+[[ "$(cat "$hidden_dir/marker")" == 'keep me' ]] || fail "remove dry-run changed unrelated hidden state"
+second_manifest_hash="$(codex_host_sha256_file "$rollback_root/$second_id/MANIFEST")"
+
+run_fail "missing bundle removal" "$rollback_installer" --prefix "$rollback_prefix" --remove missing-bundle
+run_fail "traversal bundle removal" "$rollback_installer" --prefix "$rollback_prefix" --remove ../"$second_id"
+ln -s "$second_id" "$rollback_root/remove-symlink-id"
+run_fail "symlink bundle removal" "$rollback_installer" --prefix "$rollback_prefix" --remove remove-symlink-id
+rm -f "$rollback_root/remove-symlink-id"
+printf 'tampered removal bundle\n' >>"$rollback_root/$second_id/codex-push"
+run_fail "tampered bundle removal" "$rollback_installer" --prefix "$rollback_prefix" --remove "$second_id"
+[[ "$(readlink "$rollback_root/current")" == "$remove_before_current" ]] || fail "rejected removal changed current"
+cp "$TEST_ROOT/second-codex-push" "$rollback_root/$second_id/codex-push"
+
+fake_rm_bin="$TEST_ROOT/fake-rm"
+mkdir "$fake_rm_bin"
+cat >"$fake_rm_bin/rm" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+target="${*: -1}"
+if [[ "$target" == */bundle ]]; then
+    "$CODEX_TEST_REAL_RM" -f "$target/codex-push"
+    exit 1
+fi
+exec "$CODEX_TEST_REAL_RM" "$@"
+EOF
+chmod 755 "$fake_rm_bin/rm"
+run_fail "injected removal failure" env PATH="$fake_rm_bin:$PATH" CODEX_TEST_REAL_RM="$(command -v rm)" \
+    "$rollback_installer" --prefix "$rollback_prefix" --remove "$second_id"
+removal_tombstone=""
+shopt -s nullglob
+for path in "$rollback_root/.remove.${second_id}."*; do removal_tombstone="$path"; done
+shopt -u nullglob
+[[ -n "$removal_tombstone" && -d "$removal_tombstone/bundle" &&
+   -f "$removal_tombstone/REMOVE-MANIFEST" ]] || fail "failed removal did not preserve tombstone"
+tombstone_manifest_hash="$(codex_host_sha256_file "$removal_tombstone/bundle/MANIFEST")"
+[[ "$tombstone_manifest_hash" == "$second_manifest_hash" &&
+   ! -e "$removal_tombstone/bundle/codex-push" ]] || fail "injected removal did not leave a partial retry fixture"
+[[ "$(readlink "$rollback_root/current")" == "$remove_before_current" ]] || fail "failed removal changed current"
+"$rollback_installer" --prefix "$rollback_prefix" --remove "$second_id" >/dev/null
+[[ ! -e "$rollback_root/$second_id" ]] || fail "successful removal retained the bundle"
+[[ ! -e "$removal_tombstone" ]] || fail "successful retry retained tombstone"
+[[ "$(cat "$hidden_dir/marker")" == 'keep me' ]] || fail "successful removal changed unrelated hidden state"
+"$rollback_prefix/bin/codex-push" --help >/dev/null || fail "current wrapper failed after removing inactive bundle"
+pass "bundle removal validation, dry-runs, tombstone recovery, and hidden-state preservation"
 
 [[ "$CODEX_HOST_BACKEND" == gnu-linux ]] || exit 0
 darwin_bin="$TEST_ROOT/darwin-bin"

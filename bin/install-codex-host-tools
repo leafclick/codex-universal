@@ -14,6 +14,7 @@ Usage:
   install-codex-host-tools [--prefix PATH] --check
   install-codex-host-tools [--prefix PATH] --list
   install-codex-host-tools [--prefix PATH] --rollback BUNDLE_ID
+  install-codex-host-tools [--prefix PATH] --remove BUNDLE_ID [--dry-run]
   install-codex-host-tools --help
 
 Install the codex-universal host commands beneath PATH (default: $HOME/.local).
@@ -21,16 +22,19 @@ Install the codex-universal host commands beneath PATH (default: $HOME/.local).
 --check verifies that the current installation exactly matches this checkout.
 --list verifies and lists all retained bundles without modifying the installation.
 --rollback verifies and activates a retained bundle without deleting newer bundles.
+--remove verifies and removes an inactive bundle; --dry-run only describes it.
 USAGE
 }
 
 PREFIX="${HOME:?HOME must be set}/.local"
 MODE=install
 MODE_SELECTED=false
+DRY_RUN=false
 ROLLBACK_ID=""
+REMOVE_ID=""
 
 select_mode() {
-    $MODE_SELECTED && die "only one of --check, --dry-run, --list, or --rollback may be used"
+    $MODE_SELECTED && die "only one of --check, --list, --rollback, or --remove may be used"
     MODE="$1"
     MODE_SELECTED=true
 }
@@ -47,7 +51,8 @@ while (($#)); do
             shift
             ;;
         --dry-run)
-            select_mode dry-run
+            ! $DRY_RUN || die "--dry-run may be specified only once"
+            DRY_RUN=true
             shift
             ;;
         --list)
@@ -58,6 +63,12 @@ while (($#)); do
             (($# >= 2)) || die "--rollback requires a bundle ID"
             select_mode rollback
             ROLLBACK_ID="$2"
+            shift 2
+            ;;
+        --remove)
+            (($# >= 2)) || die "--remove requires a bundle ID"
+            select_mode remove
+            REMOVE_ID="$2"
             shift 2
             ;;
         -h|--help)
@@ -75,6 +86,14 @@ while (($#)); do
     esac
 done
 
+if $DRY_RUN; then
+    case "$MODE" in
+        install) MODE=dry-run ;;
+        remove) ;;
+        *) die "--dry-run may be used only with installation or --remove" ;;
+    esac
+fi
+
 SCRIPT_DIR="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 SOURCE_ROOT="$(cd -P -- "$SCRIPT_DIR/.." && pwd -P)"
 HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
@@ -82,7 +101,7 @@ HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
 # shellcheck source=bin/codex-host-compat.bash
 source "$HOST_COMPAT" || die "cannot load host compatibility layer: $HOST_COMPAT"
 case "$MODE" in
-    rollback|install|dry-run)
+    rollback|remove|install|dry-run)
         codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
         ;;
     check|list)
@@ -103,7 +122,7 @@ case "$MODE" in
         command -v sort >/dev/null 2>&1 || die "missing command: sort"
         ;;
 esac
-if [[ "$MODE" == install || "$MODE" == rollback ]]; then
+if [[ "$MODE" == install || "$MODE" == rollback || "$MODE" == remove ]]; then
     for command_name in mkdir ln mktemp chmod rm rmdir; do
         command -v "$command_name" >/dev/null 2>&1 || die "missing command: $command_name"
     done
@@ -284,13 +303,13 @@ valid_bundle_id() {
 
 verify_retained_bundle() {
     local directory="$1"
-    local directory_id key value extra backend safe_version expected_id
+    local directory_id="${2:-${directory##*/}}"
+    local key value extra backend safe_version expected_id
     local name mode digest actual_mode actual_digest rows bundle_hash entries
     local -a lines=() expected_files=() paths=()
     local index
 
     [[ -d "$directory" && ! -L "$directory" ]] || die "missing or unsafe retained bundle: $directory"
-    directory_id="${directory##*/}"
     valid_bundle_id "$directory_id" || die "invalid retained bundle ID: $directory_id"
     [[ -f "$directory/MANIFEST" && ! -L "$directory/MANIFEST" ]] ||
         die "missing or unsafe retained bundle manifest: $directory/MANIFEST"
@@ -434,6 +453,8 @@ read_current_bundle_id() {
 TEMP_BUNDLE=""
 TEMP_LINK_DIR=""
 TEMP_WRAPPER=""
+TEMP_REMOVAL_DIR=""
+REMOVAL_MARKER=REMOVE-MANIFEST
 cleanup() {
     [[ -z "$TEMP_WRAPPER" || ! -e "$TEMP_WRAPPER" ]] || rm -f "$TEMP_WRAPPER"
     if [[ -n "$TEMP_LINK_DIR" && -d "$TEMP_LINK_DIR" && ! -L "$TEMP_LINK_DIR" ]]; then
@@ -441,6 +462,10 @@ cleanup() {
         rmdir "$TEMP_LINK_DIR"
     fi
     [[ -z "$TEMP_BUNDLE" || ! -d "$TEMP_BUNDLE" ]] || rm -rf "$TEMP_BUNDLE"
+    if [[ -n "$TEMP_REMOVAL_DIR" && -d "$TEMP_REMOVAL_DIR" && ! -L "$TEMP_REMOVAL_DIR" ]]; then
+        rm -f "$TEMP_REMOVAL_DIR/$REMOVAL_MARKER"
+        rmdir "$TEMP_REMOVAL_DIR" 2>/dev/null || true
+    fi
 }
 
 switch_current_bundle() {
@@ -451,6 +476,53 @@ switch_current_bundle() {
     codex_host_atomic_replace "$TEMP_LINK_DIR/current" "$CURRENT_LINK" || die "cannot switch current bundle"
     rmdir "$TEMP_LINK_DIR"
     TEMP_LINK_DIR=""
+}
+
+REMOVAL_TOMBSTONES=()
+removal_marker_content() {
+    local bundle_id="$1"
+    local tombstone_name="$2"
+
+    printf 'format\t1\n'
+    printf 'bundle\t%s\n' "$bundle_id"
+    printf 'tombstone\t%s\n' "$tombstone_name"
+}
+
+collect_removal_tombstones() {
+    local bundle_id="$1"
+    local tombstone marker expected_marker actual_marker entry entry_name
+    local -a entries=()
+
+    REMOVAL_TOMBSTONES=()
+    shopt -s nullglob
+    for tombstone in "$INSTALL_ROOT/.remove.${bundle_id}."*; do
+        [[ -d "$tombstone" && ! -L "$tombstone" ]] ||
+            die "unsafe removal tombstone: $tombstone"
+        [[ "$(codex_host_file_mode "$tombstone")" == 700 ]] ||
+            die "incorrect removal tombstone mode: $tombstone"
+        marker="$tombstone/$REMOVAL_MARKER"
+        [[ -f "$marker" && ! -L "$marker" ]] || die "missing or unsafe removal marker: $tombstone"
+        [[ "$(codex_host_file_mode "$marker")" == 600 &&
+           "$(codex_host_file_link_count "$marker")" == 1 ]] ||
+            die "unsafe removal marker metadata: $tombstone"
+        expected_marker="$(removal_marker_content "$bundle_id" "${tombstone##*/}")"
+        actual_marker="$(cat "$marker")" || die "cannot read removal marker: $tombstone"
+        [[ "$actual_marker" == "$expected_marker" ]] || die "invalid removal marker: $tombstone"
+        shopt -s dotglob
+        entries=("$tombstone"/*)
+        shopt -u dotglob
+        for entry in "${entries[@]}"; do
+            entry_name="${entry##*/}"
+            [[ "$entry_name" == "$REMOVAL_MARKER" || "$entry_name" == bundle ]] ||
+                die "invalid removal tombstone contents: $tombstone"
+        done
+        if [[ -e "$tombstone/bundle" || -L "$tombstone/bundle" ]]; then
+            [[ -d "$tombstone/bundle" && ! -L "$tombstone/bundle" ]] ||
+                die "unsafe removal tombstone bundle: $tombstone"
+        fi
+        REMOVAL_TOMBSTONES+=("$tombstone")
+    done
+    shopt -u nullglob
 }
 
 if [[ "$MODE" == dry-run ]]; then
@@ -513,6 +585,63 @@ if [[ "$MODE" == rollback ]]; then
     trap cleanup EXIT
     switch_current_bundle "$ROLLBACK_ID"
     printf 'Rolled back codex-universal host tools to %s\n' "$ROLLBACK_ID"
+    exit 0
+fi
+
+if [[ "$MODE" == remove ]]; then
+    valid_bundle_id "$REMOVE_ID" || die "invalid removal bundle ID: $REMOVE_ID"
+    lock_existing_installation
+    read_current_bundle_id
+    [[ "$CURRENT_ID" != "$REMOVE_ID" ]] ||
+        die "refusing to remove the current bundle; roll back to another bundle first"
+    verify_retained_bundle "$INSTALL_ROOT/$CURRENT_ID"
+
+    collect_removal_tombstones "$REMOVE_ID"
+    remove_directory="$INSTALL_ROOT/$REMOVE_ID"
+    remove_live=false
+    if [[ -e "$remove_directory" || -L "$remove_directory" ]]; then
+        verify_retained_bundle "$remove_directory"
+        remove_live=true
+    elif ((${#REMOVAL_TOMBSTONES[@]} == 0)); then
+        die "retained bundle does not exist: $REMOVE_ID"
+    fi
+
+    if $DRY_RUN; then
+        printf 'Would remove inactive codex-universal bundle: %s\n' "$REMOVE_ID"
+        if ((${#REMOVAL_TOMBSTONES[@]} > 0)); then
+            printf 'Pending removal tombstones: %s\n' "${#REMOVAL_TOMBSTONES[@]}"
+        fi
+        exit 0
+    fi
+
+    if $remove_live; then
+        trap cleanup EXIT
+        TEMP_REMOVAL_DIR="$(mktemp -d "$INSTALL_ROOT/.remove.${REMOVE_ID}.XXXXXXXX")"
+        chmod 700 "$TEMP_REMOVAL_DIR"
+        removal_marker_content "$REMOVE_ID" "${TEMP_REMOVAL_DIR##*/}" \
+            >"$TEMP_REMOVAL_DIR/$REMOVAL_MARKER"
+        chmod 600 "$TEMP_REMOVAL_DIR/$REMOVAL_MARKER"
+        codex_host_atomic_replace "$remove_directory" "$TEMP_REMOVAL_DIR/bundle" ||
+            die "cannot move retained bundle into removal tombstone: $REMOVE_ID"
+        REMOVAL_TOMBSTONES+=("$TEMP_REMOVAL_DIR")
+        TEMP_REMOVAL_DIR=""
+    fi
+
+    for removal_tombstone in "${REMOVAL_TOMBSTONES[@]}"; do
+        if [[ -e "$removal_tombstone/bundle" || -L "$removal_tombstone/bundle" ]]; then
+            if ! rm -rf "$removal_tombstone/bundle"; then
+                die "cannot delete tombstoned bundle; preserved for recovery: $removal_tombstone"
+            fi
+        fi
+        [[ ! -e "$removal_tombstone/bundle" && ! -L "$removal_tombstone/bundle" ]] ||
+            die "tombstoned bundle still exists: $removal_tombstone"
+        if ! rm -f "$removal_tombstone/$REMOVAL_MARKER" || ! rmdir "$removal_tombstone"; then
+            die "cannot delete removal tombstone; preserved for recovery: $removal_tombstone"
+        fi
+        [[ ! -e "$removal_tombstone" && ! -L "$removal_tombstone" ]] ||
+            die "removal tombstone still exists: $removal_tombstone"
+    done
+    printf 'Removed inactive codex-universal bundle: %s\n' "$REMOVE_ID"
     exit 0
 fi
 
