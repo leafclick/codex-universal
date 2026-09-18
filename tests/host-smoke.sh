@@ -75,6 +75,7 @@ git -C "$ROOT" diff --cached --check
 
 for script in \
     "$ROOT/docker-build.sh" \
+    "$ROOT/bin/install-codex-host-tools" \
     "$ROOT/bin/codex-host-compat.bash" \
     "$ROOT/bin/run-codex" \
     "$ROOT/bin/setup-codex-host-security" \
@@ -96,6 +97,7 @@ for script in \
     "$ROOT/scripts/update-tool-versions" \
     "$ROOT/tests/host-smoke-sync.sh" \
     "$ROOT/tests/host-smoke-collab.sh" \
+    "$ROOT/tests/host-smoke-install.sh" \
     "$ROOT/tests/host-smoke-compat.sh" \
     "$ROOT/tests/fixtures/host-smoke-image.sh" \
     "$ROOT/tests/fixtures/host-smoke-image-phase.sh" \
@@ -2933,6 +2935,8 @@ pass "sanitized Git image source metadata"
 
 activity "host utility compatibility contract"
 "$ROOT/tests/host-smoke-compat.sh"
+activity "host tool installer"
+"$ROOT/tests/host-smoke-install.sh"
 activity "snapshot synchronization state machine"
 "$ROOT/tests/host-smoke-sync.sh"
 activity "lane collaboration mailbox"

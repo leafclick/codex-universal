@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 022
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'USAGE'
+Usage:
+  install-codex-host-tools [--prefix PATH] [--dry-run]
+  install-codex-host-tools [--prefix PATH] --check
+  install-codex-host-tools --help
+
+Install the codex-universal host commands beneath PATH (default: $HOME/.local).
+--dry-run validates and describes an installation without writing anything.
+--check verifies that the current installation exactly matches this checkout.
+USAGE
+}
+
+PREFIX="${HOME:?HOME must be set}/.local"
+MODE=install
+
+while (($#)); do
+    case "$1" in
+        --prefix)
+            (($# >= 2)) || die "--prefix requires a path"
+            PREFIX="$2"
+            shift 2
+            ;;
+        --check)
+            [[ "$MODE" == install ]] || die "--check and --dry-run are mutually exclusive"
+            MODE=check
+            shift
+            ;;
+        --dry-run)
+            [[ "$MODE" == install ]] || die "--check and --dry-run are mutually exclusive"
+            MODE=dry-run
+            shift
+            ;;
+        -h|--help)
+            (($# == 1)) || die "--help takes no other arguments"
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            (($# == 0)) || die "unexpected argument: $1"
+            ;;
+        *)
+            die "unknown option or argument: $1"
+            ;;
+    esac
+done
+
+SCRIPT_DIR="$(cd -P -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+SOURCE_ROOT="$(cd -P -- "$SCRIPT_DIR/.." && pwd -P)"
+HOST_COMPAT="$SCRIPT_DIR/codex-host-compat.bash"
+[[ -r "$HOST_COMPAT" ]] || die "missing host compatibility layer: $HOST_COMPAT"
+# shellcheck source=bin/codex-host-compat.bash
+source "$HOST_COMPAT" || die "cannot load host compatibility layer: $HOST_COMPAT"
+codex_host_require_capabilities path stat checksum lock atomic-replace || exit 1
+
+for command_name in git mkdir install ln readlink cat dirname mktemp chmod rm rmdir; do
+    command -v "$command_name" >/dev/null 2>&1 || die "missing command: $command_name"
+done
+
+[[ "$PREFIX" == /* ]] || die "installation prefix must be an absolute path: $PREFIX"
+reject_symlink_components() {
+    local path="$1"
+    local rest="${path#/}"
+    local component current=""
+    local old_ifs="$IFS"
+
+    IFS=/
+    # Intentional word splitting walks each absolute-path component.
+    for component in $rest; do
+        [[ -n "$component" ]] || continue
+        current="$current/$component"
+        [[ ! -L "$current" ]] || die "symlink path component is not allowed: $current"
+    done
+    IFS="$old_ifs"
+}
+
+[[ ! -L "$PREFIX" ]] || die "installation prefix must not be a symlink: $PREFIX"
+PREFIX="$(codex_host_path_allow_missing "$PREFIX")" || die "cannot canonicalize prefix: $PREFIX"
+reject_symlink_components "$PREFIX"
+[[ "$PREFIX" != / ]] || die "refusing to use the filesystem root as the installation prefix"
+
+case "$PREFIX/" in
+    "$SOURCE_ROOT/"* ) die "installation prefix overlaps the source checkout: $PREFIX" ;;
+esac
+case "$SOURCE_ROOT/" in
+    "$PREFIX/"* ) die "installation prefix contains the source checkout: $PREFIX" ;;
+esac
+
+git_root="$(git -C "$SOURCE_ROOT" rev-parse --show-toplevel 2>/dev/null)" ||
+    die "source directory is not a Git checkout: $SOURCE_ROOT"
+git_root="$(codex_host_path_existing "$git_root")" || die "cannot resolve Git checkout root"
+[[ "$git_root" == "$SOURCE_ROOT" ]] ||
+    die "installer must be run from the codex-universal Git checkout root"
+REVISION="$(git -C "$SOURCE_ROOT" rev-parse HEAD 2>/dev/null)" || die "cannot read Git revision"
+VERSION="$(git -C "$SOURCE_ROOT" describe --always --tags 2>/dev/null)" ||
+    die "cannot derive Git version"
+[[ "$REVISION" =~ ^[0-9a-fA-F]{40}$ ]] || die "Git returned an invalid full revision"
+
+case "$CODEX_HOST_BACKEND" in
+    gnu-linux)
+        FILES=(
+            run-codex
+            setup-codex-idea
+            codex-push
+            codex-pull
+            codex-collab
+            codex-host-compat.bash
+            codex-sync-lib
+            run-codex-doctor.bash
+        )
+        WRAPPERS=(run-codex setup-codex-idea codex-push codex-pull codex-collab)
+        ;;
+    darwin-gnu)
+        FILES=(codex-push codex-pull codex-collab codex-host-compat.bash codex-sync-lib)
+        WRAPPERS=(codex-push codex-pull codex-collab)
+        ;;
+    *)
+        die "unsupported compatibility backend: $CODEX_HOST_BACKEND"
+        ;;
+esac
+ALL_WRAPPERS=(run-codex setup-codex-idea codex-push codex-pull codex-collab)
+
+file_mode() {
+    case "$1" in
+        run-codex|setup-codex-idea) printf '755\n' ;;
+        codex-push|codex-pull|codex-collab) printf '700\n' ;;
+        codex-sync-lib) printf '600\n' ;;
+        codex-host-compat.bash|run-codex-doctor.bash) printf '644\n' ;;
+        *) die "no installation mode is defined for $1" ;;
+    esac
+}
+
+wrapper_mode() {
+    case "$1" in
+        run-codex|setup-codex-idea) printf '755\n' ;;
+        codex-push|codex-pull|codex-collab) printf '700\n' ;;
+        *) die "no wrapper mode is defined for $1" ;;
+    esac
+}
+
+bundle_rows() {
+    local name mode digest
+
+    printf 'backend\t%s\n' "$CODEX_HOST_BACKEND"
+    for name in "${FILES[@]}"; do
+        [[ -f "$SCRIPT_DIR/$name" && ! -L "$SCRIPT_DIR/$name" ]] ||
+            die "missing or unsafe source file: $SCRIPT_DIR/$name"
+        mode="$(file_mode "$name")"
+        digest="$(codex_host_sha256_file "$SCRIPT_DIR/$name")" || die "cannot hash source file: $name"
+        printf 'file\t%s\t%s\t%s\n' "$mode" "$digest" "$name"
+    done
+}
+
+BUNDLE_HASH="$(bundle_rows | codex_host_sha256_stdin)" || die "cannot compute bundle hash"
+SAFE_VERSION="${VERSION//[^A-Za-z0-9._-]/-}"
+SAFE_VERSION="${SAFE_VERSION:0:80}"
+BUNDLE_ID="${SAFE_VERSION}-${CODEX_HOST_BACKEND}-${BUNDLE_HASH:0:16}"
+INSTALL_ROOT="$PREFIX/libexec/codex-universal"
+BUNDLE_DIR="$INSTALL_ROOT/$BUNDLE_ID"
+CURRENT_LINK="$INSTALL_ROOT/current"
+BIN_DIR="$PREFIX/bin"
+
+manifest_content() {
+    printf 'format\t1\n'
+    printf 'bundle\t%s\n' "$BUNDLE_ID"
+    printf 'version\t%s\n' "$VERSION"
+    printf 'revision\t%s\n' "$REVISION"
+    bundle_rows
+}
+
+wrapper_content() {
+    local name="$1"
+    cat <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+SELF_DIR="\$(cd -P -- "\$(dirname "\${BASH_SOURCE[0]}")" && pwd -P)"
+CURRENT="\$SELF_DIR/../libexec/codex-universal/current"
+BUNDLE_DIR="\$(cd -P -- "\$CURRENT" && pwd -P)" || {
+    printf 'ERROR: codex-universal installation is missing or invalid: %s\\n' "\$CURRENT" >&2
+    exit 1
+}
+exec "\$BUNDLE_DIR/$name" "\$@"
+EOF
+}
+
+verify_bundle() {
+    local directory="$1"
+    local name expected_mode actual_mode expected_hash actual_hash
+    local expected_manifest actual_manifest entries expected_entries
+
+    [[ -d "$directory" && ! -L "$directory" ]] || die "missing or unsafe bundle directory: $directory"
+    expected_manifest="$(manifest_content)"
+    [[ -f "$directory/MANIFEST" && ! -L "$directory/MANIFEST" ]] ||
+        die "missing or unsafe bundle manifest: $directory/MANIFEST"
+    actual_manifest="$(cat "$directory/MANIFEST")" || die "cannot read bundle manifest"
+    [[ "$actual_manifest" == "$expected_manifest" ]] || die "bundle manifest does not match this checkout"
+    [[ "$(codex_host_file_mode "$directory/MANIFEST")" == 644 ]] || die "incorrect mode for bundle manifest"
+
+    for name in "${FILES[@]}"; do
+        [[ -f "$directory/$name" && ! -L "$directory/$name" ]] || die "missing or unsafe bundle file: $name"
+        expected_mode="$(file_mode "$name")"
+        actual_mode="$(codex_host_file_mode "$directory/$name")"
+        [[ "$actual_mode" == "$expected_mode" ]] || die "incorrect mode for bundle file $name: $actual_mode"
+        expected_hash="$(codex_host_sha256_file "$SCRIPT_DIR/$name")"
+        actual_hash="$(codex_host_sha256_file "$directory/$name")"
+        [[ "$actual_hash" == "$expected_hash" ]] || die "content mismatch for bundle file: $name"
+    done
+
+    entries="$(
+        shopt -s nullglob dotglob
+        paths=("$directory"/*)
+        printf '%s\n' "${#paths[@]}"
+    )"
+    expected_entries=$((${#FILES[@]} + 1))
+    [[ "$entries" == "$expected_entries" ]] || die "bundle contains unexpected entries: $directory"
+}
+
+verify_wrappers() {
+    local name expected_name expected_hash actual_hash actual_mode expected
+
+    for name in "${WRAPPERS[@]}"; do
+        [[ -f "$BIN_DIR/$name" && ! -L "$BIN_DIR/$name" ]] || die "missing or unsafe command wrapper: $BIN_DIR/$name"
+        actual_mode="$(codex_host_file_mode "$BIN_DIR/$name")"
+        [[ "$actual_mode" == "$(wrapper_mode "$name")" ]] ||
+            die "incorrect wrapper mode for $name: $actual_mode"
+        expected_hash="$(wrapper_content "$name" | codex_host_sha256_stdin)"
+        actual_hash="$(codex_host_sha256_file "$BIN_DIR/$name")"
+        [[ "$actual_hash" == "$expected_hash" ]] || die "wrapper content mismatch: $BIN_DIR/$name"
+    done
+
+    for name in "${ALL_WRAPPERS[@]}"; do
+        expected=false
+        for expected_name in "${WRAPPERS[@]}"; do
+            if [[ "$name" == "$expected_name" ]]; then
+                expected=true
+                break
+            fi
+        done
+        if ! $expected && [[ -e "$BIN_DIR/$name" || -L "$BIN_DIR/$name" ]]; then
+            die "unsupported wrapper is present for $CODEX_HOST_BACKEND: $BIN_DIR/$name"
+        fi
+    done
+}
+
+preflight_wrappers() {
+    local name expected_name expected=false expected_hash actual_hash actual_mode
+
+    for name in "${ALL_WRAPPERS[@]}"; do
+        expected=false
+        for expected_name in "${WRAPPERS[@]}"; do
+            if [[ "$name" == "$expected_name" ]]; then
+                expected=true
+                break
+            fi
+        done
+
+        if ! $expected; then
+            [[ ! -e "$BIN_DIR/$name" && ! -L "$BIN_DIR/$name" ]] ||
+                die "unsupported wrapper already exists for $CODEX_HOST_BACKEND: $BIN_DIR/$name"
+            continue
+        fi
+
+        [[ ! -L "$BIN_DIR/$name" ]] || die "refusing to replace symlink wrapper: $BIN_DIR/$name"
+        [[ -e "$BIN_DIR/$name" ]] || continue
+        [[ -f "$BIN_DIR/$name" ]] || die "refusing to replace non-file wrapper: $BIN_DIR/$name"
+        expected_hash="$(wrapper_content "$name" | codex_host_sha256_stdin)"
+        actual_hash="$(codex_host_sha256_file "$BIN_DIR/$name")"
+        actual_mode="$(codex_host_file_mode "$BIN_DIR/$name")"
+        [[ "$actual_hash" == "$expected_hash" && "$actual_mode" == "$(wrapper_mode "$name")" ]] ||
+            die "refusing to replace an unmanaged command: $BIN_DIR/$name"
+    done
+}
+
+if [[ "$MODE" == dry-run ]]; then
+    printf 'Would install codex-universal %s (%s)\n' "$VERSION" "$REVISION"
+    printf 'Backend: %s\nPrefix: %s\nBundle: %s\n' "$CODEX_HOST_BACKEND" "$PREFIX" "$BUNDLE_DIR"
+    printf 'Commands:'
+    printf ' %s' "${WRAPPERS[@]}"
+    printf '\n'
+    exit 0
+fi
+
+if [[ "$MODE" == check ]]; then
+    reject_symlink_components "$INSTALL_ROOT"
+    reject_symlink_components "$BIN_DIR"
+    [[ -L "$CURRENT_LINK" ]] || die "current bundle link is missing or is not a symlink: $CURRENT_LINK"
+    [[ "$(readlink "$CURRENT_LINK")" == "$BUNDLE_ID" ]] || die "current bundle does not match this checkout"
+    verify_bundle "$BUNDLE_DIR"
+    verify_wrappers
+    printf 'codex-universal host tools are valid: %s\n' "$BUNDLE_ID"
+    exit 0
+fi
+
+reject_symlink_components "$INSTALL_ROOT"
+reject_symlink_components "$BIN_DIR"
+[[ ! -e "$CURRENT_LINK" || -L "$CURRENT_LINK" ]] || die "refusing to replace non-symlink current path: $CURRENT_LINK"
+preflight_wrappers
+mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
+reject_symlink_components "$INSTALL_ROOT"
+reject_symlink_components "$BIN_DIR"
+
+LOCK_FILE="$INSTALL_ROOT/.install.lock"
+[[ ! -L "$LOCK_FILE" ]] || die "refusing to use symlink as install lock: $LOCK_FILE"
+exec 9>"$LOCK_FILE"
+codex_host_lock_exclusive 9 || die "cannot lock host-tool installation: $LOCK_FILE"
+preflight_wrappers
+
+TEMP_BUNDLE=""
+TEMP_LINK_DIR=""
+TEMP_WRAPPER=""
+cleanup() {
+    [[ -z "$TEMP_WRAPPER" || ! -e "$TEMP_WRAPPER" ]] || rm -f "$TEMP_WRAPPER"
+    if [[ -n "$TEMP_LINK_DIR" && -d "$TEMP_LINK_DIR" && ! -L "$TEMP_LINK_DIR" ]]; then
+        rm -f "$TEMP_LINK_DIR/current"
+        rmdir "$TEMP_LINK_DIR"
+    fi
+    [[ -z "$TEMP_BUNDLE" || ! -d "$TEMP_BUNDLE" ]] || rm -rf "$TEMP_BUNDLE"
+}
+trap cleanup EXIT
+
+if [[ -e "$BUNDLE_DIR" || -L "$BUNDLE_DIR" ]]; then
+    verify_bundle "$BUNDLE_DIR"
+else
+    TEMP_BUNDLE="$(mktemp -d "$INSTALL_ROOT/.bundle.XXXXXXXX")"
+    chmod 755 "$TEMP_BUNDLE"
+    for name in "${FILES[@]}"; do
+        install -m "$(file_mode "$name")" "$SCRIPT_DIR/$name" "$TEMP_BUNDLE/$name"
+    done
+    manifest_content >"$TEMP_BUNDLE/MANIFEST"
+    chmod 644 "$TEMP_BUNDLE/MANIFEST"
+    verify_bundle "$TEMP_BUNDLE"
+    codex_host_atomic_replace "$TEMP_BUNDLE" "$BUNDLE_DIR" || die "cannot publish bundle: $BUNDLE_DIR"
+    TEMP_BUNDLE=""
+fi
+
+# Wrappers contain no version-specific state, so publishing them before current
+# keeps an existing installation usable and makes current the commit point.
+for name in "${WRAPPERS[@]}"; do
+    TEMP_WRAPPER="$(mktemp "$BIN_DIR/.${name}.tmp.XXXXXXXX")"
+    wrapper_content "$name" >"$TEMP_WRAPPER"
+    chmod "$(wrapper_mode "$name")" "$TEMP_WRAPPER"
+    codex_host_atomic_replace "$TEMP_WRAPPER" "$BIN_DIR/$name" || die "cannot publish wrapper: $name"
+    TEMP_WRAPPER=""
+done
+
+TEMP_LINK_DIR="$(mktemp -d "$INSTALL_ROOT/.current.XXXXXXXX")"
+ln -s "$BUNDLE_ID" "$TEMP_LINK_DIR/current"
+codex_host_atomic_replace "$TEMP_LINK_DIR/current" "$CURRENT_LINK" || die "cannot switch current bundle"
+rmdir "$TEMP_LINK_DIR"
+TEMP_LINK_DIR=""
+
+verify_bundle "$BUNDLE_DIR"
+verify_wrappers
+printf 'Installed codex-universal %s (%s)\n' "$VERSION" "$REVISION"
+printf 'Commands: %s\n' "$BIN_DIR"
