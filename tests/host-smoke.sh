@@ -105,6 +105,8 @@ if [[ "$HOST_KERNEL" == Darwin ]]; then
     PATH="$TEST_HOST_BIN:$PATH"
     export PATH
 fi
+HOST_MV="$(command -v mv)"
+HOST_LN="$(command -v ln)"
 
 git -C "$ROOT" diff --check
 git -C "$ROOT" diff --cached --check
@@ -2485,10 +2487,11 @@ mkdir -p "$cli_rollback_bin"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ "${3:-}" == "'$cli_rollback_config'" || "${3:-}" == "'$cli_config/run-codex/lanes/cli-project/rollback-preserve'" ]]; then exit 1; fi' \
-    'exec /bin/mv "$@"' > "$cli_rollback_bin/mv"
+    'exec "${CODEX_TEST_REAL_MV:?}" "$@"' > "$cli_rollback_bin/mv"
 chmod 755 "$cli_rollback_bin/mv"
 cli_rollback_env=(
     "${cli_env[@]}"
+    "CODEX_TEST_REAL_MV=$HOST_MV"
     "PATH=$cli_rollback_bin:$TEST_ROOT/fake-bin:$PATH"
 )
 cli_run_rollback() {
@@ -2549,13 +2552,14 @@ mkdir -p "$cli_signal_bin"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'set -Eeuo pipefail' \
-    '/bin/ln "$@"' \
+    '"${CODEX_TEST_REAL_LN:?}" "$@"' \
     'status=$?' \
     'if ((status == 0)); then kill -TERM "$PPID"; fi' \
     'exit "$status"' > "$cli_signal_bin/ln"
 chmod 755 "$cli_signal_bin/ln"
 cli_signal_env=(
     "${cli_env[@]}"
+    "CODEX_TEST_REAL_LN=$HOST_LN"
     "PATH=$cli_signal_bin:$TEST_ROOT/fake-bin:$PATH"
 )
 cli_run_signal() {
@@ -2595,14 +2599,16 @@ printf '%s\n' \
     'count=$((count + 1))' \
     'printf "%s\\n" "$count" > "'$cli_sparse_bin'/ln-count"' \
     'if [[ "${3##*/}" == config.toml ]]; then : > "${3:?}"; exit 1; fi' \
-    'exec /bin/ln "$@"' > "$cli_sparse_bin/ln"
+    'exec "${CODEX_TEST_REAL_LN:?}" "$@"' > "$cli_sparse_bin/ln"
 printf '%s\n' \
     '#!/usr/bin/env bash' \
     'if [[ "${3:-}" == "'$cli_sparse_config'" ]]; then exit 1; fi' \
-    'exec /bin/mv "$@"' > "$cli_sparse_bin/mv"
+    'exec "${CODEX_TEST_REAL_MV:?}" "$@"' > "$cli_sparse_bin/mv"
 chmod 755 "$cli_sparse_bin/ln" "$cli_sparse_bin/mv"
 cli_sparse_env=(
     "${cli_env[@]}"
+    "CODEX_TEST_REAL_LN=$HOST_LN"
+    "CODEX_TEST_REAL_MV=$HOST_MV"
     "PATH=$cli_sparse_bin:$TEST_ROOT/fake-bin:$PATH"
 )
 cli_run_sparse() {
