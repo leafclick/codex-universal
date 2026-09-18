@@ -80,10 +80,17 @@ depend on those GNU semantics:
 brew install bash coreutils gnu-tar flock jq zstd
 ```
 
-Homebrew installs the GNU utilities with prefixes such as `grealpath`,
-`gstat`, `gsha256sum`, `gmv`, `gsort`, and `gtar`; the compatibility module
-selects those names automatically. The remaining commands used here, including
-`find`, `awk`, `grep`, `hostname`, `lsof`, and `sqlite3`, are supplied by macOS.
+Or install the equivalent ports with MacPorts:
+
+```bash
+sudo port install bash coreutils gnutar flock jq zstd
+```
+
+Both package managers install the required GNU utilities with prefixes such as
+`grealpath`, `gstat`, `gsha256sum`, `gmv`, `gsort`, and `gtar`; the
+compatibility module selects those names automatically. The remaining commands
+used here, including `find`, `awk`, `grep`, `hostname`, `lsof`, and `sqlite3`,
+are supplied by macOS.
 Keep `codex-sync-lib` and
 `codex-host-compat.bash` beside `codex-push`, `codex-pull`, and
 `codex-collab` when installing them:

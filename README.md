@@ -260,7 +260,7 @@ Support is split by host capability:
 | Host | Supported commands | Requirements |
 | --- | --- | --- |
 | GNU/Linux | `run-codex`, `codex-push`, `codex-pull`, `codex-collab`, IDEA integration, and AppArmor setup | Docker and the Linux security stack below |
-| macOS | Standalone `codex-push`, `codex-pull`, and `codex-collab` | Bash 4.1+, Homebrew GNU utilities, `flock`, and the synchronization dependencies in the [sync guide](docs/codex-sync.md#install-required-software) |
+| macOS | Standalone `codex-push`, `codex-pull`, and `codex-collab` | Bash 4.1+, GNU utilities from Homebrew or MacPorts, `flock`, and the synchronization dependencies in the [sync guide](docs/codex-sync.md#install-required-software) |
 
 Building and running the containers, the full launcher, IDEA integration, and
 AppArmor setup require:
@@ -281,7 +281,7 @@ The CUDA profile additionally requires the NVIDIA driver and NVIDIA Container To
 
 The host compatibility layer centralizes utility semantics in
 `bin/codex-host-compat.bash`. Standalone `codex-push`, `codex-pull`, and
-`codex-collab` support macOS with Bash 4.1 or newer and the Homebrew
+`codex-collab` support macOS with Bash 4.1 or newer and the Homebrew or MacPorts
 dependencies documented in the [Codex state synchronization guide](docs/codex-sync.md#install-required-software).
 The full `run-codex` launcher, IDEA integration, and AppArmor setup remain
 GNU/Linux-only; macOS does not provide the required security and container

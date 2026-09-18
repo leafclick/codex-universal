@@ -5,12 +5,13 @@ Contributions should preserve the project's non-root runtime, explicit approval 
 ## Development setup
 
 Use a Debian, Ubuntu, or comparable GNU/Linux host with Bash 4.1 or newer, or
-macOS with Homebrew for standalone synchronization and collaboration work.
+macOS with Homebrew or MacPorts for standalone synchronization and
+collaboration work.
 Install the base requirements from the [README](README.md#host-requirements)
 and the synchronization dependencies from [docs/codex-sync.md](docs/codex-sync.md#install-required-software).
 
 The host compatibility layer is `bin/codex-host-compat.bash`. Its macOS
-backend uses Homebrew GNU utilities for path resolution, metadata, checksums,
+backend uses prefixed GNU utilities for path resolution, metadata, checksums,
 locks, atomic publication, NUL sorting, and canonical tar output. macOS does
 not support the full launcher, IDEA integration, or AppArmor setup.
 
