@@ -1118,6 +1118,7 @@ Install them as a version-coherent bundle with:
 ```bash
 bin/install-codex-host-tools
 bin/install-codex-host-tools --check
+bin/install-codex-host-tools --list
 ```
 
 The default prefix is `~/.local`. Use `--prefix ABSOLUTE_PATH` to select a
@@ -1126,7 +1127,11 @@ writing anything. The installer records the Git revision and content hashes,
 keeps commands and sourced companion modules in one content-addressed,
 versioned bundle, and atomically switches the `current` bundle. Small launchers in
 `PREFIX/bin` resolve that bundle before execution. Previous bundles are
-retained for recovery.
+retained for recovery. `--list` verifies every retained bundle and marks the
+active one. Use `--rollback BUNDLE_ID` to verify and atomically reactivate an
+older bundle for the same operating-system backend; no bundles are deleted.
+The checkout-oriented `--check` continues to report a mismatch while a bundle
+from an older checkout is active.
 
 On GNU/Linux the bundle includes `run-codex`, `setup-codex-idea`, and the
 standalone synchronization and collaboration commands. On macOS it installs
