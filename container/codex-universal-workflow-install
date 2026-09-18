@@ -20,7 +20,9 @@ if [[ "$source_root" != "$default_source_root" ]]; then
     }
     source_root="$(realpath -e -- "$source_root")"
     codex_home="$(realpath -m -- "$codex_home")"
-    [[ "$source_root" == /tmp/* && "$codex_home" == /tmp/* ]] || {
+    test_tmp_root="$(realpath -e -- /tmp)"
+    [[ "$source_root" == "$test_tmp_root/"* &&
+       "$codex_home" == "$test_tmp_root/"* ]] || {
         echo "workflow test source and CODEX_HOME must remain under /tmp" >&2
         exit 2
     }

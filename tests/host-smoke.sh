@@ -5,7 +5,7 @@ export GIT_PAGER=cat
 export PAGER=cat
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-TEST_ROOT="$(mktemp -d)"
+TEST_ROOT="$(mktemp -d /tmp/codex-universal-host-smoke.XXXXXXXX)"
 ACTIVE_TEST_CONTAINER=""
 ACTIVE_TEST_CONTAINER_TOKEN=""
 SUITE_STARTED_AT=$SECONDS
