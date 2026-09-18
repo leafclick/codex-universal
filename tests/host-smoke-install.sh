@@ -19,6 +19,21 @@ run_fail() {
         fail "$label unexpectedly succeeded"
     fi
 }
+assert_exact_bundle_files() {
+    local directory="$1"
+    shift
+    local expected path
+    local -a entries=()
+
+    shopt -s nullglob dotglob
+    entries=("$directory"/*)
+    shopt -u nullglob dotglob
+    [[ "${#entries[@]}" == "$#" ]] || fail "bundle command set is wrong"
+    for expected in "$@"; do
+        path="$directory/$expected"
+        [[ -f "$path" && ! -L "$path" ]] || fail "bundle command set is wrong"
+    done
+}
 
 bash -n "$INSTALLER"
 
@@ -72,11 +87,7 @@ else
     expected_files=(MANIFEST codex-collab codex-host-compat.bash codex-pull codex-push codex-sync-lib)
     expected_wrappers=(codex-collab codex-pull codex-push)
 fi
-actual_files=()
-shopt -s nullglob
-for path in "$bundle_dir"/*; do [[ -f "$path" ]] && actual_files+=("${path##*/}"); done
-shopt -u nullglob
-[[ "${actual_files[*]}" == "${expected_files[*]}" ]] || fail "bundle command set is wrong"
+assert_exact_bundle_files "$bundle_dir" "${expected_files[@]}"
 for file in "${expected_wrappers[@]}"; do
     expected_mode=700
     [[ "$file" == run-codex || "$file" == setup-codex-idea ]] && expected_mode=755
@@ -132,11 +143,7 @@ darwin_prefix="$TEST_ROOT/darwin-install"
 PATH="$darwin_bin:$PATH" "$INSTALLER" --prefix "$darwin_prefix" >/dev/null
 darwin_bundle="$darwin_prefix/libexec/codex-universal/$(readlink "$darwin_prefix/libexec/codex-universal/current")"
 darwin_expected=(MANIFEST codex-collab codex-host-compat.bash codex-pull codex-push codex-sync-lib)
-darwin_actual=()
-shopt -s nullglob
-for path in "$darwin_bundle"/*; do [[ -f "$path" ]] && darwin_actual+=("${path##*/}"); done
-shopt -u nullglob
-[[ "${darwin_actual[*]}" == "${darwin_expected[*]}" ]] || fail "Darwin bundle command set is wrong"
+assert_exact_bundle_files "$darwin_bundle" "${darwin_expected[@]}"
 for file in run-codex setup-codex-idea; do [[ ! -e "$darwin_prefix/bin/$file" ]] || fail "Darwin installed Linux-only command $file"; done
 PATH="$darwin_bin:$PATH" "$INSTALLER" --prefix "$darwin_prefix" --check >/dev/null || fail "Darwin installation check failed"
 pass "Darwin portable command set"
