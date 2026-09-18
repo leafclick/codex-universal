@@ -42,7 +42,7 @@ editor-aware navigation is useful.
 This is the shortest supported setup. Follow the linked detailed sections if a
 step fails or needs customization.
 
-1. Install Docker Engine, Bash, Git, AppArmor, `jq`, `sqlite3`, `socat`, and
+1. Install Docker Engine, Bash 4.1 or newer, Git, AppArmor, `jq`, `sqlite3`, `socat`, and
    `util-linux`. See
    [host requirements](#host-requirements); CUDA users must also complete
    [CUDA host setup](#cuda-host-setup).
@@ -72,6 +72,7 @@ step fails or needs customization.
    install -m 644 bin/run-codex-doctor.bash ~/.local/bin/
    install -m 700 bin/codex-push bin/codex-pull bin/codex-collab ~/.local/bin/
    install -m 600 bin/codex-sync-lib ~/.local/bin/
+   install -m 644 bin/codex-host-compat.bash ~/.local/bin/
    ```
 
 4. Register a Git checkout and start Codex. On a machine without existing Codex
@@ -256,7 +257,7 @@ The CUDA variant additionally contains the NVIDIA CUDA development environment.
 
 Building and running the containers requires:
 
-- Bash
+- GNU/Linux host with Bash 4.1 or newer
 - Docker Engine with an available Docker daemon
 - Git
 - GNU `grep`
@@ -269,6 +270,12 @@ Building and running the containers requires:
 - `sudo` for the one-time AppArmor policy installation
 
 The CUDA profile additionally requires the NVIDIA driver and NVIDIA Container Toolkit. The optional `codex-push` and `codex-pull` commands require more host utilities; see the [Codex state synchronization guide](docs/codex-sync.md#install-required-software).
+
+The first compatibility-layer milestone centralizes host utility semantics in
+`bin/codex-host-compat.bash`, but its only backend currently supports
+GNU/Linux. The synchronization and collaboration commands are the intended
+future portability boundary; the full launcher still requires the Linux
+security stack above. Do not treat macOS or BSD as supported hosts yet.
 
 The synchronization commands run on the host. Installing a utility such as `zstd` inside the Docker image does not make it available to those host commands.
 
@@ -1108,6 +1115,7 @@ install -m 700 bin/codex-push ~/.local/bin/codex-push
 install -m 700 bin/codex-pull ~/.local/bin/codex-pull
 install -m 700 bin/codex-collab ~/.local/bin/codex-collab
 install -m 600 bin/codex-sync-lib ~/.local/bin/codex-sync-lib
+install -m 644 bin/codex-host-compat.bash ~/.local/bin/codex-host-compat.bash
 ```
 
 Keep `run-codex-doctor.bash` beside `run-codex`; it is a sourced companion
@@ -1115,6 +1123,11 @@ module, not a standalone command. When `run-codex` is installed as a symbolic
 link, it resolves the link target and loads the module from that directory.
 Likewise, keep `codex-sync-lib` beside `codex-push` and `codex-pull`; both
 snapshot commands source the shared validation module.
+Keep `codex-host-compat.bash` beside every installed host command that uses
+the compatibility boundary (`run-codex`, `setup-codex-idea`, `codex-push`,
+`codex-pull`, and `codex-collab`); it is a sourced companion module, not a
+standalone command. Repository-local maintenance commands load it directly
+from `bin/`.
 
 Alternatively, `~/bin` can be used if that is already the user's preferred executable directory.
 

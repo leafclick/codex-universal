@@ -43,7 +43,12 @@ Only one machine should actively modify the shared Codex state at a time.
 
 ## Install required software
 
-The synchronization commands require Bash and standard GNU/Linux utilities.
+The synchronization commands require Bash 4.1 or newer and standard
+GNU/Linux utilities. The first host compatibility-layer milestone is
+centralized in `bin/codex-host-compat.bash`, but its only backend currently
+supports GNU/Linux. Synchronization and collaboration are the planned
+portability boundary; macOS and BSD hosts are not supported yet, and the full
+launcher remains Linux-only because of its security requirements.
 The complete host tool set below also includes `jq` and `sqlite3`, which are
 used by `run-codex` session listing and selection. `jq` is also used by the
 optional `setup-codex-idea` command. On Debian, Ubuntu, and related
@@ -89,10 +94,14 @@ mkdir -p ~/.local/bin
 install -m 700 bin/codex-push ~/.local/bin/codex-push
 install -m 700 bin/codex-pull ~/.local/bin/codex-pull
 install -m 600 bin/codex-sync-lib ~/.local/bin/codex-sync-lib
+install -m 644 bin/codex-host-compat.bash ~/.local/bin/codex-host-compat.bash
 ```
 
 Keep `codex-sync-lib` beside both commands. It is their shared validation
 module, not a standalone command.
+
+Keep `codex-host-compat.bash` beside both commands as well. It is their
+host-utility compatibility module, not a standalone command.
 
 ## Configure the snapshot directory
 

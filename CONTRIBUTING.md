@@ -4,7 +4,16 @@ Contributions should preserve the project's non-root runtime, explicit approval 
 
 ## Development setup
 
-Use a Debian, Ubuntu, or comparable GNU/Linux host. Install the base requirements from the [README](README.md#host-requirements) and the synchronization dependencies from [docs/codex-sync.md](docs/codex-sync.md#install-required-software).
+Use a Debian, Ubuntu, or comparable GNU/Linux host with Bash 4.1 or newer.
+Install the base requirements from the [README](README.md#host-requirements)
+and the synchronization dependencies from [docs/codex-sync.md](docs/codex-sync.md#install-required-software).
+
+The first host compatibility-layer milestone is `bin/codex-host-compat.bash`.
+It defines the semantic boundary for host utilities such as path resolution,
+metadata, checksums, locks, and atomic publication, while retaining a
+GNU/Linux-only backend for now. Future macOS and BSD backends must preserve
+the same behavior and must not weaken the Linux security contract; those hosts
+are not supported by the full launcher yet.
 
 Install the host sandbox policy and commands, then build the relevant image as
 described in the README. Images use a fixed non-root identity and must remain
@@ -13,7 +22,7 @@ portable across builder and runtime UID/GID values.
 ## Making changes
 
 - Keep the generic and CUDA Dockerfiles aligned for shared packages and setup steps.
-- Keep shell commands compatible with Bash and quote filesystem paths.
+- Keep shell commands compatible with Bash 4.1 or newer and quote filesystem paths.
 - Update user documentation when behavior, dependencies, environment variables, or defaults change.
 - Do not weaken the Codex sandbox, approval policy, Docker capability restrictions, or state validation.
 - Do not add secrets, live Codex state, generated snapshots, or local project registrations.
