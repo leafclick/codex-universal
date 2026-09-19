@@ -123,6 +123,15 @@ RUN gcc -std=c11 -O2 -fstack-protector-strong \
         /usr/local/bin/codex-no-nested-userns \
     && rm -f /tmp/codex-no-nested-userns /usr/local/src/codex-no-nested-userns.c
 
+COPY --chmod=0644 container/codex-landlock-probe.c /usr/local/src/codex-landlock-probe.c
+RUN gcc -std=c11 -O2 -fstack-protector-strong \
+        -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror \
+        -Wl,-z,relro,-z,now \
+        -o /tmp/codex-landlock-probe /usr/local/src/codex-landlock-probe.c \
+    && install -o root -g root -m 0755 /tmp/codex-landlock-probe \
+        /usr/local/bin/codex-landlock-probe \
+    && rm -f /tmp/codex-landlock-probe /usr/local/src/codex-landlock-probe.c
+
 # Give the image a fixed non-root default identity. run-codex replaces this
 # with the invoking host user's numeric identity and supplies a writable tmpfs
 # home, so one immutable image can run on hosts with different UID/GID values.
