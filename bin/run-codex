@@ -2808,20 +2808,15 @@ run_sandbox_probe() {
 
     if [[ "$CODEX_HOST_BACKEND" == darwin-gnu ]]; then
         # Docker Desktop and OrbStack may forbid a second user namespace even
-        # though the outer container remains hardened. Codex's pinned Linux
-        # runtime provides a Landlock compatibility backend for this case.
-        # Exercise that backend itself rather than weakening the outer Docker
-        # policy or accepting an unsandboxed command path.
+        # though the outer container remains hardened. Verify that the Docker
+        # VM kernel and bundled seccomp policy permit Landlock and that an
+        # empty ruleset actually denies a handled write. The public `codex
+        # sandbox` command uses permission profiles, which cannot be combined
+        # with the legacy Landlock backend selected for the interactive run.
         docker "${docker_args[@]}" \
-            --entrypoint /usr/local/bin/codex \
-            -e HOME=/tmp \
-            -e CODEX_HOME=/tmp/.codex \
+            --entrypoint /usr/local/bin/codex-landlock-probe \
             "$image" \
-            --enable use_legacy_landlock \
-            sandbox \
-            -P :workspace \
-            -C /tmp \
-            /bin/true
+            >/dev/null
         return
     fi
 
@@ -3213,11 +3208,12 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 
 if ! sandbox_probe_output="$(run_sandbox_probe "$IMAGE" 2>&1)"; then
     [[ -z "$sandbox_probe_output" ]] || printf '%s\n' "$sandbox_probe_output" >&2
-    echo "ERROR: Bubblewrap cannot start with the installed host sandbox policy." >&2
     if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
+        echo "ERROR: Bubblewrap cannot start with the installed host sandbox policy." >&2
         echo "Re-run bin/setup-codex-host-security from the codex-universal checkout." >&2
     else
-        echo "Confirm Docker Desktop accepts the bundled seccomp policy, then reinstall the host tools." >&2
+        echo "ERROR: Landlock enforcement failed inside the Docker VM." >&2
+        echo "Confirm Docker Desktop accepts the bundled seccomp policy and exposes Landlock, then reinstall the host tools." >&2
     fi
     exit 1
 fi

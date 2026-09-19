@@ -438,13 +438,13 @@ run_doctor() {
                 if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
                     doctor_pass "AppArmor, seccomp, and Bubblewrap sandbox probe"
                 else
-                    doctor_pass "Docker Desktop seccomp and Codex Landlock sandbox probe"
+                    doctor_pass "Docker Desktop seccomp and Landlock enforcement probe"
                 fi
             else
                 if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then
                     doctor_fail "AppArmor, seccomp, or Bubblewrap sandbox probe failed"
                 else
-                    doctor_fail "Docker Desktop seccomp or Codex Landlock sandbox probe failed"
+                    doctor_fail "Docker Desktop seccomp or Landlock enforcement probe failed"
                 fi
                 [[ -z "$probe_output" ]] || printf '      %s\n' "$probe_output"
                 if [[ "$CODEX_HOST_BACKEND" == gnu-linux ]]; then

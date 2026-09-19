@@ -104,6 +104,7 @@ case "$check_phase" in
         test -r /etc/codex/requirements.toml
         [[ "$(stat -c %a /etc/codex)" == 755 ]]
         [[ "$(stat -c %u /usr/local/bin/codex-entrypoint)" == 0 ]]
+        [[ "$(stat -c %u /usr/local/bin/codex-landlock-probe)" == 0 ]]
         [[ "$(stat -c %u /usr/local/share/npm-global/bin/codex)" == 0 ]]
         [[ "$(stat -c %u /etc/codex/requirements.toml)" == 0 ]]
         [[ "$(awk '$1 == "CapEff:" {print $2}' /proc/self/status)" == 0000000000000000 ]]
@@ -155,9 +156,14 @@ case "$check_phase" in
             "$fixture_dir" "$mcp_stderr"
         ;;
     cli-smoke)
+        codex_smoke_args=(
+            --sandbox workspace-write
+            --ask-for-approval on-request
+            -c 'approvals_reviewer="user"'
+        )
         if [[ "${CODEX_TEST_RESTRICTED_USERNS:-0}" == 1 ]]; then
-            codex --enable use_legacy_landlock sandbox \
-                -P :workspace -C /tmp /bin/true
+            codex-landlock-probe
+            codex_smoke_args=(--enable use_legacy_landlock "${codex_smoke_args[@]}")
             java --version
             clojure -Sdescribe
             deps -Sdescribe
@@ -170,11 +176,7 @@ case "$check_phase" in
         cljfmt --version
         clj-kondo --version
         clojure-lsp --version
-        codex \
-            --sandbox workspace-write \
-            --ask-for-approval on-request \
-            -c 'approvals_reviewer="user"' \
-            --help >/dev/null
+        codex "${codex_smoke_args[@]}" --help >/dev/null
         ;;
     cuda-runtime)
         if [[ "$1" == cuda ]]; then

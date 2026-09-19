@@ -486,6 +486,13 @@ jq -e '
         (.names | index("unshare")))
 ' "$ROOT/security/seccomp/codex-bwrap.json" >/dev/null ||
     fail "Bubblewrap seccomp profile is invalid or incomplete"
+jq -e '
+    any(.syscalls[];
+        .action == "SCMP_ACT_ALLOW" and
+        (.names | index("landlock_create_ruleset")) and
+        (.names | index("landlock_restrict_self")))
+' "$ROOT/security/seccomp/codex-bwrap.json" >/dev/null ||
+    fail "seccomp profile does not permit the Landlock enforcement probe"
 grep -Fq 'Copyright The Moby Authors.' \
     "$ROOT/security/seccomp/NOTICE" ||
     fail "Moby seccomp attribution is missing"
@@ -520,8 +527,12 @@ sed -n '/^run_sandbox_probe()/,/^}/p' "$ROOT/bin/run-codex" |
     grep -Fq -- '--tmpfs "$TMP_TMPFS_SPEC"' ||
     fail "Bubblewrap preflight does not provide writable temporary storage"
 sed -n '/^run_sandbox_probe()/,/^}/p' "$ROOT/bin/run-codex" |
-    grep -Fq -- '-P :workspace' ||
-    fail "Darwin Landlock preflight does not select the workspace permission profile"
+    grep -Fq -- '--entrypoint /usr/local/bin/codex-landlock-probe' ||
+    fail "Darwin Landlock preflight does not exercise direct kernel enforcement"
+if sed -n '/^run_sandbox_probe()/,/^}/p' "$ROOT/bin/run-codex" |
+    grep -Fq -- 'codex sandbox'; then
+    fail "Darwin Landlock preflight incorrectly uses the permission-profile CLI"
+fi
 grep -Fq -- '--unshare-net' "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge is not network-isolated"
 grep -Fq -- '--unshare-pid' "$ROOT/container/codex-clojure-lsp-mcp" ||
@@ -757,6 +768,9 @@ for dockerfile in "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda"; do
     grep -q 'container/codex-no-nested-userns.c /usr/local/src/codex-no-nested-userns.c' \
         "$dockerfile" ||
         fail "$(basename "$dockerfile") does not build the nested-userns filter"
+    grep -q 'container/codex-landlock-probe.c /usr/local/src/codex-landlock-probe.c' \
+        "$dockerfile" ||
+        fail "$(basename "$dockerfile") does not build the Landlock enforcement probe"
     grep -qE '^[[:space:]]+socat([[:space:]\\]|$)' "$dockerfile" ||
         fail "$(basename "$dockerfile") does not install the IntelliJ MCP relay"
     grep -q 'container/libnss_codex.c /usr/local/src/libnss_codex.c' "$dockerfile" ||
@@ -855,6 +869,9 @@ grep -Fq '/usr/local/bin/codex-no-nested-userns' \
     "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP bridge can create a nested user namespace"
 if [[ "$HOST_KERNEL" == Linux ]] && command -v gcc >/dev/null 2>&1; then
+    gcc -std=c11 -O2 -Wall -Wextra -Werror \
+        -o "$TEST_ROOT/codex-landlock-probe" \
+        "$ROOT/container/codex-landlock-probe.c"
     nested_userns_filter="$TEST_ROOT/codex-no-nested-userns"
     gcc -std=c11 -O2 -Wall -Wextra -Werror \
         -o "$nested_userns_filter" \
@@ -2860,7 +2877,7 @@ assert_contains "$darwin_doctor_output" \
 assert_contains "$darwin_doctor_output" \
     "WARN  Docker Desktop does not expose the GNU/Linux AppArmor host-policy contract"
 assert_contains "$darwin_doctor_output" \
-    "PASS  Docker Desktop seccomp and Codex Landlock sandbox probe"
+    "PASS  Docker Desktop seccomp and Landlock enforcement probe"
 assert_contains "$darwin_doctor_output" \
     "PASS  Portable runtime identity, read-only image, tools, and managed Codex policy"
 assert_contains "$darwin_doctor_output" "Diagnostics passed with 1 warning(s)."
