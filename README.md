@@ -103,8 +103,10 @@ invoke `sudo`, mount the project into its diagnostic container, or modify
 persistent Codex state. It reports the registered project and profile, fixed
 non-root image identity, host runtime UID/GID, read-only image boundary,
 sandbox operation, installed tool versions, and the Clojure LSP MCP initialize
-handshake plus a semantic query against a disposable Clojure fixture. A CUDA
-project additionally checks GPU access and NVIDIA entrypoint execution.
+handshake plus a semantic query against a disposable Clojure fixture. The
+image preloads only the pinned Clojure CLI's base Maven dependencies for this
+offline probe; project dependencies remain outside the image. A CUDA project
+additionally checks GPU access and NVIDIA entrypoint execution.
 Optional integrations are reported as warnings or skips.
 
 Then exit Codex and run the host smoke suite from the `codex-universal`

@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 This change log follows the conventions of
 [keepachangelog.com](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.6.2] - 2026-09-24
 
 ### Added
 
@@ -23,6 +23,12 @@ This change log follows the conventions of
 
 ### Fixed
 
+- Give the Clojure LSP MCP doctor probe realistic bounded startup budgets and
+  report the exact failed handshake stage with bounded protocol evidence.
+- Preload the pinned Clojure CLI base dependencies into a read-only image cache
+  so the doctor and image semantic probes remain self-contained offline.
+- Stop passing the obsolete session-level `network.allow_local_binding` setting
+  that Codex 0.156.1 ignores with a startup warning.
 - Allow untracked and ignored checkout files during lane state handoff while
   continuing to reject staged or unstaged tracked changes.
 - Report both the destination and snapshot runtime labels when a lane pull

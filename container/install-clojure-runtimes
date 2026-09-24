@@ -84,3 +84,15 @@ printf '%s\n' "$lein_version_output"
     exit 1
 }
 DEPS_CLJ_TOOLS_DIR=/usr/local/lib/clojure deps -Sdescribe
+
+# The doctor and image smoke suite exercise clojure-lsp without network access
+# or a persistent user home. Preload the Clojure CLI base dependencies into a
+# root-owned repository that those disposable probes can select explicitly.
+offline_m2=/opt/clojure/offline-m2
+offline_home="$install_root/offline-home"
+offline_deps="{:mvn/local-repo \"$offline_m2\"}"
+install -d -m 0755 "$offline_m2" "$offline_home"
+HOME="$offline_home" clojure -Srepro -Sdeps "$offline_deps" -P
+HOME="$offline_home" clojure -Srepro -Sdeps "$offline_deps" -Spath >/dev/null
+find "$offline_m2" -type d -exec chmod 0755 {} +
+find "$offline_m2" -type f -exec chmod 0644 {} +

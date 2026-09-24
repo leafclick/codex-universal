@@ -3384,7 +3384,6 @@ if $IDEA_MODE; then
                         network_access: false,
                         writable_roots: [$home]
                     },
-                    network: {allow_local_binding: true},
                     mcp_optional_startup_grace_ms: 5000,
                     mcp_servers: {
                         idea: {
@@ -3410,8 +3409,7 @@ if $IDEA_MODE; then
                     sandbox_workspace_write: {
                         network_access: false,
                         writable_roots: [$home]
-                    },
-                    network: {allow_local_binding: true}
+                    }
                 }'
         )"
     fi
@@ -3506,9 +3504,6 @@ codex_args=(
     -c 'approvals_reviewer="user"'
     -c "sandbox_workspace_write.network_access=false"
     -c "sandbox_workspace_write.writable_roots=[\"$CONTAINER_HOME\"]"
-    # This permits only container-local listeners such as the nREPL helper;
-    # external network access remains disabled above.
-    -c 'network.allow_local_binding=true'
 )
 
 if ! $IDEA_MODE && [[ "$EFFECTIVE_CLOJURE_LSP_MCP" == 1 ]]; then

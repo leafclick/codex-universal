@@ -667,6 +667,13 @@ grep -Fq 'Unexpected Leiningen launcher version metadata' \
 grep -Fq 'Leiningen runtime version does not match ${LEIN_VERSION}' \
     "$ROOT/container/install-clojure-runtimes" ||
     fail "Leiningen installed version is not checked against its pin"
+grep -Fq 'offline_m2=/opt/clojure/offline-m2' \
+    "$ROOT/container/install-clojure-runtimes" &&
+    grep -Fq 'clojure -Srepro -Sdeps "$offline_deps" -P' \
+        "$ROOT/container/install-clojure-runtimes" &&
+    grep -Fq 'mvn/local-repo \"/opt/clojure/offline-m2\"' \
+        "$ROOT/bin/run-codex-doctor.bash" ||
+    fail "offline Clojure MCP probes do not use the preloaded base dependency cache"
 if grep -R -q 'CODEX_UNSAFE_ALLOW_NO_SANDBOX' \
     "$ROOT/Dockerfile.generic" "$ROOT/Dockerfile.cuda" "$ROOT/bin"; then
     fail "unsafe Codex sandbox bypass is present"
@@ -828,6 +835,13 @@ grep -Fq '127.0.0.1' "$workflow_skill/scripts/clojure-development" ||
 grep -Fq 'clojure:/usr/local/bin/codex-lsp-message-proxy' \
     "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure MCP wrapper does not route the server through its message proxy"
+grep -Fq 'mcp_stage="initialize"' "$ROOT/bin/run-codex-doctor.bash" &&
+    grep -Fq 'for _ in {1..30}; do' "$ROOT/bin/run-codex-doctor.bash" &&
+    grep -Fq '"ready_timeout_seconds":60' "$ROOT/bin/run-codex-doctor.bash" &&
+    grep -Fq 'for _ in {1..90}; do' "$ROOT/bin/run-codex-doctor.bash" &&
+    grep -Fq 'Clojure MCP doctor probe failed during %s.' \
+        "$ROOT/bin/run-codex-doctor.bash" ||
+    fail "Clojure MCP doctor probe lacks bounded readiness budgets or stage diagnostics"
 if grep -Eq '^[[:space:]]+"(execute_command|suggest_fixes)",' \
     "$ROOT/bin/run-codex"; then
     fail "Clojure LSP allowlist exposes broad or semantically ambiguous tools"
@@ -1745,6 +1759,7 @@ for output in "$new_output" "$resume_output"; do
     assert_contains "$output" "--ask-for-approval on-request"
     assert_contains "$output" 'approvals_reviewer="user"'
     assert_contains "$output" "sandbox_workspace_write.network_access=false"
+    assert_not_contains "$output" "network.allow_local_binding"
     assert_contains "$output" 'mcp_servers.clojure_lsp.command="/usr/local/bin/codex-clojure-lsp-mcp"'
     assert_contains "$output" 'mcp_servers.clojure_lsp.args=["clojure:clojure-lsp"]'
     assert_contains "$output" 'mcp_servers.clojure_lsp.enabled_tools=['
@@ -1858,6 +1873,7 @@ assert_contains "$idea_output" 'approval_policy":"on-request"'
 assert_contains "$idea_output" 'mcp_servers":{"idea":{"url":"http://127.0.0.1:64342/stream"'
 assert_contains "$idea_output" 'enabled_tools":["analyze_calls","get_file_problems"'
 assert_contains "$idea_output" 'default_tools_approval_mode":"writes"'
+assert_not_contains "$idea_output" '"network":{"allow_local_binding":true}'
 assert_contains "$idea_output" 'CODEX_IDEA_MCP_RELAY_SOCKET=/run/codex-idea-mcp/idea-mcp.sock'
 assert_contains "$idea_output" 'CODEX_IDEA_MCP_RELAY_PORT=64342'
 assert_contains "$idea_output" ':/run/codex-idea-mcp:ro'

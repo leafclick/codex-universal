@@ -171,7 +171,10 @@ doctor_mcp_probe() {
 
             fixture_dir=/workspace/clojure-lsp-doctor
             bridge_stderr="$HOME/clojure-lsp-doctor.stderr"
-            mkdir -p "$fixture_dir/src/doctor_fixture"
+            mkdir -p "$HOME/.clojure" "$fixture_dir/src/doctor_fixture"
+            printf "%s\n" \
+                "{:mvn/local-repo \"/opt/clojure/offline-m2\"}" \
+                > "$HOME/.clojure/deps.edn"
             printf "%s\n" \
                 "{:paths [\"src\"]}" \
                 > "$fixture_dir/deps.edn"
@@ -189,12 +192,19 @@ doctor_mcp_probe() {
             mcp_input_fd="${MCP_BRIDGE[1]}"
             mcp_output_fd="${MCP_BRIDGE[0]}"
             mcp_ready=0
+            mcp_stage="initialize"
+            mcp_line=""
 
             cleanup_mcp_bridge() {
                 kill "$mcp_pid" 2>/dev/null || true
                 wait "$mcp_pid" 2>/dev/null || true
             }
             fail_mcp_probe() {
+                printf "Clojure MCP doctor probe failed during %s.\n" \
+                    "$mcp_stage" >&2
+                if [[ -n "$mcp_line" ]]; then
+                    printf "Last MCP output: %.2048s\n" "$mcp_line" >&2
+                fi
                 tail -n 40 -- "$bridge_stderr" >&2 || true
                 exit 1
             }
@@ -204,7 +214,7 @@ doctor_mcp_probe() {
                 '\''{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"run-codex-doctor","version":"1"}}}'\'' \
                 >&"$mcp_input_fd"
 
-            for _ in {1..10}; do
+            for _ in {1..30}; do
                 if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
                    jq -e \
                        '\''.id == 1 and .result.serverInfo.name == "agent-lsp"'\'' \
@@ -223,8 +233,10 @@ doctor_mcp_probe() {
                 '\''{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'\'' \
                 >&"$mcp_input_fd"
 
+            mcp_stage="tools/list"
+            mcp_line=""
             tools_response=""
-            for _ in {1..10}; do
+            for _ in {1..30}; do
                 if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
                    jq -e '\''.id == 2'\'' <<<"$mcp_line" >/dev/null 2>&1; then
                     tools_response="$mcp_line"
@@ -233,14 +245,18 @@ doctor_mcp_probe() {
             done
 
             [[ -n "$tools_response" ]] || fail_mcp_probe
+            mcp_stage="tool allowlist validation"
+            mcp_line="$tools_response"
             jq -e --argjson required "$1" \
                 '\''($required - [.result.tools[].name]) | length == 0'\'' \
                 <<<"$tools_response" >/dev/null || fail_mcp_probe
 
-            printf '\''{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"start_lsp","arguments":{"root_dir":"%s","language_id":"clojure","ready_timeout_seconds":30}}}\n'\'' \
+            printf '\''{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"start_lsp","arguments":{"root_dir":"%s","language_id":"clojure","ready_timeout_seconds":60}}}\n'\'' \
                 "$fixture_dir" >&"$mcp_input_fd"
+            mcp_stage="start_lsp"
+            mcp_line=""
             start_response=""
-            for _ in {1..45}; do
+            for _ in {1..90}; do
                 if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
                    jq -e '\''.id == 3'\'' <<<"$mcp_line" >/dev/null 2>&1; then
                     start_response="$mcp_line"
@@ -257,8 +273,10 @@ doctor_mcp_probe() {
 
             printf '\''{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"inspect_symbol","arguments":{"file_path":"%s/src/doctor_fixture/core.clj","line":3,"column":7,"language_id":"clojure"}}}\n'\'' \
                 "$fixture_dir" >&"$mcp_input_fd"
+            mcp_stage="inspect_symbol"
+            mcp_line=""
             semantic_response=""
-            for _ in {1..30}; do
+            for _ in {1..60}; do
                 if IFS= read -r -t 1 -u "$mcp_output_fd" mcp_line &&
                    jq -e '\''.id == 4'\'' <<<"$mcp_line" >/dev/null 2>&1; then
                     semantic_response="$mcp_line"

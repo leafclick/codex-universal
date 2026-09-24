@@ -95,6 +95,9 @@ case "$check_phase" in
         [[ "$LEIN_JAR" == /opt/clojure/leiningen-standalone.jar ]]
         [[ -r "$LEIN_JAR" ]]
         [[ "$DEPS_CLJ_TOOLS_DIR" == /usr/local/lib/clojure ]]
+        test -d /opt/clojure/offline-m2/org/clojure/clojure
+        find /opt/clojure/offline-m2/org/clojure/clojure \
+            -type f -name 'clojure-*.jar' -print -quit | grep -q .
         clojure -Sdescribe
         deps -Sdescribe
         lein version
@@ -149,7 +152,10 @@ case "$check_phase" in
         [[ -f "$fixture_source/deps.edn" ]]
         [[ -f "$fixture_source/src/lsp_fixture/core.clj" ]]
         [[ -f "$fixture_source/test/lsp_fixture/core_test.clj" ]]
-        mkdir -p "$fixture_dir"
+        mkdir -p "$HOME/.clojure" "$fixture_dir"
+        printf '%s\n' \
+            '{:mvn/local-repo "/opt/clojure/offline-m2"}' \
+            > "$HOME/.clojure/deps.edn"
         cp -R -- "$fixture_source/." "$fixture_dir/"
         python3 /opt/codex-universal/tests/fixtures/check-clojure-lsp-mcp.py \
             "$fixture_dir" "$mcp_stderr"
