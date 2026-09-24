@@ -139,7 +139,7 @@ Environment:
   CODEX_DEFAULT_PROFILE=generic
   CODEX_CONTAINER_HOME=/home/codex
   CODEX_WORKSPACE_ROOT=/workspace
-  CODEX_LOCK_FILE=PATH       Override scoped handoff lock (legacy default: ~/.cache/codex-handoff.lock)
+  CODEX_LOCK_FILE=/absolute/path  Override scoped handoff lock (legacy default: ~/.cache/codex-handoff.lock)
   CODEX_SYNC_ROOT=~/Seafile/CodexSync
   CODEX_APPARMOR_PROFILE=codex-universal
   CODEX_SECCOMP_PROFILE=~/.config/run-codex/security/codex-bwrap.json
@@ -174,6 +174,31 @@ validate_container_mount_path() {
 
 container_paths_overlap() {
     [[ "$1" == "$2" || "$1" == "$2/"* || "$2" == "$1/"* ]]
+}
+
+canonical_handoff_lock_path() {
+    local lock_path="$1"
+    local canonical
+
+    [[ "$lock_path" == /* ]] ||
+        die "CODEX_LOCK_FILE must be an absolute path: $lock_path"
+    canonical="$(realpath -m -- "$lock_path")" ||
+        die "Cannot resolve CODEX_LOCK_FILE: $lock_path"
+    [[ "$canonical" != / ]] ||
+        die "CODEX_LOCK_FILE must not be the filesystem root"
+    printf '%s\n' "$canonical"
+}
+
+validate_handoff_lock_separation() {
+    local protected_path canonical
+
+    for protected_path in "$@"; do
+        canonical="$(realpath -m -- "$protected_path")" ||
+            die "Cannot resolve protected state path: $protected_path"
+        if container_paths_overlap "$LOCK_FILE" "$canonical"; then
+            die "CODEX_LOCK_FILE must be separate from Codex state and synchronization directories: $LOCK_FILE"
+        fi
+    done
 }
 
 need() {
@@ -1179,15 +1204,11 @@ lane_handoff_lock() {
     local lock_path
 
     if [[ -n "${CODEX_LOCK_FILE:-}" ]]; then
-        [[ "$CODEX_LOCK_FILE" == /* ]] ||
-            die "CODEX_LOCK_FILE must be an absolute path"
-        lock_path="$(realpath -m -- "$CODEX_LOCK_FILE")" || return 1
+        lock_path="$CODEX_LOCK_FILE"
     else
-        lock_path="$(realpath -m -- "$CONFIG_ROOT/locks/$name/$lane.handoff.lock")" ||
-            return 1
+        lock_path="$CONFIG_ROOT/locks/$name/$lane.handoff.lock"
     fi
-    [[ "$lock_path" != / ]] || die "CODEX_LOCK_FILE must not be the filesystem root"
-    printf '%s\n' "$lock_path"
+    canonical_handoff_lock_path "$lock_path"
 }
 
 create_managed_lane() {
@@ -3017,6 +3038,7 @@ IMAGE="$(profile_image "$PROFILE")"
 if [[ -z "${CODEX_LOCK_FILE:-}" && "$RESOLVED_STATE_MODE" == isolated ]]; then
     LOCK_FILE="$CONFIG_ROOT/locks/$PROJECT/$LANE.handoff.lock"
 fi
+LOCK_FILE="$(canonical_handoff_lock_path "$LOCK_FILE")"
 if [[ -n "$STATE_SYNC_MODE" ]]; then
     [[ "$RESOLVED_STATE_MODE" == isolated ]] ||
         die "Lane-aware state synchronization requires isolated state; use standalone codex-push/codex-pull for this legacy global registration"
@@ -3041,6 +3063,10 @@ if ! $SETUP_SESSION && ! check_onboarding true; then
     exit 2
 fi
 resolve_lane_codex_home "$PROJECT" "$LANE" "$RESOLVED_STATE_MODE"
+validate_handoff_lock_separation \
+    "$CODEX_HOST_HOME" \
+    "$SYNC_ROOT" \
+    "$LOCAL_SYNC_STATE_ROOT"
 resolve_clojure_mcp "$PROJECT_PATH" "$RESOLVED_CLOJURE_MCP"
 if [[ "$RESOLVED_GIT_LAYOUT" == linked-worktree ]]; then
     CONTAINER_PROJECT_DEFAULT="$PROJECT_PATH"
@@ -3156,6 +3182,9 @@ if $IDEA_MODE || [[ "$RESOLVED_GIT_LAYOUT" == linked-worktree ]]; then
     # references without granting access to the host path's parent directory.
     # Do not allow a registered checkout to mask container runtime paths.
     case "$PROJECT_PATH" in
+        /tmp)
+            die "Exact-path mode cannot mount a project over the container temporary root: $PROJECT_PATH"
+            ;;
         /|/bin|/bin/*|/dev|/dev/*|/etc|/etc/*|/lib|/lib/*|/lib64|/lib64/*|\
         /opt|/opt/*|/proc|/proc/*|/run|/run/*|/sbin|/sbin/*|/sys|/sys/*|\
         /usr|/usr/*|/var|/var/*)

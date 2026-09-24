@@ -5,8 +5,9 @@ subsequent runtime investigation. Completed and refuted findings are preserved
 in `REVIEW-ARCHIVE.md`; current execution evidence and probe failures remain in
 `STATUS.md`.
 
-Issue 23 remains deferred. Issue 44 now has a substantial source implementation
-and remains in progress for live-image and second-machine Codex lane acceptance.
+Issues 23 and 50 remain deferred. Issue 44 now has a substantial source
+implementation and remains in progress for live-image and second-machine Codex
+lane acceptance.
 The existing local mailbox remains supported, but multi-agent coordination,
 cross-provider adapters, broker expansion, and automatic wakeup belong to the
 separate `clojure-agent-harness` project and are not roadmap items here. See the
@@ -28,7 +29,8 @@ test-heavy, and `H` architectural or integration-heavy.
 
 | ID | Type | Work item | Evidence | Status | Complexity | Reason |
 |---:|---|---|---|---|---|---|
-| 23 | Improvement | Optionally revisit generic/CUDA Dockerfile deduplication and package pruning if the files grow substantially or actual profile drift appears. | SOURCE CONFIRMED | Deferred by product decision. The common blocks currently match, and speculative package pruning is not valuable enough to pursue now. | H for refactor; M for package audit | Avoid architecture and compatibility work until growth or demonstrated drift justifies it. |
+| 23 | Improvement | Optionally revisit generic/CUDA Dockerfile deduplication, package pruning, or an explicit parity test if the files grow substantially or actual profile drift appears. | SOURCE CONFIRMED | Low priority; deferred by product decision. The common blocks currently match, and speculative package pruning or architecture work is not valuable enough to pursue now. | H for refactor; M for parity/package audit | Avoid architecture and compatibility work until growth or demonstrated drift justifies it. |
+| 50 | Improvement | Incrementally modularize `bin/run-codex`, `tests/host-smoke.sh`, and specialist README material; add a local-only CI job with image and external-sync checks explicitly disabled. | SOURCE CONFIRMED | Low priority; deferred by product decision. Current commands and focused suites are functional, but the largest files remain expensive to review and no repository CI workflow runs the local-only checks. | H, phased | Keep near-term effort on behavior and security fixes; extract only cohesive seams with stable regression coverage. |
 
 ## Project isolation design work
 

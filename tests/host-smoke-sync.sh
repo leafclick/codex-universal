@@ -286,6 +286,9 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
     [[ "$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')" == \
        "$(sha256sum "$TEST_ROOT/b/live/payload" | awk '{print $1}')" ]] ||
         fail "forced pull did not restore generation 1"
+    if compgen -G "$TEST_ROOT/b/.live.restore.*" >/dev/null; then
+        fail "successful pull left its restore staging directory behind"
+    fi
 
     printf 'generation two\n' > "$TEST_ROOT/a/live/payload"
     run_machine a "$PUSH_COMMAND" >/dev/null

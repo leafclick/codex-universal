@@ -484,6 +484,11 @@ for nested_bwrap_script in \
 done
 grep -Fq -- '--tmpfs "$TMP_TMPFS_SPEC" \' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not provide writable temporary storage"
+grep -Fq '        /tmp)' "$ROOT/bin/run-codex" ||
+    fail "exact-path project mounts do not reject the container temporary root"
+if grep -Fq '/tmp/*' "$ROOT/bin/run-codex"; then
+    fail "exact-path project mounts reject safe project directories below /tmp"
+fi
 grep -Fq -- '--unshare-net' "$ROOT/container/codex-clojure-lsp-mcp" ||
     fail "Clojure LSP MCP bridge is not network-isolated"
 grep -Fq -- '--unshare-pid' "$ROOT/container/codex-clojure-lsp-mcp" ||
@@ -1226,6 +1231,14 @@ test ! -e "$bootstrap_destination/history.jsonl" ||
 "${launcher_env[@]}" "$ROOT/bin/run-codex" \
     --init --profile generic smoke-project "$TEST_ROOT/repo" >/dev/null
 
+if "${launcher_env[@]}" "CODEX_LOCK_FILE=relative-handoff.lock" \
+    "$ROOT/bin/run-codex" smoke-project --sessions \
+    >"$TEST_ROOT/relative-lock.out" 2>&1; then
+    fail "launcher accepted a relative handoff lock path"
+fi
+assert_contains "$(<"$TEST_ROOT/relative-lock.out")" \
+    "CODEX_LOCK_FILE must be an absolute path"
+
 project_config="$TEST_ROOT/launcher-config/run-codex/projects/smoke-project"
 grep -Fxq 'clojure_mcp=auto' "$project_config" ||
     fail "new project config does not default Clojure MCP to auto"
@@ -1417,6 +1430,14 @@ assert_contains "$list_output" "OK"
 isolated_codex_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/codex-home"
 isolated_m2_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/m2"
 mkdir -p -- "$isolated_codex_home"
+if "${launcher_env[@]}" \
+    "CODEX_LOCK_FILE=$isolated_codex_home/handoff.lock" \
+    "$ROOT/bin/run-codex" smoke-project --sessions \
+    >"$TEST_ROOT/overlapping-lock.out" 2>&1; then
+    fail "launcher accepted a handoff lock inside Codex state"
+fi
+assert_contains "$(<"$TEST_ROOT/overlapping-lock.out")" \
+    "CODEX_LOCK_FILE must be separate from Codex state and synchronization directories"
 printf '%s\n' default-state > "$isolated_codex_home/lane-marker"
 printf '%s\n' untracked-state-input > "$TEST_ROOT/repo/untracked-state-input"
 "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --push-state >/dev/null
@@ -1521,12 +1542,14 @@ assert_contains "$(<"$TEST_ROOT/session-image-version.out")" \
     "--sessions cannot be combined with launch options"
 
 session_handoff_lock="$TEST_ROOT/launcher-config/run-codex/locks/smoke-project/default.handoff.lock"
+session_handoff_input="$TEST_ROOT/launcher-config/run-codex/locks/../locks/smoke-project/default.handoff.lock"
 session_lock_stdout="$TEST_ROOT/session-lock.out"
 session_lock_stderr="$TEST_ROOT/session-lock.err"
 mkdir -p -- "$(dirname "$session_handoff_lock")"
 exec 7>"$session_handoff_lock"
 flock -x 7
-"${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --sessions \
+"${launcher_env[@]}" "CODEX_LOCK_FILE=$session_handoff_input" \
+    "$ROOT/bin/run-codex" smoke-project --sessions \
     >"$session_lock_stdout" 2>"$session_lock_stderr" 7>&- &
 session_lock_pid=$!
 session_lock_waiting=false

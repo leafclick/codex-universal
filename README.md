@@ -1384,8 +1384,11 @@ The synchronized root defaults to `~/Seafile/CodexSync` and can be changed with
 `CODEX_SYNC_ROOT`. Data is stored below
 `projects/<project>/lanes/<lane>`; local baselines and handoff locks are scoped
 the same way. Register the same project and lane names on each machine even
-when their absolute checkout paths differ. A running different lane does not block this operation, while a
-running container for the selected lane does. These commands reuse the same
+when their absolute checkout paths differ. An explicit `CODEX_LOCK_FILE`
+override must be absolute and separate from the Codex state, synchronized
+snapshot, and local-baseline directories. A running different lane does not
+block this operation, while a running container for the selected lane does.
+These commands reuse the same
 transactional archive, checksum, marker, database validation, divergence, and
 rollback implementation as `codex-push` and `codex-pull`. Code commits and
 checkout-local onboarding inputs remain separate from the Codex-state snapshot.

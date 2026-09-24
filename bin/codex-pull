@@ -646,8 +646,6 @@ if ! mv -- "$RESTORE_TMP/content" "$CODEX_DIR"; then
     die "Could not install restored state and rollback failed; original directory remains at $BACKUP_DIR and $CODEX_DIR is unavailable"
 fi
 
-RESTORE_TMP=""
-
 # Baseline the newest remote generation, not necessarily the selected one.
 # After forcing an older generation this makes the next push publish the
 # recovered contents as REMOTE_GEN + 1 without moving history backwards.
