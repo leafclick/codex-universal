@@ -89,9 +89,10 @@ case "$check_phase" in
         command -v zstd >/dev/null
         ;;
     clojure-runtime)
-        /bin/bash /opt/codex-universal/tests/fixtures/host-smoke-clojure-runtime.sh \
+        /bin/bash /tmp/host-smoke-clojure-runtime.sh \
             /opt/codex-universal \
-            /usr/local/share/codex-universal/workflow/skills/clojure-development
+            /usr/local/share/codex-universal/workflow/skills/clojure-development \
+            /tmp/clojure-runtime-fixtures
         [[ "$LEIN_JAR" == /opt/clojure/leiningen-standalone.jar ]]
         [[ -r "$LEIN_JAR" ]]
         [[ "$DEPS_CLJ_TOOLS_DIR" == /usr/local/lib/clojure ]]

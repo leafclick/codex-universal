@@ -4,6 +4,7 @@ umask 077
 
 ROOT="${1:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
 workflow_skill="${2:-/usr/local/share/codex-universal/workflow/skills/clojure-development}"
+fixture_root="${3:-$ROOT/tests/fixtures}"
 TEST_ROOT="$(mktemp -d)"
 namespace_service_pid=""
 namespace_service_pgid=""
@@ -46,7 +47,7 @@ fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 command -v bb >/dev/null 2>&1 || fail "tested image is missing Babashka"
 command -v python3 >/dev/null 2>&1 || fail "tested image is missing Python"
 
-python3 "$ROOT/tests/fixtures/check-clojure-network-context.py" \
+python3 "$fixture_root/check-clojure-network-context.py" \
     "$workflow_skill/scripts/clojure-development" ||
     fail "Clojure helper network preflight changed state or missed elevation"
 process_supervisor="$workflow_skill/scripts/clojure-process-supervisor"
@@ -145,7 +146,7 @@ if command -v bwrap >/dev/null 2>&1; then
 
         mkdir -p -- "$namespace_project/.codex"
         printf '%s\n' \
-            "{:runtimes {:isolated {:kind :lein :repl [\"python3\" \"$ROOT/tests/fixtures/fake-nrepl.py\" \"--interfaces-file\" \"$namespace_fixture/interfaces.txt\"]}}}" \
+            "{:runtimes {:isolated {:kind :lein :repl [\"python3\" \"$fixture_root/fake-nrepl.py\" \"--interfaces-file\" \"$namespace_fixture/interfaces.txt\"]}}}" \
             > "$namespace_project/.codex/clojure-development.edn"
         CODEX_PROJECT_ROOT="$namespace_project" \
             CODEX_CLOJURE_STATE_DIR="$namespace_fixture" \
@@ -186,7 +187,7 @@ fi
 
 config_fixture="$TEST_ROOT/clojure-config"
 config_state="$TEST_ROOT/clojure-runtime"
-fake_nrepl="$ROOT/tests/fixtures/fake-nrepl.py"
+fake_nrepl="$fixture_root/fake-nrepl.py"
 mkdir -p -- "$config_fixture/.codex" "$config_fixture/bb-work"
 mkdir -p -- "$config_state"
 "$process_supervisor" service \

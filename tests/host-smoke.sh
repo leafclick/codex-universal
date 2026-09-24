@@ -26,6 +26,9 @@ cleanup() {
             docker rm -f -- "$ACTIVE_TEST_CONTAINER" >/dev/null 2>&1 || true
         fi
     fi
+    if [[ -d "${image_clojure_fixture_dir:-}" ]]; then
+        chmod u+w -- "$image_clojure_fixture_dir" 2>/dev/null || true
+    fi
     rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
@@ -3001,17 +3004,34 @@ CUDA_TEST_IMAGE="${CODEX_TEST_CUDA_IMAGE:-leafclick/codex-universal-cuda:latest}
 image_smoke_script="$TEST_ROOT/host-smoke-image.sh"
 image_smoke_phase_wrapper="$TEST_ROOT/host-smoke-image-phase.sh"
 image_smoke_runner="$TEST_ROOT/host-smoke-image.clj"
+image_clojure_runtime_script="$TEST_ROOT/host-smoke-clojure-runtime.sh"
+image_clojure_fixture_dir="$TEST_ROOT/clojure-runtime-fixtures"
+mkdir -p -- "$image_clojure_fixture_dir"
 cp -- "$ROOT/tests/fixtures/host-smoke-image.sh" "$image_smoke_script"
 cp -- "$ROOT/tests/fixtures/host-smoke-image-phase.sh" "$image_smoke_phase_wrapper"
 cp -- "$ROOT/tests/fixtures/host-smoke-image.clj" "$image_smoke_runner"
+cp -- "$ROOT/tests/fixtures/host-smoke-clojure-runtime.sh" \
+    "$image_clojure_runtime_script"
+cp -- "$ROOT/tests/fixtures/check-clojure-network-context.py" \
+    "$ROOT/tests/fixtures/fake-nrepl.py" \
+    "$image_clojure_fixture_dir/"
 chmod 0555 -- \
     "$image_smoke_script" \
     "$image_smoke_phase_wrapper" \
-    "$image_smoke_runner"
+    "$image_smoke_runner" \
+    "$image_clojure_runtime_script" \
+    "$image_clojure_fixture_dir"
+chmod 0444 -- \
+    "$image_clojure_fixture_dir/check-clojure-network-context.py" \
+    "$image_clojure_fixture_dir/fake-nrepl.py"
 [[ "$(stat -c %a "$image_smoke_script")" == 555 &&
    "$(stat -c %a "$image_smoke_phase_wrapper")" == 555 &&
-   "$(stat -c %a "$image_smoke_runner")" == 555 ]] ||
-    fail "temporary container image smoke files are not executable by the container user"
+   "$(stat -c %a "$image_smoke_runner")" == 555 &&
+   "$(stat -c %a "$image_clojure_runtime_script")" == 555 &&
+   "$(stat -c %a "$image_clojure_fixture_dir")" == 555 &&
+   "$(stat -c %a "$image_clojure_fixture_dir/check-clojure-network-context.py")" == 444 &&
+   "$(stat -c %a "$image_clojure_fixture_dir/fake-nrepl.py")" == 444 ]] ||
+    fail "temporary container image smoke files lack container-readable modes"
 
 image_timeout_seconds="${CODEX_TEST_IMAGE_TIMEOUT_SECONDS:-720}"
 image_heartbeat_seconds="${CODEX_TEST_IMAGE_HEARTBEAT_SECONDS:-10}"
@@ -3083,6 +3103,8 @@ smoke_image() {
         --mount "type=bind,src=$image_smoke_script,dst=/tmp/host-smoke-image.sh,readonly"
         --mount "type=bind,src=$image_smoke_phase_wrapper,dst=/tmp/host-smoke-image-phase.sh,readonly"
         --mount "type=bind,src=$image_smoke_runner,dst=/tmp/host-smoke-image.clj,readonly"
+        --mount "type=bind,src=$image_clojure_runtime_script,dst=/tmp/host-smoke-clojure-runtime.sh,readonly"
+        --mount "type=bind,src=$image_clojure_fixture_dir,dst=/tmp/clojure-runtime-fixtures,readonly"
         -e HOME=/home/codex
         -e "CODEX_TEST_IMAGE_HEARTBEAT_SECONDS=$image_heartbeat_seconds"
         -e "CODEX_TEST_IMAGE_KILL_AFTER_SECONDS=$image_kill_after_seconds"
