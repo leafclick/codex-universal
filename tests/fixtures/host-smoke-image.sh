@@ -128,7 +128,7 @@ case "$check_phase" in
             --unshare-net \
             --ro-bind / / \
             --dev /dev \
-            --proc /proc \
+            --tmpfs /proc \
             --tmpfs /tmp \
             -- \
             /bin/bash -c '
@@ -185,7 +185,7 @@ case "$check_phase" in
                     --unshare-user \
                     --ro-bind / / \
                     --dev /dev \
-                    --proc /proc \
+                    --tmpfs /proc \
                     --tmpfs /tmp \
                     -- \
                     /bin/bash -c '
@@ -198,7 +198,7 @@ case "$check_phase" in
                 --unshare-user \
                 --ro-bind / / \
                 --dev /dev \
-                --proc /proc \
+                --tmpfs /proc \
                 --tmpfs /tmp \
                 -- \
                 /bin/bash -c "nvidia-smi >/dev/null"

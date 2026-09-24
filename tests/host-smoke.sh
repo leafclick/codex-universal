@@ -473,6 +473,15 @@ grep -Fq -- '--unshare-pid \' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not exercise the private PID namespace"
 grep -Fq -- '--tmpfs /proc \' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not exercise the private procfs overlay"
+for nested_bwrap_script in \
+    "$ROOT/bin/run-codex-doctor.bash" \
+    "$ROOT/tests/fixtures/host-smoke-image.sh"; do
+    grep -Fq -- '--tmpfs /proc' "$nested_bwrap_script" ||
+        fail "nested Bubblewrap probe does not hide procfs with tmpfs: $nested_bwrap_script"
+    if grep -Fq -- '--proc /proc' "$nested_bwrap_script"; then
+        fail "nested Bubblewrap probe mounts a fresh procfs: $nested_bwrap_script"
+    fi
+done
 grep -Fq -- '--tmpfs "$TMP_TMPFS_SPEC" \' "$ROOT/bin/run-codex" ||
     fail "Bubblewrap preflight does not provide writable temporary storage"
 grep -Fq -- '--unshare-net' "$ROOT/container/codex-clojure-lsp-mcp" ||

@@ -137,7 +137,7 @@ doctor_runtime_probe() {
                 --unshare-user \
                 --ro-bind / / \
                 --dev /dev \
-                --proc /proc \
+                --tmpfs /proc \
                 --tmpfs /tmp \
                 -- \
                 /bin/bash -c "nvidia-smi >/dev/null"
