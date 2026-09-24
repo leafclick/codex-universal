@@ -160,7 +160,7 @@ RUN /usr/local/src/install-clojure-tools \
 # Keep frequently changing agent packages and integration files after the
 # stable Java and Clojure runtime layers so their updates preserve that cache.
 ARG NPM_VERSION=12.0.2
-ARG CODEX_VERSION=0.154.0
+ARG CODEX_VERSION=0.156.1
 ARG CODEX_ACP_VERSION=1.11.0
 ARG AGENT_LSP_VERSION=0.19.1
 RUN npm install -g "npm@${NPM_VERSION}" \

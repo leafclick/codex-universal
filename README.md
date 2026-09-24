@@ -317,7 +317,7 @@ A specific Codex, ACP adapter, or LSP bridge version can be used:
 
 ```bash
 NPM_VERSION=12.0.2 \
-CODEX_VERSION=0.154.0 \
+CODEX_VERSION=0.156.1 \
 CODEX_ACP_VERSION=1.11.0 \
 AGENT_LSP_VERSION=0.19.1 \
   ./docker-build.sh all

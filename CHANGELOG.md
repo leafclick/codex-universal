@@ -14,6 +14,7 @@ This change log follows the conventions of
 
 ### Changed
 
+- Update the Codex CLI to 0.156.1.
 - Pin the image npm CLI to 12.0.2 while retaining the newest registry-published
   `agent-lsp` package, 0.19.1.
 - Keep this repository's roadmap focused on the standalone Codex container,
@@ -22,6 +23,8 @@ This change log follows the conventions of
 
 ### Fixed
 
+- Report both the destination and snapshot runtime labels when a lane pull
+  rejects an image mismatch.
 - Surface unexpected language-server exits and protocol forwarding failures
   from the Clojure LSP message proxy.
 - Run Clojure-helper runtime smoke fixtures with the image's pinned Babashka

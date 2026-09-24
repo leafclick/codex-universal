@@ -652,6 +652,13 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
             "$PULL_COMMAND" --force 1 >"$wrong_root/$wrong_context.log" 2>&1; then
             fail "wrong $wrong_context handoff context was accepted"
         fi
+        if [[ "$wrong_context" == runtime ]]; then
+            wrong_runtime_output="$(<"$wrong_root/$wrong_context.log")"
+            assert_contains "$wrong_runtime_output" \
+                "Destination runtime is version $wrong_value revision $handoff_revision"
+            assert_contains "$wrong_runtime_output" \
+                "snapshot requires version $handoff_version revision $handoff_revision"
+        fi
         [[ "$(fixture_state_hash "$wrong_root/live")" == "$wrong_before" ]] ||
             fail "wrong $wrong_context context changed live state"
     done

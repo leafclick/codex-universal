@@ -398,7 +398,8 @@ validate_selected_handoff() {
         die "Destination runtime profile must be '$SNAPSHOT_RUNTIME_PROFILE'"
     [[ "$SNAPSHOT_RUNTIME_VERSION" == "$HANDOFF_RUNTIME_VERSION" &&
        "$SNAPSHOT_RUNTIME_REVISION" == "$HANDOFF_RUNTIME_REVISION" ]] ||
-        die "Destination runtime must match version $SNAPSHOT_RUNTIME_VERSION revision $SNAPSHOT_RUNTIME_REVISION"
+        die "Destination runtime is version $HANDOFF_RUNTIME_VERSION revision $HANDOFF_RUNTIME_REVISION," \
+            "but snapshot requires version $SNAPSHOT_RUNTIME_VERSION revision $SNAPSHOT_RUNTIME_REVISION"
     [[ "$SNAPSHOT_ONBOARDING_SHA256" == "$HANDOFF_ONBOARDING_SHA256" ]] ||
         die "Destination onboarding declarations do not match the snapshot handoff contract"
 }
