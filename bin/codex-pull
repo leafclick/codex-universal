@@ -122,6 +122,20 @@ if [[ "$MODE" != list ]]; then
     validate_handoff_context
 fi
 
+force_pull_command() {
+    local generation="$1"
+
+    if ! $HANDOFF_ENABLED; then
+        printf 'codex-pull --force %s' "$generation"
+    elif [[ "$HANDOFF_LANE" == default ]]; then
+        printf 'run-codex %s --force-state %s' \
+            "$HANDOFF_PROJECT" "$generation"
+    else
+        printf 'run-codex %s --lane %s --force-state %s' \
+            "$HANDOFF_PROJECT" "$HANDOFF_LANE" "$generation"
+    fi
+}
+
 normalize_path() {
     local variable="$1"
     local value="${!variable}"
@@ -579,7 +593,8 @@ else
             exit 0
         fi
 
-        die "Remote generation $REMOTE_GEN exists but this machine has no baseline. Use 'codex-pull --force $REMOTE_GEN' if remote state should replace the local directory."
+        FORCE_PULL_COMMAND="$(force_pull_command "$REMOTE_GEN")"
+        die "Remote generation $REMOTE_GEN exists but this machine has no baseline. Use '$FORCE_PULL_COMMAND' if remote state should replace the local directory."
     fi
 
     # The normal forward path always restores the newest valid snapshot.

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 This change log follows the conventions of
 [keepachangelog.com](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Fixed
+
+- Show lane-aware `run-codex --force-state` recovery commands when snapshot
+  synchronization finds remote state but no local baseline.
+
 ## [0.6.2] - 2026-09-24
 
 ### Added

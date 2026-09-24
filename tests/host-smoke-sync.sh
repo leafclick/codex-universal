@@ -276,6 +276,12 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
 
     mkdir -p "$TEST_ROOT/b/live" "$TEST_ROOT/b/home"
     printf 'replace me\n' > "$TEST_ROOT/b/live/payload"
+    if run_machine b "$PULL_COMMAND" \
+        >"$TEST_ROOT/no-baseline-standalone.log" 2>&1; then
+        fail "snapshot pull without a baseline unexpectedly succeeded"
+    fi
+    assert_contains "$(<"$TEST_ROOT/no-baseline-standalone.log")" \
+        "Use 'codex-pull --force 1'"
     run_machine b "$PULL_COMMAND" --force 1 >/dev/null
     [[ "$(sha256sum "$TEST_ROOT/a/live/payload" | awk '{print $1}')" == \
        "$(sha256sum "$TEST_ROOT/b/live/payload" | awk '{print $1}')" ]] ||
@@ -662,6 +668,40 @@ if [[ "${CODEX_TEST_SKIP_SYNC:-0}" != 1 ]]; then
         [[ "$(fixture_state_hash "$wrong_root/live")" == "$wrong_before" ]] ||
             fail "wrong $wrong_context context changed live state"
     done
+
+    if run_handoff handoff-b "$PULL_COMMAND" \
+        >"$handoff_destination/no-baseline-pull.log" 2>&1; then
+        fail "lane pull without a baseline unexpectedly succeeded"
+    fi
+    assert_contains "$(<"$handoff_destination/no-baseline-pull.log")" \
+        "Use 'run-codex $handoff_project --force-state 3'"
+    if run_handoff handoff-b "$PUSH_COMMAND" \
+        >"$handoff_destination/no-baseline-push.log" 2>&1; then
+        fail "lane push without a baseline unexpectedly succeeded"
+    fi
+    assert_contains "$(<"$handoff_destination/no-baseline-push.log")" \
+        "Run 'run-codex $handoff_project --force-state 3'"
+
+    named_handoff_sync_root="$TEST_ROOT/handoff-named-sync"
+    named_handoff_source="$TEST_ROOT/handoff-named-a"
+    named_handoff_destination="$TEST_ROOT/handoff-named-b"
+    original_handoff_sync_root="$handoff_sync_root"
+    original_handoff_lane="$handoff_lane"
+    handoff_sync_root="$named_handoff_sync_root"
+    handoff_lane='review'
+    mkdir -p "$named_handoff_source/live" "$named_handoff_source/home" \
+        "$named_handoff_destination/live" "$named_handoff_destination/home"
+    printf 'named lane source\n' > "$named_handoff_source/live/payload"
+    printf 'named lane destination\n' > "$named_handoff_destination/live/payload"
+    run_handoff handoff-named-a "$PUSH_COMMAND" >/dev/null
+    if run_handoff handoff-named-b "$PULL_COMMAND" \
+        >"$named_handoff_destination/no-baseline-pull.log" 2>&1; then
+        fail "named lane pull without a baseline unexpectedly succeeded"
+    fi
+    assert_contains "$(<"$named_handoff_destination/no-baseline-pull.log")" \
+        "Use 'run-codex $handoff_project --lane review --force-state 1'"
+    handoff_sync_root="$original_handoff_sync_root"
+    handoff_lane="$original_handoff_lane"
 
     run_handoff handoff-b "$PULL_COMMAND" --force 1 >/dev/null
     [[ "$(<"$handoff_destination/live/payload")" == \
