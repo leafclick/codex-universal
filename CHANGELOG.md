@@ -7,10 +7,20 @@ This change log follows the conventions of
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-24
+
 ### Fixed
 
 - Show lane-aware `run-codex --force-state` recovery commands when snapshot
   synchronization finds remote state but no local baseline.
+- Canonicalize handoff lock paths, keep them separate from live and synchronized
+  Codex state, and reject the filesystem-wide `/tmp` project mount.
+- Remove snapshot restore staging after a successful pull while retaining
+  actionable failure and rollback state.
+- Use a fresh `/proc` tmpfs in nested Bubblewrap probes to avoid host-dependent
+  `VFS: Mount too revealing` failures.
+- Stage image-runtime Clojure and LSP fixtures with portable read and traversal
+  modes so smoke tests work under the container's non-root identity.
 
 ## [0.6.2] - 2026-09-24
 
