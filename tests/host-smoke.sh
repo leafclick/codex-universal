@@ -27,7 +27,8 @@ cleanup() {
         fi
     fi
     if [[ -d "${image_clojure_fixture_dir:-}" ]]; then
-        chmod u+w -- "$image_clojure_fixture_dir" 2>/dev/null || true
+        find "$image_clojure_fixture_dir" -type d \
+            -exec chmod u+w -- {} + 2>/dev/null || true
     fi
     rm -rf -- "$TEST_ROOT"
 }
@@ -111,9 +112,12 @@ clojure_lsp_fixture="$ROOT/tests/fixtures/clojure-lsp-project"
    -f "$clojure_lsp_fixture/src/lsp_fixture/core.clj" &&
    -f "$clojure_lsp_fixture/test/lsp_fixture/core_test.clj" ]] ||
     fail "committed Clojure LSP fixture is incomplete"
-grep -Fq '/opt/codex-universal/tests/fixtures/check-clojure-lsp-mcp.py' \
+grep -Fq '/tmp/clojure-runtime-fixtures/check-clojure-lsp-mcp.py' \
     "$ROOT/tests/fixtures/host-smoke-image.sh" ||
     fail "container image smoke does not use the committed Clojure LSP harness"
+grep -Fq '/tmp/clojure-runtime-fixtures/clojure-lsp-project' \
+    "$ROOT/tests/fixtures/host-smoke-image.sh" ||
+    fail "container image smoke does not use the committed Clojure LSP project"
 set +e
 image_diagnostic_output="$(
     bash "$ROOT/tests/fixtures/host-smoke-image.sh" \
@@ -3013,24 +3017,28 @@ cp -- "$ROOT/tests/fixtures/host-smoke-image.clj" "$image_smoke_runner"
 cp -- "$ROOT/tests/fixtures/host-smoke-clojure-runtime.sh" \
     "$image_clojure_runtime_script"
 cp -- "$ROOT/tests/fixtures/check-clojure-network-context.py" \
+    "$ROOT/tests/fixtures/check-clojure-lsp-mcp.py" \
     "$ROOT/tests/fixtures/fake-nrepl.py" \
+    "$image_clojure_fixture_dir/"
+cp -R -- "$ROOT/tests/fixtures/clojure-lsp-project" \
     "$image_clojure_fixture_dir/"
 chmod 0555 -- \
     "$image_smoke_script" \
     "$image_smoke_phase_wrapper" \
     "$image_smoke_runner" \
-    "$image_clojure_runtime_script" \
-    "$image_clojure_fixture_dir"
-chmod 0444 -- \
-    "$image_clojure_fixture_dir/check-clojure-network-context.py" \
-    "$image_clojure_fixture_dir/fake-nrepl.py"
+    "$image_clojure_runtime_script"
+find "$image_clojure_fixture_dir" -type d -exec chmod 0555 -- {} +
+find "$image_clojure_fixture_dir" -type f -exec chmod 0444 -- {} +
 [[ "$(stat -c %a "$image_smoke_script")" == 555 &&
    "$(stat -c %a "$image_smoke_phase_wrapper")" == 555 &&
    "$(stat -c %a "$image_smoke_runner")" == 555 &&
    "$(stat -c %a "$image_clojure_runtime_script")" == 555 &&
    "$(stat -c %a "$image_clojure_fixture_dir")" == 555 &&
    "$(stat -c %a "$image_clojure_fixture_dir/check-clojure-network-context.py")" == 444 &&
-   "$(stat -c %a "$image_clojure_fixture_dir/fake-nrepl.py")" == 444 ]] ||
+   "$(stat -c %a "$image_clojure_fixture_dir/fake-nrepl.py")" == 444 &&
+   "$(stat -c %a "$image_clojure_fixture_dir/check-clojure-lsp-mcp.py")" == 444 &&
+   "$(stat -c %a "$image_clojure_fixture_dir/clojure-lsp-project")" == 555 &&
+   "$(stat -c %a "$image_clojure_fixture_dir/clojure-lsp-project/deps.edn")" == 444 ]] ||
     fail "temporary container image smoke files lack container-readable modes"
 
 image_timeout_seconds="${CODEX_TEST_IMAGE_TIMEOUT_SECONDS:-720}"

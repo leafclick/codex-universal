@@ -147,7 +147,7 @@ case "$check_phase" in
         codex-clojure-lsp-mcp --check-clojure-lsp >/dev/null
         ;;
     clojure-lsp)
-        fixture_source=/opt/codex-universal/tests/fixtures/clojure-lsp-project
+        fixture_source=/tmp/clojure-runtime-fixtures/clojure-lsp-project
         fixture_dir="$HOME/clojure-lsp-smoke"
         mcp_stderr="$fixture_dir/mcp-stderr.log"
         [[ -f "$fixture_source/deps.edn" ]]
@@ -158,7 +158,7 @@ case "$check_phase" in
             '{:mvn/local-repo "/opt/clojure/offline-m2"}' \
             > "$HOME/.clojure/deps.edn"
         cp -R -- "$fixture_source/." "$fixture_dir/"
-        python3 /opt/codex-universal/tests/fixtures/check-clojure-lsp-mcp.py \
+        python3 /tmp/clojure-runtime-fixtures/check-clojure-lsp-mcp.py \
             "$fixture_dir" "$mcp_stderr"
         ;;
     cli-smoke)
