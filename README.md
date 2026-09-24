@@ -1824,8 +1824,9 @@ run-codex --init --lane same-lane --profile cuda same-project /another/path
 
 This command only registers the checkout; it does not start Codex or hand off
 its state. Use the same project and lane names on both machines. Before
-switching ownership, commit and publish the lane's code, complete its onboarding
-check, exit its Codex container on machine A, and publish the contextual state:
+switching ownership, commit and publish tracked lane changes, complete its
+onboarding check, exit its Codex container on machine A, and publish the
+contextual state:
 
 ```bash
 git -C /path/to/machine-a-checkout status --short
@@ -1852,7 +1853,9 @@ run-codex same-project --lane same-lane --new
 For later forward handoffs, use `--pull-state` instead of `--force-state`.
 Only one machine should actively modify a lane's state at a time. The snapshots
 contain lane Codex state, not the project checkout, so transfer commits and any
-uncommitted working-tree changes separately.
+uncommitted working-tree changes separately. Staged or unstaged tracked changes
+block state handoff because its requirements bind the committed `HEAD`.
+Untracked and ignored files are allowed, but are not included in the snapshot.
 
 Protect the Seafile library with a strong, unique password. Snapshots can contain Codex authentication material and session history; keep the password separate from the repository and synchronized data.
 

@@ -23,6 +23,8 @@ This change log follows the conventions of
 
 ### Fixed
 
+- Allow untracked and ignored checkout files during lane state handoff while
+  continuing to reject staged or unstaged tracked changes.
 - Report both the destination and snapshot runtime labels when a lane pull
   rejects an image mismatch.
 - Surface unexpected language-server exits and protocol forwarding failures

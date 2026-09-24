@@ -1395,9 +1395,32 @@ isolated_codex_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/de
 isolated_m2_home="$TEST_ROOT/launcher-config/run-codex/state/smoke-project/default/m2"
 mkdir -p -- "$isolated_codex_home"
 printf '%s\n' default-state > "$isolated_codex_home/lane-marker"
+printf '%s\n' untracked-state-input > "$TEST_ROOT/repo/untracked-state-input"
 "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --push-state >/dev/null
+rm -- "$TEST_ROOT/repo/untracked-state-input"
 compgen -G "$TEST_ROOT/lane-sync/projects/smoke-project/lanes/default/codex-g*.tar.zst.state" >/dev/null ||
     fail "default lane state push did not use its independent snapshot namespace"
+
+printf '%s\n' tracked-state-change >> "$TEST_ROOT/repo/deps.edn"
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --push-state \
+    >"$TEST_ROOT/tracked-state-change.out" 2>&1; then
+    fail "lane state push accepted an unstaged tracked checkout change"
+fi
+assert_contains "$(<"$TEST_ROOT/tracked-state-change.out")" \
+    "Preserve or remove tracked checkout changes"
+git -C "$TEST_ROOT/repo" restore --worktree -- deps.edn
+
+printf '%s\n' staged-state-change >> "$TEST_ROOT/repo/deps.edn"
+git -C "$TEST_ROOT/repo" add -- deps.edn
+if "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --push-state \
+    >"$TEST_ROOT/staged-state-change.out" 2>&1; then
+    fail "lane state push accepted a staged tracked checkout change"
+fi
+assert_contains "$(<"$TEST_ROOT/staged-state-change.out")" \
+    "Preserve or remove tracked checkout changes"
+git -C "$TEST_ROOT/repo" restore --staged --worktree -- deps.edn
+pass "lane state handoff allows untracked files and rejects tracked changes"
+
 printf '%s\n' review-state > \
     "$TEST_ROOT/launcher-config/run-codex/state/smoke-project/review/codex-home/lane-marker"
 "${launcher_env[@]}" "$ROOT/bin/run-codex" smoke-project --lane review --push-state >/dev/null

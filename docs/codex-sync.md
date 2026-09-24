@@ -189,6 +189,11 @@ declarations, and destination readiness match the published handoff marker.
 The refusal happens before extraction or live-state replacement and can be
 retried after the missing code, image, or local inputs are supplied.
 
+State handoff requires the tracked index and working tree to match `HEAD`.
+Untracked and ignored checkout files do not block push or pull, but they are
+not included in the Codex-state snapshot and must be transferred or provisioned
+separately when the destination needs them.
+
 Before switching back, exit Codex on machine B, push there, wait for
 synchronization, and pull on machine A.
 

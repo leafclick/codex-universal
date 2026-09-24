@@ -2499,8 +2499,10 @@ run_lane_state_sync() {
         die "Missing synchronization companion command: $command"
 
     if [[ "$mode" != list-state ]]; then
-        [[ -z "$(git -C "$PROJECT_PATH" status --porcelain=v1 --untracked-files=all)" ]] ||
-            die "Preserve or remove checkout changes before handing off lane '$LANE'"
+        if ! git -C "$PROJECT_PATH" diff --quiet -- ||
+           ! git -C "$PROJECT_PATH" diff --cached --quiet --; then
+            die "Preserve or remove tracked checkout changes before handing off lane '$LANE'"
+        fi
         handoff_commit="$(git -C "$PROJECT_PATH" rev-parse --verify HEAD^{commit})" ||
             die "Cannot resolve the lane's required Git commit"
 
